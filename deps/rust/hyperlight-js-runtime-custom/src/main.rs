@@ -5,7 +5,8 @@ build`) into the prebuilt blob workerd embeds (//deps/rust/hyperlight-js-runtime
 
 Two kinds of globals are installed:
   - Rust classes (via #[rquickjs::class]) for byte-level APIs: TextEncoder / TextDecoder.
-  - JS polyfills (via ctx.eval) for the rest: atob / btoa, URL / URLSearchParams, Headers.
+  - JS polyfills (via ctx.eval) for the rest: atob / btoa, URL / URLSearchParams, Headers,
+    DOMException, Event / EventTarget, AbortController / AbortSignal.
 
 The same binary builds as a native CLI (for fast local testing) and as a Hyperlight guest; the lib
 provides all guest infrastructure, so this file only declares the globals + a CLI entry point.
@@ -82,6 +83,10 @@ fn setup_wintertc(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
 
     // Headers (WHATWG Fetch): case-insensitive, combine-on-append, Set-Cookie kept separate.
     ctx.eval::<(), _>(HEADERS_POLYFILL)?;
+
+    // DOMException + Event/EventTarget + AbortController/AbortSignal (one closure: AbortSignal is an
+    // EventTarget and its default abort reason is an AbortError DOMException).
+    ctx.eval::<(), _>(EVENTS_POLYFILL)?;
 
     Ok(())
 }
@@ -439,6 +444,162 @@ const HEADERS_POLYFILL: &str = r##"
   }
 
   globalThis.Headers = Headers;
+})();
+"##;
+
+// DOMException + Event / EventTarget + AbortController / AbortSignal. One closure: AbortSignal is an
+// EventTarget, and the default abort reason is an AbortError DOMException, so they share the same
+// private maps. Note: AbortSignal.timeout() cannot actually fire in this execution model (the vCPU is
+// parked between calls), so it returns a never-aborting signal rather than pretending to schedule.
+const EVENTS_POLYFILL: &str = r##"
+(() => {
+  // ---- DOMException (WHATWG) ----
+  const DOM_CODES = {
+    IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5,
+    NoModificationAllowedError: 7, NotFoundError: 8, NotSupportedError: 9, InUseAttributeError: 10,
+    InvalidStateError: 11, SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14,
+    InvalidAccessError: 15, SecurityError: 18, NetworkError: 19, AbortError: 20, URLMismatchError: 21,
+    QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24, DataCloneError: 25,
+  };
+  class DOMException extends Error {
+    constructor(message, name) {
+      super(message === undefined ? "" : String(message));
+      Object.defineProperty(this, "name", { value: name === undefined ? "Error" : String(name), writable: true, configurable: true });
+    }
+    get code() { return DOM_CODES[this.name] || 0; }
+    get [Symbol.toStringTag]() { return "DOMException"; }
+  }
+  const DOM_CONSTS = {
+    INDEX_SIZE_ERR: 1, DOMSTRING_SIZE_ERR: 2, HIERARCHY_REQUEST_ERR: 3, WRONG_DOCUMENT_ERR: 4,
+    INVALID_CHARACTER_ERR: 5, NO_DATA_ALLOWED_ERR: 6, NO_MODIFICATION_ALLOWED_ERR: 7, NOT_FOUND_ERR: 8,
+    NOT_SUPPORTED_ERR: 9, INUSE_ATTRIBUTE_ERR: 10, INVALID_STATE_ERR: 11, SYNTAX_ERR: 12,
+    INVALID_MODIFICATION_ERR: 13, NAMESPACE_ERR: 14, INVALID_ACCESS_ERR: 15, VALIDATION_ERR: 16,
+    TYPE_MISMATCH_ERR: 17, SECURITY_ERR: 18, NETWORK_ERR: 19, ABORT_ERR: 20, URL_MISMATCH_ERR: 21,
+    QUOTA_EXCEEDED_ERR: 22, TIMEOUT_ERR: 23, INVALID_NODE_TYPE_ERR: 24, DATA_CLONE_ERR: 25,
+  };
+  for (const k of Object.keys(DOM_CONSTS)) {
+    Object.defineProperty(DOMException, k, { value: DOM_CONSTS[k], enumerable: true });
+    Object.defineProperty(DOMException.prototype, k, { value: DOM_CONSTS[k], enumerable: true });
+  }
+
+  // ---- Event ----
+  const evState = new WeakMap(); // Event -> { stopImmediate, stopProp, dispatched }
+  class Event {
+    constructor(type, init) {
+      init = init || {};
+      this.type = String(type);
+      this.bubbles = !!init.bubbles;
+      this.cancelable = !!init.cancelable;
+      this.composed = !!init.composed;
+      this.defaultPrevented = false;
+      this.target = null;
+      this.currentTarget = null;
+      this.srcElement = null;
+      this.eventPhase = 0;
+      this.isTrusted = false;
+      this.timeStamp = 0; // no in-guest clock yet
+      evState.set(this, { stopImmediate: false, stopProp: false, dispatched: false });
+    }
+    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+    stopPropagation() { evState.get(this).stopProp = true; }
+    stopImmediatePropagation() { const s = evState.get(this); s.stopImmediate = true; s.stopProp = true; }
+    composedPath() { return this.currentTarget ? [this.currentTarget] : []; }
+    get returnValue() { return !this.defaultPrevented; }
+    set returnValue(v) { if (this.cancelable && v === false) this.defaultPrevented = true; }
+  }
+  Object.defineProperties(Event, { NONE: { value: 0 }, CAPTURING_PHASE: { value: 1 }, AT_TARGET: { value: 2 }, BUBBLING_PHASE: { value: 3 } });
+
+  // ---- EventTarget ----
+  const listeners = new WeakMap(); // EventTarget -> Map<type, Array<entry>>
+  class EventTarget {
+    constructor() { listeners.set(this, new Map()); }
+    addEventListener(type, callback, options) {
+      if (callback === undefined || callback === null) return;
+      type = String(type);
+      const opts = (typeof options === "boolean") ? { capture: options } : (options || {});
+      const capture = !!opts.capture, once = !!opts.once, passive = !!opts.passive, signal = opts.signal || null;
+      if (signal && signal.aborted) return;
+      const map = listeners.get(this);
+      if (!map.has(type)) map.set(type, []);
+      const arr = map.get(type);
+      for (const l of arr) if (l.callback === callback && l.capture === capture) return;
+      arr.push({ callback: callback, capture: capture, once: once, passive: passive, signal: signal });
+      if (signal) { const self = this; signal.addEventListener("abort", function () { self.removeEventListener(type, callback, { capture: capture }); }, { once: true }); }
+    }
+    removeEventListener(type, callback, options) {
+      type = String(type);
+      const capture = (typeof options === "boolean") ? options : !!(options && options.capture);
+      const map = listeners.get(this); if (!map.has(type)) return;
+      const arr = map.get(type);
+      for (let i = 0; i < arr.length; i++) if (arr[i].callback === callback && arr[i].capture === capture) { arr.splice(i, 1); return; }
+    }
+    dispatchEvent(event) {
+      const st = evState.get(event);
+      if (st && st.dispatched) throw new DOMException("The event is already being dispatched", "InvalidStateError");
+      if (st) st.dispatched = true;
+      const map = listeners.get(this);
+      event.target = this; event.srcElement = this; event.currentTarget = this; event.eventPhase = 2;
+      const arr = (map.get(event.type) || []).slice();
+      for (const l of arr) {
+        if (st && st.stopImmediate) break;
+        try {
+          if (typeof l.callback === "function") l.callback.call(this, event);
+          else if (l.callback && typeof l.callback.handleEvent === "function") l.callback.handleEvent(event);
+        } catch (e) { console.error(e); }
+        if (l.once) this.removeEventListener(event.type, l.callback, { capture: l.capture });
+      }
+      event.currentTarget = null; event.eventPhase = 0;
+      if (st) { st.dispatched = false; st.stopImmediate = false; st.stopProp = false; }
+      return !event.defaultPrevented;
+    }
+  }
+
+  // ---- AbortSignal / AbortController ----
+  const signalState = new WeakMap();      // AbortSignal -> { aborted, reason, onabort }
+  const controllerSignal = new WeakMap(); // AbortController -> AbortSignal
+  let allowConstruct = false;
+  function newSignal() { allowConstruct = true; try { return new AbortSignal(); } finally { allowConstruct = false; } }
+  function doAbort(signal, reason) {
+    const s = signalState.get(signal);
+    if (s.aborted) return;
+    s.aborted = true;
+    s.reason = (reason !== undefined) ? reason : new DOMException("This operation was aborted", "AbortError");
+    const ev = new Event("abort");
+    if (typeof s.onabort === "function") { try { s.onabort.call(signal, ev); } catch (e) { console.error(e); } }
+    signal.dispatchEvent(ev);
+  }
+  class AbortSignal extends EventTarget {
+    constructor() {
+      super();
+      if (!allowConstruct) throw new TypeError("Illegal constructor");
+      signalState.set(this, { aborted: false, reason: undefined, onabort: null });
+    }
+    get aborted() { return signalState.get(this).aborted; }
+    get reason() { return signalState.get(this).reason; }
+    get onabort() { return signalState.get(this).onabort; }
+    set onabort(fn) { signalState.get(this).onabort = (typeof fn === "function") ? fn : null; }
+    throwIfAborted() { const s = signalState.get(this); if (s.aborted) throw s.reason; }
+    static abort(reason) { const sig = newSignal(); const s = signalState.get(sig); s.aborted = true; s.reason = (reason !== undefined) ? reason : new DOMException("This operation was aborted", "AbortError"); return sig; }
+    static timeout(ms) { return newSignal(); }
+    static any(signals) {
+      const sig = newSignal();
+      const list = Array.from(signals);
+      for (const s of list) { if (s.aborted) { const st = signalState.get(sig); st.aborted = true; st.reason = s.reason; return sig; } }
+      for (const s of list) { s.addEventListener("abort", function () { doAbort(sig, s.reason); }, { once: true }); }
+      return sig;
+    }
+  }
+  class AbortController {
+    constructor() { controllerSignal.set(this, newSignal()); }
+    get signal() { return controllerSignal.get(this); }
+    abort(reason) { doAbort(controllerSignal.get(this), reason); }
+  }
+
+  globalThis.DOMException = DOMException;
+  globalThis.Event = Event;
+  globalThis.EventTarget = EventTarget;
+  globalThis.AbortSignal = AbortSignal;
+  globalThis.AbortController = AbortController;
 })();
 "##;
 
