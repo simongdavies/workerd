@@ -9,9 +9,6 @@
 //! bridge is self-contained (cxx opaque types are per-bridge) but borrows the shared kj cxx types
 //! for the request/response plumbing.
 
-use std::pin::Pin;
-
-use kj::http::Service as _;
 use worker::Result;
 
 use crate::HyperlightJsConfig;
@@ -29,9 +26,21 @@ pub mod bridge {
     #[namespace = "kj::rust"]
     unsafe extern "C++" {
         type HttpMethod = kj::http::ffi::HttpMethod;
-        type HttpHeaders = kj::http::ffi::HttpHeaders;
-        type HttpServiceResponse = kj::http::ffi::HttpServiceResponse;
-        type AsyncInputStream = kj::io::ffi::AsyncInputStream;
+    }
+
+    /// A single HTTP header (name + value). Carries request headers into the guest event and the
+    /// guest's response headers back out.
+    struct HttpHeaderEntry {
+        name: String,
+        value: String,
+    }
+
+    /// The HTTP response a guest handler produced, mapped by the C++ bridge onto the kj response.
+    struct GuestResponse {
+        status: u16,
+        status_text: String,
+        headers: Vec<HttpHeaderEntry>,
+        body: Vec<u8>,
     }
 
     extern "Rust" {
@@ -46,14 +55,15 @@ pub mod bridge {
         /// Mint a lightweight per-request handle onto the shared warm VM pool.
         fn new_request(self: &SharedWorker) -> Box<RequestWorker>;
 
-        async unsafe fn request<'a>(
+        /// Marshal the request (method, url, headers, whole body) into the guest event, run the
+        /// Worker's handler on the warm guest, and return the response for the C++ side to write.
+        async unsafe fn run_request<'a>(
             self: &'a mut RequestWorker,
             method: HttpMethod,
             url: &'a [u8],
-            headers: &'a HttpHeaders,
-            request_body: Pin<&'a mut AsyncInputStream>,
-            response: Pin<&'a mut HttpServiceResponse>,
-        ) -> Result<()>;
+            req_headers: &'a [HttpHeaderEntry],
+            body: &'a [u8],
+        ) -> Result<GuestResponse>;
     }
 
     impl Box<SharedWorker> {}
@@ -88,18 +98,13 @@ impl SharedWorker {
 }
 
 impl RequestWorker {
-    async fn request<'a>(
+    async fn run_request<'a>(
         &'a mut self,
         method: bridge::HttpMethod,
         url: &'a [u8],
-        headers: &'a bridge::HttpHeaders,
-        request_body: Pin<&'a mut bridge::AsyncInputStream>,
-        response: Pin<&'a mut bridge::HttpServiceResponse>,
-    ) -> Result<()> {
-        let response = kj::http::ServiceResponse::from(response);
-        self.inner
-            .request(method, url, headers.into(), request_body, response)
-            .await?;
-        Ok(())
+        req_headers: &'a [bridge::HttpHeaderEntry],
+        body: &'a [u8],
+    ) -> Result<bridge::GuestResponse> {
+        self.inner.run_request(method, url, req_headers, body).await
     }
 }

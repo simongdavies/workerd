@@ -974,6 +974,37 @@ const HTTP_POLYFILL: &str = r##"
       const st = resState.get(r); st.status = 0; st.type = "error";
       return r;
     }
+    // Serialize for the host: when a handler returns a Response, JSON.stringify calls this, emitting
+    // the $hlResponse marker the workerd bridge maps onto the real HTTP response. The body source is
+    // read synchronously (string / URLSearchParams / ArrayBuffer / TypedArray / null); binary bodies
+    // are base64-encoded with bodyBase64 = true. A Blob body needs an async read and is unsupported
+    // via a direct return -- read it in the handler first.
+    toJSON() {
+      const st = resState.get(this);
+      const src = st.bodySource;
+      let body = "";
+      let bodyBase64 = false;
+      if (src === null || src === undefined) {
+        body = "";
+      } else if (typeof src === "string") {
+        body = src;
+      } else if (src instanceof URLSearchParams) {
+        body = src.toString();
+      } else if (src instanceof ArrayBuffer || ArrayBuffer.isView(src)) {
+        const bytes = (src instanceof ArrayBuffer) ? new Uint8Array(src) : new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+        let binary = "";
+        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+        body = btoa(binary);
+        bodyBase64 = true;
+      } else if (src instanceof Blob) {
+        throw new TypeError("Returning a Response with a Blob body is not supported; read it in the handler first");
+      } else {
+        body = String(src);
+      }
+      const headers = [];
+      for (const pair of st.headers.entries()) headers.push([pair[0], pair[1]]);
+      return { $hlResponse: 1, status: st.status, statusText: st.statusText, headers: headers, body: body, bodyBase64: bodyBase64 };
+    }
     get [Symbol.toStringTag]() { return "Response"; }
   }
   defineBodyAccessors(Response.prototype, resState);

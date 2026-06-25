@@ -21,7 +21,6 @@
 // into the crate so its generated cxxbridge symbols are emitted for the C++ side to link against.
 mod ffi;
 
-use std::pin::Pin;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -33,14 +32,10 @@ use futures::channel::oneshot;
 use hyperlight_js::LoadedJSSandbox;
 use hyperlight_js::SandboxBuilder;
 use hyperlight_js::Script;
-use kj::http::ConnectResponse;
-use kj::http::ConnectSettings;
-use kj::http::HeaderId;
-use kj::http::HeadersRef;
 use kj::http::Method;
-use kj::http::ServiceResponse;
-use kj::io::AsyncInputStream;
-use kj::io::AsyncIoStream;
+
+use crate::ffi::bridge::GuestResponse;
+use crate::ffi::bridge::HttpHeaderEntry;
 
 /// The name under which the Worker's handler is registered in the guest. The guest runtime invokes
 /// the JS function exported under this name for every event.
@@ -168,15 +163,196 @@ fn internal_error(message: &str) -> KjError {
 
 /// Marshal an HTTP request into the JSON event passed to the guest handler.
 ///
-/// v1 carries the method and URL only; request headers and body are follow-ups (they need header
-/// iteration and an async body read respectively).
-fn marshal_event(method: &Method, url: &[u8]) -> String {
+/// The event carries the method, URL, request headers (as `[name, value]` pairs, preserving
+/// duplicates) and the whole request body. A UTF-8 body is passed through as a string
+/// (`bodyEncoding: "utf-8"`); a binary body is base64-encoded (`bodyEncoding: "base64"`, decodable
+/// in-guest via `atob`); an empty body is `null` (`bodyEncoding: "none"`).
+fn marshal_event(
+    method: Method,
+    url: &[u8],
+    req_headers: &[HttpHeaderEntry],
+    body: &[u8],
+) -> String {
     let url = String::from_utf8_lossy(url);
+    let headers: Vec<[&str; 2]> = req_headers
+        .iter()
+        .map(|h| [h.name.as_str(), h.value.as_str()])
+        .collect();
+    let (body_value, body_encoding) = if body.is_empty() {
+        (serde_json::Value::Null, "none")
+    } else {
+        match std::str::from_utf8(body) {
+            Ok(text) => (serde_json::Value::String(text.to_owned()), "utf-8"),
+            Err(_) => (serde_json::Value::String(base64_encode(body)), "base64"),
+        }
+    };
     serde_json::json!({
         "method": format!("{method:?}"),
         "url": url,
+        "headers": headers,
+        "body": body_value,
+        "bodyEncoding": body_encoding,
     })
     .to_string()
+}
+
+/// Standard base64 alphabet (RFC 4648).
+const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encode bytes as standard base64 with `=` padding (used to carry a binary request body into the
+/// guest, where it is decoded with `atob`).
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(BASE64_ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(BASE64_ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64_ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64_ALPHABET[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode standard base64, ignoring padding and ASCII whitespace. Returns `None` on an invalid
+/// character. Used to recover a binary response body the guest produced with `btoa`.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let mut reverse = [255u8; 256];
+    for (i, &c) in BASE64_ALPHABET.iter().enumerate() {
+        reverse[c as usize] = i as u8;
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for &c in input.as_bytes() {
+        if c == b'=' || c == b'\n' || c == b'\r' || c == b' ' {
+            continue;
+        }
+        let value = reverse[c as usize];
+        if value == 255 {
+            return None;
+        }
+        buffer = (buffer << 6) | value as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buffer >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// JSON key the guest's `Response` serializes under (`Response.prototype.toJSON`), letting the host
+/// distinguish an explicit `Response` from a plain handler return value.
+const HL_RESPONSE_MARKER: &str = "$hlResponse";
+
+/// Map the guest handler's JSON result into a [`GuestResponse`].
+///
+/// A result tagged with [`HL_RESPONSE_MARKER`] (the handler returned a `Response`) is mapped to its
+/// status/headers/body. Any other value is served as-is with `200 OK` and `application/json` (the
+/// legacy behaviour).
+fn parse_guest_response(result: &str) -> GuestResponse {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(result) {
+        if value.get(HL_RESPONSE_MARKER).is_some() {
+            let status = value
+                .get("status")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(200)
+                .clamp(200, 599) as u16;
+            let status_text = match value.get("statusText").and_then(serde_json::Value::as_str) {
+                Some(text) if !text.is_empty() => text.to_owned(),
+                _ => reason_phrase(status).to_owned(),
+            };
+            let headers = value
+                .get("headers")
+                .and_then(serde_json::Value::as_array)
+                .map(|pairs| {
+                    pairs
+                        .iter()
+                        .filter_map(|pair| {
+                            let pair = pair.as_array()?;
+                            Some(HttpHeaderEntry {
+                                name: pair.first()?.as_str()?.to_owned(),
+                                value: pair.get(1)?.as_str()?.to_owned(),
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let body_text = value
+                .get("body")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let body = if value
+                .get("bodyBase64")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+            {
+                base64_decode(body_text).unwrap_or_default()
+            } else {
+                body_text.as_bytes().to_vec()
+            };
+            return GuestResponse {
+                status,
+                status_text,
+                headers,
+                body,
+            };
+        }
+    }
+
+    GuestResponse {
+        status: 200,
+        status_text: "OK".to_owned(),
+        headers: vec![HttpHeaderEntry {
+            name: "content-type".to_owned(),
+            value: "application/json; charset=utf-8".to_owned(),
+        }],
+        body: result.as_bytes().to_vec(),
+    }
+}
+
+/// A reason phrase for common status codes, used when a guest `Response` did not set an explicit
+/// `statusText`. Falls back to `"Unknown"` so the kj response always has a non-empty reason phrase.
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        206 => "Partial Content",
+        301 => "Moved Permanently",
+        302 => "Found",
+        303 => "See Other",
+        304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        409 => "Conflict",
+        410 => "Gone",
+        418 => "I'm a Teapot",
+        422 => "Unprocessable Entity",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        501 => "Not Implemented",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
 }
 
 /// Environment variable selecting how many warm micro-VMs to keep in the pool.
@@ -249,50 +425,22 @@ impl RequestHandle {
         Ok(rx)
     }
 
-    fn unimplemented(name: &str) -> KjError {
-        KjError::new(
-            KjExceptionType::Unimplemented,
-            format!("hyperlight-js worker: {name} is not supported"),
-        )
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl kj::http::Service for RequestHandle {
-    async fn request<'a>(
-        &'a mut self,
+    /// Marshal the request into the guest event, run the Worker's handler on the warm guest, and map
+    /// the handler's JSON result into a [`GuestResponse`]. The await is woken cross-thread when the
+    /// VM thread replies, so the KJ event loop stays free while the guest runs.
+    async fn run_request(
+        &self,
         method: Method,
-        url: &'a [u8],
-        headers: HeadersRef<'a>,
-        _request_body: Pin<&'a mut AsyncInputStream>,
-        response: ServiceResponse<'a>,
-    ) -> worker::Result<()> {
-        // Marshal the request, submit it to the warm guest, and await its result. The await is woken
-        // cross-thread when the VM thread replies, so the KJ event loop stays free while the guest
-        // runs.
-        let event_json = marshal_event(&method, url);
+        url: &[u8],
+        req_headers: &[HttpHeaderEntry],
+        body: &[u8],
+    ) -> worker::Result<GuestResponse> {
+        let event_json = marshal_event(method, url, req_headers, body);
         let rx = self.submit(event_json)?;
         let result = rx
             .await
             .map_err(|_| internal_error("the micro-VM thread dropped the request"))?
             .map_err(|err| internal_error(&format!("guest execution failed: {err}")))?;
-
-        let mut headers = headers.clone_shallow();
-        headers.set(HeaderId::CONTENT_TYPE, "application/json; charset=utf-8");
-        let body = result.into_bytes();
-        let mut out = response.send(200, "OK", &headers, Some(body.len() as u64))?;
-        out.write(&body).await?;
-        Ok(())
-    }
-
-    async fn connect<'a>(
-        &'a mut self,
-        _host: &'a [u8],
-        _headers: HeadersRef<'a>,
-        _connection: Pin<&'a mut AsyncIoStream>,
-        _response: ConnectResponse<'a>,
-        _settings: ConnectSettings<'a>,
-    ) -> worker::Result<()> {
-        Err(Self::unimplemented("connect"))
+        Ok(parse_guest_response(&result))
     }
 }
