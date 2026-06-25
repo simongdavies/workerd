@@ -279,6 +279,10 @@ _REPLACEMENTS = {
             # still expose _createPyodideModule for compatibility (import { _createPyodideModule })
             _PRELUDE + "export default _createPyodideModule; export { _createPyodideModule };",
         ],
+        [
+            "l.reader.releaseLock(),",
+            "",
+        ],
     ],
 }
 
