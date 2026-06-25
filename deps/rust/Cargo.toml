@@ -49,3 +49,19 @@ tokio = { version = "1", default-features = false, features = ["net", "rt", "rt-
 tracing = { version = "0", default-features = false, features = ["std"] }
 swc_common = "21"
 swc_ts_fast_strip = "49"
+
+# Hyperlight micro-VM JavaScript worker sandbox. workerd embeds hyperlight-js directly
+# (no hyperlight-sandbox wrapper, so no wasmtime/wasi-http stack enters workerd's V8
+# runtime). The QuickJS guest is supplied as a prebuilt blob via HYPERLIGHT_JS_RUNTIME_PATH
+# (see //deps/rust/patches:hyperlight-js-prebuilt-runtime.patch), so rquickjs/QuickJS never
+# enter the host build. x86_64-linux only (KVM-backed VMM); rev-pinned for deterministic
+# vendoring.
+[target.'cfg(all(target_arch = "x86_64", target_os = "linux"))'.dependencies]
+hyperlight-js = { git = "https://github.com/simongdavies/hyperlight-js", rev = "f21ae967a623d67ac21823522a848fe4371d88b0", default-features = false, features = ["kvm"] }
+
+# hyperlight-js depends on hyperlight-js-runtime purely so its build.rs can cross-compile the
+# QuickJS guest; workerd supplies a prebuilt guest blob instead and never uses the runtime crate
+# on the host. The real crate pulls rquickjs/QuickJS + bindgen (libclang) and cannot build
+# hermetically in crate_universe, so substitute an empty stub of the same name+version.
+[patch."https://github.com/simongdavies/hyperlight-js"]
+hyperlight-js-runtime = { path = "hyperlight-js-runtime-stub" }

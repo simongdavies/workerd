@@ -61,6 +61,48 @@ crate.annotation(
     crate = "capnpc",
     gen_binaries = ["capnpc-rust"],
 )
+
+# Hyperlight (micro-VM JS sandbox) crate_universe fixups. The hyperlight-js dependency is
+# x86_64-linux only; these annotations are inert on platforms where the crates aren't in the
+# resolved graph. See //deps/rust/patches and //deps/rust/hyperlight-js-runtime.
+crate.annotation(
+    # hyperlight-host's build script uses the `built` crate, which reads the full set of
+    # CARGO_PKG_* metadata vars. rules_rust only provides NAME + VERSION* to build scripts,
+    # so supply the optional-metadata vars the crate would otherwise read from [package].
+    build_script_env = {
+        "CARGO_PKG_AUTHORS": "",
+        "CARGO_PKG_DESCRIPTION": "",
+        "CARGO_PKG_HOMEPAGE": "",
+        "CARGO_PKG_LICENSE": "Apache-2.0",
+        "CARGO_PKG_REPOSITORY": "",
+    },
+    crate = "hyperlight-host",
+    version = "0.15.0",
+)
+crate.annotation(
+    # hyperlight-js cross-compiles its QuickJS guest at build time via a nested
+    # cargo-hyperlight invocation (target x86_64-hyperlight-none), which Bazel's hermetic
+    # crate_universe build cannot run. The patch embeds a prebuilt guest blob supplied via
+    # HYPERLIGHT_JS_RUNTIME_PATH and drops the bare-metal hyperlight-js-runtime dependency
+    # (which would otherwise pull rquickjs/QuickJS into the host build). It also strips
+    # `readme.workspace = true` (the splicer doesn't carry the workspace README).
+    build_script_data = ["@@//deps/rust/hyperlight-js-runtime:jsruntime.bin"],
+    build_script_env = {
+        "HYPERLIGHT_JS_RUNTIME_PATH": "$(execpath @@//deps/rust/hyperlight-js-runtime:jsruntime.bin)",
+    },
+    crate = "hyperlight-js",
+    patch_args = ["-p1"],
+    patches = ["//deps/rust/patches:hyperlight-js-prebuilt-runtime.patch"],
+    version = "0.2.5",
+)
+crate.annotation(
+    # Strip `readme.workspace = true` (crate_universe splicer doesn't carry the workspace
+    # README, so rules_rust's CARGO_PKG_README resolution panics).
+    crate = "hyperlight-js-common",
+    patch_args = ["-p1"],
+    patches = ["//deps/rust/patches:hyperlight-js-common-drop-readme.patch"],
+    version = "0.2.5",
+)
 crate.from_cargo(
     # TODO(cleanup): This name is a bit misleading now that we don't vendor. We can clean it up as a
     # followup.

@@ -1,0 +1,14 @@
+# The prebuilt hyperlight-js QuickJS guest runtime, embedded into the `hyperlight-js`
+# host crate at build time (see //deps/rust/patches:hyperlight-js-prebuilt-runtime.patch).
+# hyperlight-js normally cross-compiles this from source via a nested cargo-hyperlight
+# build targeting x86_64-hyperlight-none, which Bazel's hermetic crate_universe build
+# cannot run; instead we supply this prebuilt blob.
+#
+# Rebuild (out-of-band, from a hyperlight-js checkout at the pinned rev):
+#   export HYPERLIGHT_CFLAGS="-I$PWD/src/hyperlight-js-runtime/include -D__wasi__=1 -D_POSIX_MONOTONIC_CLOCK"
+#   cargo hyperlight build --manifest-path src/hyperlight-js-runtime/Cargo.toml \
+#     --target-dir <out> && cp <out>/x86_64-hyperlight-none/debug/hyperlight-js-runtime jsruntime.bin
+exports_files(
+    ["jsruntime.bin"],
+    visibility = ["//visibility:public"],
+)

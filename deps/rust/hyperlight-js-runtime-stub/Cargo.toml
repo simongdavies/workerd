@@ -1,0 +1,17 @@
+# Empty stand-in for hyperlight-js-runtime, substituted via [patch] in deps/rust/Cargo.toml.
+#
+# hyperlight-js depends on hyperlight-js-runtime only so its build.rs can locate the crate's
+# manifest in order to cross-compile the QuickJS guest (target x86_64-hyperlight-none). workerd
+# supplies a prebuilt guest blob instead (see //deps/rust/patches:hyperlight-js-prebuilt-runtime.patch),
+# so the real runtime crate — which pulls rquickjs/QuickJS + bindgen (libclang) and cannot build
+# hermetically in crate_universe — is never needed on the host. hyperlight-js never references it
+# at runtime (only its build.rs did, via cargo metadata, which the prebuilt-runtime patch bypasses),
+# so an empty lib suffices.
+[package]
+name = "hyperlight-js-runtime"
+version = "0.2.5"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,59 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 62ae4c5..702c5d8 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,7 +5,6 @@ edition.workspace = true
+ rust-version.workspace = true
+ license.workspace = true
+ repository.workspace = true
+-readme.workspace = true
+ description = """
+ hyperlight-js is a rust library crate that enables JavaScript code to be run inside lightweight Virtual Machine backed Sandbox.
+ It is built on top of Hyperlight.
+@@ -18,7 +17,6 @@ hyperlight-js-common = { workspace = true }
+ anyhow = "1.0.102"
+ fn-traits = "0.2.0"
+ hyperlight-host = { workspace = true }
+-hyperlight-js-runtime = { workspace = true }
+ metrics = "0.24.6"
+ oxc_resolver = "11.21.0"
+ phf = { version = "0.14", features = ["macros"] }
+diff --git a/build.rs b/build.rs
+index b46e0bb..056e693 100644
+--- a/build.rs
++++ b/build.rs
+@@ -196,22 +196,30 @@ fn build_js_runtime() -> PathBuf {
+ }
+ 
+ fn bundle_runtime() {
+-    let js_runtime_resource = match env::var("HYPERLIGHT_JS_RUNTIME_PATH") {
++    let js_runtime_src = match env::var("HYPERLIGHT_JS_RUNTIME_PATH") {
+         Ok(path) => {
+             println!("cargo:warning=Using custom JS runtime: {path}");
+             println!("cargo:rerun-if-env-changed=HYPERLIGHT_JS_RUNTIME_PATH");
+             println!("cargo:rerun-if-changed={path}");
+             PathBuf::from(path)
+-                .canonicalize()
+-                .expect("HYPERLIGHT_JS_RUNTIME_PATH must point to a valid file")
+         }
+         Err(_) => build_js_runtime(),
+     };
+ 
+     let out_dir = env::var_os("OUT_DIR").unwrap();
++    // Copy the guest blob into OUT_DIR and reference it via env!("OUT_DIR") so the
++    // include_bytes! is resolved relative to OUT_DIR during the separate rustc compile action.
++    // Required for Bazel's hermetic crate_universe build, where the build-script and compile
++    // actions run in different sandboxes — an absolute path baked here would not exist in the
++    // later action.
++    let js_runtime_resource = Path::new(&out_dir).join("hyperlight-js-runtime");
++    fs::copy(&js_runtime_src, &js_runtime_resource).unwrap_or_else(|e| {
++        panic!("failed to copy hyperlight-js-runtime from {js_runtime_src:?}: {e}")
++    });
++
+     let dest_path = Path::new(&out_dir).join("host_resource.rs");
+     let contents =
+-        format!("pub (super) static JSRUNTIME: &[u8] = include_bytes!({js_runtime_resource:?});");
++        "pub (super) static JSRUNTIME: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/hyperlight-js-runtime\"));";
+ 
+     fs::write(dest_path, contents).unwrap();
+     println!("cargo:rerun-if-changed=build.rs");

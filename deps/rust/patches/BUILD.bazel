@@ -1,0 +1,22 @@
+# Patches applied to git-sourced hyperlight crates via crate_universe
+# `crate.annotation(patches = …)` in //build:deps/rust.MODULE.bazel.
+#
+# - hyperlight-js-prebuilt-runtime.patch: hyperlight-js normally cross-compiles its
+#   QuickJS guest at build time via a nested cargo-hyperlight invocation targeting
+#   x86_64-hyperlight-none, which Bazel's hermetic crate_universe build cannot run.
+#   The patch makes build.rs embed a prebuilt guest blob (supplied via
+#   HYPERLIGHT_JS_RUNTIME_PATH and copied into OUT_DIR so the later rustc compile
+#   action can include_bytes! it), and drops the bare-metal hyperlight-js-runtime
+#   dependency — which is only used by the (now-skipped) cross-compile and would
+#   otherwise pull rquickjs/QuickJS into the host build. It also strips
+#   `readme.workspace = true` (the crate_universe splicer doesn't carry the
+#   workspace README, so rules_rust's CARGO_PKG_README resolution panics).
+# - hyperlight-js-common-drop-readme.patch: strips `readme.workspace = true` for the
+#   same splicer reason.
+exports_files(
+    [
+        "hyperlight-js-prebuilt-runtime.patch",
+        "hyperlight-js-common-drop-readme.patch",
+    ],
+    visibility = ["//visibility:public"],
+)

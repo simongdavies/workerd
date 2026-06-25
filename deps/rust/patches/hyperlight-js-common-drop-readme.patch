@@ -1,0 +1,12 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index decbc97..db33357 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -5,7 +5,6 @@ edition.workspace = true
+ rust-version.workspace = true
+ license.workspace = true
+ repository.workspace = true
+-readme.workspace = true
+ description = """
+ Shared constants and binary framing utilities for hyperlight-js.
+ 
