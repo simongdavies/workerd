@@ -7,7 +7,7 @@ Two kinds of globals are installed:
   - Rust classes (via #[rquickjs::class]) for byte-level APIs: TextEncoder / TextDecoder.
   - JS polyfills (via ctx.eval) for the rest: atob / btoa, URL / URLSearchParams, Headers,
     DOMException, Event / EventTarget, AbortController / AbortSignal, structuredClone,
-    queueMicrotask, Blob, URLPattern.
+    queueMicrotask, Blob, URLPattern, Request / Response.
 
 The same binary builds as a native CLI (for fast local testing) and as a Hyperlight guest; the lib
 provides all guest infrastructure, so this file only declares the globals + a CLI entry point.
@@ -95,6 +95,10 @@ fn setup_wintertc(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
 
     // URLPattern: a pragmatic path-to-regexp-style matcher over URL components (depends on URL).
     ctx.eval::<(), _>(URLPATTERN_POLYFILL)?;
+
+    // Request / Response: WHATWG Fetch data shells (depend on Headers/Blob/URL/URLSearchParams).
+    // The body is stored as a source and consumed lazily, so no streaming is involved (Tier 3).
+    ctx.eval::<(), _>(HTTP_POLYFILL)?;
 
     Ok(())
 }
@@ -835,6 +839,147 @@ const URLPATTERN_POLYFILL: &str = r##"
   }
 
   globalThis.URLPattern = URLPattern;
+})();
+"##;
+
+// Request / Response (WHATWG Fetch data shells). The body is stored as a source (string / Blob /
+// ArrayBuffer / TypedArray / URLSearchParams / null) and converted to bytes lazily by the async
+// arrayBuffer()/text()/json()/blob()/bytes() accessors -- there is no streaming body (Tier 3), so a
+// body is consumed once (bodyUsed guards re-reads). Content-Type is inferred from the body source.
+const HTTP_POLYFILL: &str = r##"
+(() => {
+  const reqState = new WeakMap();
+  const resState = new WeakMap();
+  const NULL_BODY_STATUS = [101, 103, 204, 205, 304];
+
+  function encodeUtf8(s) { return new TextEncoder().encode(s); }
+  function decodeUtf8(b) { return new TextDecoder().decode(b); }
+
+  function bodyContentType(body) {
+    if (typeof body === "string") return "text/plain;charset=UTF-8";
+    if (body instanceof Blob) return body.type || null;
+    if (body instanceof URLSearchParams) return "application/x-www-form-urlencoded;charset=UTF-8";
+    return null;
+  }
+  async function bodyToBytes(body) {
+    if (body === null || body === undefined) return new Uint8Array(0);
+    if (typeof body === "string") return encodeUtf8(body);
+    if (body instanceof Blob) return new Uint8Array(await body.arrayBuffer());
+    if (body instanceof URLSearchParams) return encodeUtf8(body.toString());
+    if (body instanceof ArrayBuffer) return new Uint8Array(body.slice(0));
+    if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength));
+    return encodeUtf8(String(body));
+  }
+  async function consume(obj, stateMap) {
+    const st = stateMap.get(obj);
+    if (st.bodyUsed) throw new TypeError("Body has already been consumed");
+    st.bodyUsed = true;
+    return bodyToBytes(st.bodySource);
+  }
+
+  // Shared async body accessors mixed onto both Request and Response prototypes.
+  function defineBodyAccessors(proto, stateMap) {
+    proto.arrayBuffer = async function () { const b = await consume(this, stateMap); return b.buffer.slice(0); };
+    proto.bytes = async function () { return consume(this, stateMap); };
+    proto.text = async function () { return decodeUtf8(await consume(this, stateMap)); };
+    proto.json = async function () { return JSON.parse(decodeUtf8(await consume(this, stateMap))); };
+    proto.blob = async function () { const ct = stateMap.get(this).headers.get("content-type") || ""; const b = await consume(this, stateMap); return new Blob([b], { type: ct }); };
+  }
+
+  class Request {
+    constructor(input, init) {
+      init = init || {};
+      let url, method = "GET", headersInit, bodySource = null;
+      if (input instanceof Request) {
+        const st = reqState.get(input);
+        url = st.url; method = st.method; headersInit = st.headers; bodySource = st.bodyUsed ? null : st.bodySource;
+      } else {
+        try { url = new URL(String(input)).href; } catch (e) { url = String(input); }
+      }
+      if (init.method !== undefined) method = String(init.method).toUpperCase();
+      if (init.headers !== undefined) headersInit = init.headers;
+      const body = (init.body !== undefined) ? init.body : bodySource;
+      if ((method === "GET" || method === "HEAD") && body !== null && body !== undefined)
+        throw new TypeError("Request with GET/HEAD method cannot have a body");
+      const headers = new Headers(headersInit);
+      const ct = bodyContentType(body);
+      if (ct && !headers.has("content-type")) headers.set("content-type", ct);
+      reqState.set(this, {
+        url: url, method: method, headers: headers, bodySource: (body === undefined ? null : body), bodyUsed: false,
+        redirect: init.redirect || "follow", signal: init.signal || null, credentials: init.credentials || "same-origin",
+        mode: init.mode || "cors", integrity: init.integrity || "",
+      });
+    }
+    get method() { return reqState.get(this).method; }
+    get url() { return reqState.get(this).url; }
+    get headers() { return reqState.get(this).headers; }
+    get redirect() { return reqState.get(this).redirect; }
+    get signal() { return reqState.get(this).signal; }
+    get credentials() { return reqState.get(this).credentials; }
+    get mode() { return reqState.get(this).mode; }
+    get integrity() { return reqState.get(this).integrity; }
+    get bodyUsed() { return reqState.get(this).bodyUsed; }
+    clone() {
+      const st = reqState.get(this);
+      if (st.bodyUsed) throw new TypeError("Cannot clone a Request whose body has been consumed");
+      return new Request(st.url, { method: st.method, headers: st.headers, body: st.bodySource, redirect: st.redirect, signal: st.signal, credentials: st.credentials, mode: st.mode, integrity: st.integrity });
+    }
+    get [Symbol.toStringTag]() { return "Request"; }
+  }
+  defineBodyAccessors(Request.prototype, reqState);
+
+  class Response {
+    constructor(body, init) {
+      init = init || {};
+      const status = (init.status !== undefined) ? Number(init.status) : 200;
+      if (!Number.isInteger(status) || status < 200 || status > 599) throw new RangeError("Response status must be between 200 and 599");
+      if (body !== null && body !== undefined && NULL_BODY_STATUS.indexOf(status) !== -1) throw new TypeError("Response with a null-body status cannot have a body");
+      const statusText = (init.statusText !== undefined) ? String(init.statusText) : "";
+      const headers = new Headers(init.headers);
+      const src = (body === undefined) ? null : body;
+      const ct = bodyContentType(src);
+      if (ct && !headers.has("content-type")) headers.set("content-type", ct);
+      resState.set(this, { status: status, statusText: statusText, headers: headers, bodySource: src, bodyUsed: false, type: "default", url: "", redirected: false });
+    }
+    get status() { return resState.get(this).status; }
+    get statusText() { return resState.get(this).statusText; }
+    get ok() { const s = resState.get(this).status; return s >= 200 && s <= 299; }
+    get headers() { return resState.get(this).headers; }
+    get type() { return resState.get(this).type; }
+    get url() { return resState.get(this).url; }
+    get redirected() { return resState.get(this).redirected; }
+    get bodyUsed() { return resState.get(this).bodyUsed; }
+    clone() {
+      const st = resState.get(this);
+      if (st.bodyUsed) throw new TypeError("Cannot clone a Response whose body has been consumed");
+      return new Response(st.bodySource, { status: st.status, statusText: st.statusText, headers: st.headers });
+    }
+    static json(data, init) {
+      init = init || {};
+      const text = JSON.stringify(data);
+      const hadContentType = new Headers(init.headers).has("content-type");
+      const r = new Response(text === undefined ? "null" : text, init);
+      if (!hadContentType) r.headers.set("content-type", "application/json;charset=UTF-8");
+      return r;
+    }
+    static redirect(url, status) {
+      status = (status === undefined) ? 302 : Number(status);
+      if ([301, 302, 303, 307, 308].indexOf(status) === -1) throw new RangeError("Invalid redirect status");
+      const r = new Response(null, { status: status });
+      r.headers.set("location", new URL(String(url)).href);
+      return r;
+    }
+    static error() {
+      const r = new Response(null, { status: 200 });
+      const st = resState.get(r); st.status = 0; st.type = "error";
+      return r;
+    }
+    get [Symbol.toStringTag]() { return "Response"; }
+  }
+  defineBodyAccessors(Response.prototype, resState);
+
+  globalThis.Request = Request;
+  globalThis.Response = Response;
 })();
 "##;
 
