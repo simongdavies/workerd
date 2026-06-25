@@ -236,6 +236,8 @@ wd_cc_library(
         "//src/cloudflare",
         "//src/node",
         "//src/pyodide:pyodide_static",
+        "//src/rust/hyperlight-js",
+        "//src/rust/hyperlight-js:bridge",
         "//src/workerd/api:memory-cache",
         "//src/workerd/api:pyodide",
         "//src/workerd/io",

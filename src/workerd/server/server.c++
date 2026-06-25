@@ -29,6 +29,7 @@
 #include <workerd/io/worker-fs.h>
 #include <workerd/io/worker-interface.h>
 #include <workerd/io/worker.h>
+#include <workerd/rust/hyperlight-js/bridge.h>
 #include <workerd/server/actor-id-impl.h>
 #include <workerd/server/facet-tree-index.h>
 #include <workerd/server/fallback-service.h>
@@ -2103,6 +2104,44 @@ kj::Own<Server::Service> Server::makeExternalService(kj::StringPtr name,
       "\" has unrecognized protocol. Was the config "
       "compiled with a newer version of the schema?"));
   return makeInvalidConfigService();
+}
+
+// Service backed by a Hyperlight + QuickJS micro-VM. Each request is marshalled to a JSON event,
+// executed inside a guest VM (via the Rust `hyperlight-js` crate), and the guest's JSON result is
+// returned as the response. This path never enters V8/JSG.
+class Server::HyperlightJsService final: public Service {
+ public:
+  explicit HyperlightJsService(::rust::Box<workerd::rust::hyperlight_js::SharedWorker> worker)
+      : worker(kj::mv(worker)) {}
+
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    return workerd::rust::hyperlight_js::newHyperlightJsWorkerInterface(*worker);
+  }
+
+  bool hasHandler(kj::StringPtr handlerName) override {
+    return handlerName == "fetch"_kj;
+  }
+
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+      IoChannelFactory::ChannelTokenUsage usage) override {
+    JSG_FAIL_REQUIRE(DOMDataCloneError, "HyperlightJsService can't be passed over RPC.");
+  }
+
+ private:
+  // The warm, shared micro-VM pool, booted once. Per-request handles are minted in startRequest().
+  ::rust::Box<workerd::rust::hyperlight_js::SharedWorker> worker;
+};
+
+kj::Own<Server::Service> Server::makeHyperlightJsService(
+    kj::StringPtr name, config::HyperlightJsServer::Reader conf) {
+  TRACE_EVENT("workerd", "Server::makeHyperlightJsService()", "name", name.cStr());
+  if (!conf.hasHandler()) {
+    reportConfigError(kj::str("Hyperlight JS service \"", name,
+        "\" must specify a `handler` (the Worker's JavaScript source)."));
+    return makeInvalidConfigService();
+  }
+  return kj::refcounted<HyperlightJsService>(
+      workerd::rust::hyperlight_js::newHyperlightJsSharedWorker(conf.getHandler()));
 }
 
 // Service used when the service is configured as network service.
@@ -5457,6 +5496,9 @@ kj::Promise<kj::Own<Server::Service>> Server::makeService(config::Service::Reade
 
     case config::Service::DISK:
       co_return makeDiskDirectoryService(name, conf.getDisk(), headerTableBuilder);
+
+    case config::Service::HYPERLIGHT_JS:
+      co_return makeHyperlightJsService(name, conf.getHyperlightJs());
   }
 
   reportConfigError(kj::str("Service named \"", name,

@@ -245,6 +245,8 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   kj::Own<Service> makeDiskDirectoryService(kj::StringPtr name,
       config::DiskDirectory::Reader conf,
       kj::HttpHeaderTable::Builder& headerTableBuilder);
+  kj::Own<Service> makeHyperlightJsService(
+      kj::StringPtr name, config::HyperlightJsServer::Reader conf);
   kj::Promise<kj::Own<Service>> makeWorker(kj::StringPtr name,
       config::Worker::Reader conf,
       capnp::List<config::Extension>::Reader extensions);
@@ -307,6 +309,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   class ExternalTcpService;
   class NetworkService;
   class DiskDirectoryService;
+  class HyperlightJsService;
   class WorkerService;
   class WorkerEntrypointService;
   class WorkerdBootstrapImpl;

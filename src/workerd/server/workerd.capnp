@@ -188,12 +188,27 @@ struct Service {
     # An HTTP service backed by a directory on disk, supporting a basic HTTP GET/PUT. Generally
     # not intended to be exposed directly to the internet; typically you want to bind this into
     # a Worker that adds logic for setting Content-Type and the like.
+
+    hyperlightJs @6 :HyperlightJsServer;
+    # A service backed by a Hyperlight + QuickJS micro-VM. Each fetch() request is marshalled to a
+    # JSON event, the Worker's handler runs inside the guest VM, and its JSON result is returned as
+    # the HTTP response. Distinct from `worker` (which runs on V8); this path never enters V8/JSG.
   }
 
   # TODO(someday): Allow defining a list of middlewares to stack on top of the service. This would
   #   be a list of Worker names, where each Worker must have a binding called `next`. This
   #   implicitly creates an inherited worker that wraps this service, with the `next` binding
   #   pointing to the service itself (or to the next middleware in the stack).
+}
+
+struct HyperlightJsServer {
+  # Runs requests inside a Hyperlight + QuickJS micro-VM guest. Each fetch() request is marshalled
+  # to a JSON event, the Worker's handler is run in the guest, and its JSON result is returned as
+  # the response body.
+
+  handler @0 :Text;
+  # The Worker's JavaScript source. It must export a `fetch` handler, e.g.
+  # `export function fetch(event) { ... }`. Typically supplied via `embed "handler.js"`.
 }
 
 struct ServiceDesignator {
