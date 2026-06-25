@@ -6,7 +6,8 @@ build`) into the prebuilt blob workerd embeds (//deps/rust/hyperlight-js-runtime
 Two kinds of globals are installed:
   - Rust classes (via #[rquickjs::class]) for byte-level APIs: TextEncoder / TextDecoder.
   - JS polyfills (via ctx.eval) for the rest: atob / btoa, URL / URLSearchParams, Headers,
-    DOMException, Event / EventTarget, AbortController / AbortSignal.
+    DOMException, Event / EventTarget, AbortController / AbortSignal, structuredClone,
+    queueMicrotask, Blob.
 
 The same binary builds as a native CLI (for fast local testing) and as a Hyperlight guest; the lib
 provides all guest infrastructure, so this file only declares the globals + a CLI entry point.
@@ -87,6 +88,10 @@ fn setup_wintertc(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     // DOMException + Event/EventTarget + AbortController/AbortSignal (one closure: AbortSignal is an
     // EventTarget and its default abort reason is an AbortError DOMException).
     ctx.eval::<(), _>(EVENTS_POLYFILL)?;
+
+    // Blob (in-memory, UTF-8-backed) + structuredClone (cycle-aware deep clone) + queueMicrotask
+    // (maps to the QuickJS job queue).
+    ctx.eval::<(), _>(UTIL_POLYFILL)?;
 
     Ok(())
 }
@@ -600,6 +605,92 @@ const EVENTS_POLYFILL: &str = r##"
   globalThis.EventTarget = EventTarget;
   globalThis.AbortSignal = AbortSignal;
   globalThis.AbortController = AbortController;
+})();
+"##;
+
+// Blob + structuredClone + queueMicrotask. Blob is an in-memory byte container (UTF-8 for string
+// parts) with async text()/arrayBuffer()/bytes() accessors; its stream() is unsupported (Tier 3).
+// structuredClone is a cycle-aware deep clone over the structured-clone-able types (throws a
+// DataCloneError for functions/symbols). queueMicrotask defers onto QuickJS's existing job queue.
+const UTIL_POLYFILL: &str = r##"
+(() => {
+  const blobBytes = new WeakMap(); // Blob -> Uint8Array
+  const blobType = new WeakMap();  // Blob -> string
+
+  function encodeUtf8(s) { return new TextEncoder().encode(s); }
+  function decodeUtf8(bytes) { return new TextDecoder().decode(bytes); }
+  function toBytes(part) {
+    if (part instanceof Blob) return blobBytes.get(part);
+    if (part instanceof ArrayBuffer) return new Uint8Array(part.slice(0));
+    if (ArrayBuffer.isView(part)) return new Uint8Array(part.buffer.slice(part.byteOffset, part.byteOffset + part.byteLength));
+    return encodeUtf8(String(part));
+  }
+
+  class Blob {
+    constructor(parts, options) {
+      options = options || {};
+      const chunks = [];
+      if (parts !== undefined && parts !== null) {
+        if (typeof parts[Symbol.iterator] !== "function") throw new TypeError("Blob parts must be iterable");
+        for (const part of parts) chunks.push(toBytes(part));
+      }
+      let total = 0; for (const c of chunks) total += c.length;
+      const bytes = new Uint8Array(total); let off = 0;
+      for (const c of chunks) { bytes.set(c, off); off += c.length; }
+      blobBytes.set(this, bytes);
+      const type = String(options.type || "");
+      blobType.set(this, /[^\u0020-\u007e]/.test(type) ? "" : type.toLowerCase());
+    }
+    get size() { return blobBytes.get(this).length; }
+    get type() { return blobType.get(this); }
+    slice(start, end, contentType) {
+      const bytes = blobBytes.get(this); const len = bytes.length;
+      const s = (start === undefined) ? 0 : (start < 0 ? Math.max(len + start, 0) : Math.min(start, len));
+      const e = (end === undefined) ? len : (end < 0 ? Math.max(len + end, 0) : Math.min(end, len));
+      const out = new Blob([], { type: contentType !== undefined ? String(contentType) : "" });
+      blobBytes.set(out, bytes.slice(s, Math.max(s, e)));
+      return out;
+    }
+    text() { return Promise.resolve(decodeUtf8(blobBytes.get(this))); }
+    arrayBuffer() { const b = blobBytes.get(this); return Promise.resolve(b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength)); }
+    bytes() { return Promise.resolve(blobBytes.get(this).slice()); }
+    stream() { throw new DOMException("Blob.stream() is not supported in this runtime", "NotSupportedError"); }
+    get [Symbol.toStringTag]() { return "Blob"; }
+  }
+
+  function structuredClone(value) {
+    const seen = new Map();
+    function clone(v) {
+      if (v === null || (typeof v !== "object" && typeof v !== "function")) {
+        if (typeof v === "symbol") throw new DOMException("Symbol could not be cloned", "DataCloneError");
+        return v;
+      }
+      if (typeof v === "function") throw new DOMException("Function could not be cloned", "DataCloneError");
+      if (seen.has(v)) return seen.get(v);
+      if (v instanceof Date) return new Date(v.getTime());
+      if (v instanceof RegExp) { const r = new RegExp(v.source, v.flags); r.lastIndex = v.lastIndex; return r; }
+      if (v instanceof ArrayBuffer) { const c = v.slice(0); seen.set(v, c); return c; }
+      if (ArrayBuffer.isView(v)) {
+        const buf = clone(v.buffer);
+        if (v instanceof DataView) return new DataView(buf, v.byteOffset, v.byteLength);
+        return new v.constructor(buf, v.byteOffset, v.length);
+      }
+      if (v instanceof Blob) return v.slice(0, v.size, v.type);
+      if (v instanceof Map) { const m = new Map(); seen.set(v, m); for (const [k, val] of v) m.set(clone(k), clone(val)); return m; }
+      if (v instanceof Set) { const s = new Set(); seen.set(v, s); for (const val of v) s.add(clone(val)); return s; }
+      if (Array.isArray(v)) { const a = []; seen.set(v, a); for (let i = 0; i < v.length; i++) a[i] = clone(v[i]); return a; }
+      if (v instanceof Error) { const Ctor = (typeof globalThis[v.name] === "function") ? globalThis[v.name] : Error; const e = new Ctor(v.message); if (v.stack !== undefined) { try { e.stack = v.stack; } catch (_) {} } return e; }
+      const o = {}; seen.set(v, o); for (const k of Object.keys(v)) o[k] = clone(v[k]); return o;
+    }
+    return clone(value);
+  }
+
+  globalThis.Blob = Blob;
+  globalThis.structuredClone = structuredClone;
+  globalThis.queueMicrotask = function queueMicrotask(callback) {
+    if (typeof callback !== "function") throw new TypeError("queueMicrotask: the callback is not a function");
+    Promise.resolve().then(function () { try { callback(); } catch (e) { console.error(e); } });
+  };
 })();
 "##;
 
