@@ -1,0 +1,28 @@
+[package]
+name = "hyperlight-js-runtime-custom"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Standalone crate (its own workspace) so it is not pulled into the Bazel deps/rust
+# resolution. It is built OUT OF BAND (not by Bazel) via `cargo hyperlight build` to
+# produce the prebuilt guest runtime embedded at //deps/rust/hyperlight-js-runtime:jsruntime.bin.
+# See build-runtime.sh in this directory.
+[workspace]
+
+[[bin]]
+name = "hyperlight-js-runtime-custom"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the same rev workerd's hyperlight-js host crate uses (deps/rust/Cargo.toml), so the
+# guest runtime this produces is protocol-compatible with the host.
+hyperlight-js-runtime = { git = "https://github.com/simongdavies/hyperlight-js", rev = "f21ae967a623d67ac21823522a848fe4371d88b0" }
+rquickjs = { version = "0.12", default-features = false, features = ["bindgen", "futures", "macro", "loader"] }
+
+# anyhow is only needed for the native CLI entry point, not the hyperlight guest.
+[target.'cfg(not(hyperlight))'.dependencies]
+anyhow = "1.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(hyperlight)'] }
