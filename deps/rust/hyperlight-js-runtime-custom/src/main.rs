@@ -7,7 +7,7 @@ Two kinds of globals are installed:
   - Rust classes (via #[rquickjs::class]) for byte-level APIs: TextEncoder / TextDecoder.
   - JS polyfills (via ctx.eval) for the rest: atob / btoa, URL / URLSearchParams, Headers,
     DOMException, Event / EventTarget, AbortController / AbortSignal, structuredClone,
-    queueMicrotask, Blob.
+    queueMicrotask, Blob, URLPattern.
 
 The same binary builds as a native CLI (for fast local testing) and as a Hyperlight guest; the lib
 provides all guest infrastructure, so this file only declares the globals + a CLI entry point.
@@ -92,6 +92,9 @@ fn setup_wintertc(ctx: &Ctx<'_>) -> rquickjs::Result<()> {
     // Blob (in-memory, UTF-8-backed) + structuredClone (cycle-aware deep clone) + queueMicrotask
     // (maps to the QuickJS job queue).
     ctx.eval::<(), _>(UTIL_POLYFILL)?;
+
+    // URLPattern: a pragmatic path-to-regexp-style matcher over URL components (depends on URL).
+    ctx.eval::<(), _>(URLPATTERN_POLYFILL)?;
 
     Ok(())
 }
@@ -691,6 +694,147 @@ const UTIL_POLYFILL: &str = r##"
     if (typeof callback !== "function") throw new TypeError("queueMicrotask: the callback is not a function");
     Promise.resolve().then(function () { try { callback(); } catch (e) { console.error(e); } });
   };
+})();
+"##;
+
+// URLPattern. A pragmatic path-to-regexp-style matcher (NOT the full WHATWG URLPattern parser): it
+// compiles each URL component pattern (:name named groups, * wildcards, (regex) groups, {..} groups
+// with ?/+/* modifiers, literals) into a RegExp, and matches a tested URL's components against them.
+// Missing components default to a wildcard. Note: ":name?" does not auto-optionalize a preceding
+// separator -- use "{/:name}?" for an optional segment. Depends on the URL global (above).
+const URLPATTERN_POLYFILL: &str = r##"
+(() => {
+  const COMPONENTS = ["protocol", "username", "password", "hostname", "port", "pathname", "search", "hash"];
+  const SEP = { hostname: ".", pathname: "/" }; // per-component separator char class; others: none
+  const compiledMap = new WeakMap(); // URLPattern -> { component: { names, regex, source } }
+
+  function escapeLiteral(ch) { return ch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
+
+  function compileInner(pattern, sepClass, names, ctr) {
+    const defaultMatch = sepClass ? "[^" + sepClass + "]+?" : "[^]+?";
+    let regex = ""; let i = 0;
+    while (i < pattern.length) {
+      const ch = pattern[i];
+      if (ch === ":") {
+        i++;
+        let name = "";
+        while (i < pattern.length && /[A-Za-z0-9_]/.test(pattern[i])) { name += pattern[i]; i++; }
+        let match = defaultMatch;
+        if (pattern[i] === "(") {
+          let depth = 1; i++; let re = "";
+          while (i < pattern.length && depth > 0) { const c = pattern[i]; if (c === "(") depth++; else if (c === ")") { depth--; if (depth === 0) { i++; break; } } re += c; i++; }
+          match = re;
+        }
+        let mod = "";
+        if (pattern[i] === "?" || pattern[i] === "*" || pattern[i] === "+") { mod = pattern[i]; i++; }
+        names.push(name);
+        regex += "(" + match + ")" + mod;
+      } else if (ch === "(") {
+        let depth = 1; i++; let re = "";
+        while (i < pattern.length && depth > 0) { const c = pattern[i]; if (c === "(") depth++; else if (c === ")") { depth--; if (depth === 0) { i++; break; } } re += c; i++; }
+        let mod = "";
+        if (pattern[i] === "?" || pattern[i] === "*" || pattern[i] === "+") { mod = pattern[i]; i++; }
+        names.push(String(ctr.n++));
+        regex += "(" + re + ")" + mod;
+      } else if (ch === "*") {
+        i++;
+        let mod = "";
+        if (pattern[i] === "?" || pattern[i] === "*" || pattern[i] === "+") { mod = pattern[i]; i++; }
+        names.push(String(ctr.n++));
+        regex += "([^]*?)" + mod;
+      } else if (ch === "{") {
+        let depth = 1; i++; let inner = "";
+        while (i < pattern.length && depth > 0) { const c = pattern[i]; if (c === "{") depth++; else if (c === "}") { depth--; if (depth === 0) { i++; break; } } inner += c; i++; }
+        let mod = "";
+        if (pattern[i] === "?" || pattern[i] === "*" || pattern[i] === "+") { mod = pattern[i]; i++; }
+        const innerBody = compileInner(inner, sepClass, names, ctr);
+        regex += "(?:" + innerBody + ")" + mod;
+      } else {
+        regex += escapeLiteral(ch); i++;
+      }
+    }
+    return regex;
+  }
+
+  function compileComponent(pattern, comp) {
+    if (pattern === "*") return { names: ["0"], regex: new RegExp("^([^]*?)$"), source: "*" };
+    const names = []; const ctr = { n: 0 };
+    const body = compileInner(String(pattern), SEP[comp] || null, names, ctr);
+    return { names: names, regex: new RegExp("^" + body + "$"), source: String(pattern) };
+  }
+
+  function parsePatternString(str) {
+    const m = /^(?:([^:/?#]+):)?(?:\/\/([^/?#]*))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/.exec(String(str));
+    const init = {};
+    if (m[1] !== undefined) init.protocol = m[1];
+    if (m[2] !== undefined) {
+      let host = m[2]; let userinfo = "";
+      const at = host.lastIndexOf("@");
+      if (at !== -1) { userinfo = host.slice(0, at); host = host.slice(at + 1); }
+      if (userinfo) { const c = userinfo.indexOf(":"); if (c === -1) init.username = userinfo; else { init.username = userinfo.slice(0, c); init.password = userinfo.slice(c + 1); } }
+      let hostname = host, port = "";
+      if (host.startsWith("[")) { const close = host.indexOf("]"); hostname = host.slice(0, close + 1); const rest = host.slice(close + 1); if (rest.startsWith(":")) port = rest.slice(1); }
+      else { const c = host.lastIndexOf(":"); if (c !== -1) { hostname = host.slice(0, c); port = host.slice(c + 1); } }
+      init.hostname = hostname; if (port) init.port = port;
+    }
+    if (m[3]) init.pathname = m[3];
+    if (m[4] !== undefined) init.search = m[4];
+    if (m[5] !== undefined) init.hash = m[5];
+    return init;
+  }
+
+  function partsOf(input, base) {
+    if (input && typeof input === "object") {
+      const get = (k) => (input[k] !== undefined && input[k] !== null) ? String(input[k]) : "";
+      return { protocol: get("protocol"), username: get("username"), password: get("password"), hostname: get("hostname"), port: get("port"), pathname: get("pathname"), search: get("search"), hash: get("hash") };
+    }
+    const str = String(input);
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(str) || base !== undefined) {
+      const u = new URL(str, base);
+      return { protocol: u.protocol.replace(/:$/, ""), username: u.username, password: u.password, hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search.replace(/^\?/, ""), hash: u.hash.replace(/^#/, "") };
+    }
+    const m = /^([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/.exec(str);
+    return { protocol: "", username: "", password: "", hostname: "", port: "", pathname: m[1] || "", search: m[2] || "", hash: m[3] || "" };
+  }
+
+  class URLPattern {
+    constructor(input, baseURL) {
+      let init = (input && typeof input === "object") ? input : parsePatternString(input !== undefined ? input : "");
+      if (baseURL !== undefined) {
+        const b = parsePatternString(baseURL);
+        for (const c of COMPONENTS) if (init[c] === undefined && b[c] !== undefined) init[c] = b[c];
+      }
+      const compiled = {};
+      for (const c of COMPONENTS) {
+        const pat = (init[c] !== undefined && init[c] !== null) ? String(init[c]) : "*";
+        compiled[c] = compileComponent(pat, c);
+        Object.defineProperty(this, c, { value: compiled[c].source, enumerable: true });
+      }
+      compiledMap.set(this, compiled);
+    }
+    test(input, baseURL) {
+      const parts = partsOf(input, baseURL);
+      const compiled = compiledMap.get(this);
+      for (const c of COMPONENTS) if (!compiled[c].regex.test(parts[c])) return false;
+      return true;
+    }
+    exec(input, baseURL) {
+      const parts = partsOf(input, baseURL);
+      const compiled = compiledMap.get(this);
+      const result = { inputs: [input] };
+      for (const c of COMPONENTS) {
+        const cc = compiled[c];
+        const m = cc.regex.exec(parts[c]);
+        if (!m) return null;
+        const groups = {};
+        for (let k = 0; k < cc.names.length; k++) groups[cc.names[k]] = m[k + 1];
+        result[c] = { input: parts[c], groups: groups };
+      }
+      return result;
+    }
+  }
+
+  globalThis.URLPattern = URLPattern;
 })();
 "##;
 
