@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "standard": "ECMA-429 Minimum Common Web API",
+  "qualification": "executor smoke plus upstream Workerd WPT baseline; not conformance",
+  "executor_probe": {
+    "fixture": "src/workerd/server/sandbox-executor/wintertc-smoke.js",
+    "expected_result": "src/workerd/server/sandbox-executor/wintertc-smoke-expected.json",
+    "bundle_generator": "src/workerd/server/tests/sandbox/make-executor-bundle.py wintertc-smoke",
+    "status": "passed",
+    "passes": [
+      "URL",
+      "URLPattern",
+      "Request",
+      "Response",
+      "Headers",
+      "FormData",
+      "Blob",
+      "TextEncoder",
+      "TextDecoder",
+      "WebCrypto.digest",
+      "WebCrypto.getRandomValues",
+      "ReadableStream",
+      "TransformStream",
+      "CompressionStream",
+      "DecompressionStream",
+      "performance.now"
+    ],
+    "not_tested": ["AbortController", "EventTarget", "structuredClone"]
+  },
+  "sandbox_policy_unavailable": [
+    "outbound fetch",
+    "WebSocket",
+    "connect",
+    "bindings",
+    "actors",
+    "timers",
+    "WebAssembly compilation"
+  ],
+  "upstream_wpt_baseline": [
+    {
+      "target": "//src/wpt:url@",
+      "status": "passed",
+      "passed_files": 29,
+      "failed_files": 0,
+      "expected_failures": 0,
+      "omitted_or_disabled_files": 2
+    },
+    {
+      "target": "//src/wpt:urlpattern@",
+      "status": "passed",
+      "passed_files": 5,
+      "failed_files": 0,
+      "expected_failures": 0,
+      "omitted_or_disabled_files": 1
+    },
+    {
+      "target": "//src/wpt:encoding@",
+      "status": "passed",
+      "passed_files": 58,
+      "failed_files": 0,
+      "expected_failures": 0,
+      "omitted_or_disabled_files": 3
+    },
+    {
+      "target": "//src/wpt:fetch/api@",
+      "status": "passed",
+      "passed_files": 152,
+      "failed_files": 0,
+      "expected_failures": 0,
+      "omitted_or_disabled_files": 62
+    },
+    {
+      "target": "//src/wpt:streams@",
+      "status": "passed",
+      "passed_files": 78,
+      "failed_files": 0,
+      "expected_failures": 0,
+      "omitted_or_disabled_files": 8
+    },
+    {
+      "target": "//src/wpt:compression@",
+      "status": "passed",
+      "passed_files": 21,
+      "failed_files": 0,
+      "expected_failures": 0,
+      "omitted_or_disabled_files": 1
+    },
+    {
+      "target": "//src/wpt:WebCryptoAPI@",
+      "status": "passed",
+      "passed_files": 150,
+      "failed_files": 0,
+      "expected_failures": 0,
+      "omitted_or_disabled_files": 19,
+      "bazel_options": ["--test_size_filters=enormous"]
+    },
+    {
+      "target": "//src/wpt:performance-timeline@",
+      "status": "passed",
+      "passed_files": 25,
+      "failed_files": 0,
+      "expected_failures": 0,
+      "omitted_or_disabled_files": 1
+    }
+  ],
+  "additional_workerd_baseline": [
+    {
+      "target": "//src/workerd/api/tests:settimeout-test@",
+      "status": "passed",
+      "reason": "No dedicated timers WPT target is configured in src/wpt."
+    },
+    {
+      "target": "//src/workerd/api/tests:wasm-memory-discard-test@",
+      "status": "passed",
+      "reason": "No dedicated WebAssembly WPT target is configured in src/wpt."
+    }
+  ]
+}

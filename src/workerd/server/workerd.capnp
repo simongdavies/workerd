@@ -211,6 +211,11 @@ struct Service {
     # An HTTP service backed by a directory on disk, supporting a basic HTTP GET/PUT. Generally
     # not intended to be exposed directly to the internet; typically you want to bind this into
     # a Worker that adds logic for setting Content-Type and the like.
+
+    sandboxedWorker @6 :SandboxedWorker;
+    # An experimental service that forwards Worker events over Cap'n Proto RPC to an isolated
+    # execution environment. The remote endpoint must expose WorkerdBootstrap for exactly one
+    # immutable Worker version.
   }
 
   # TODO(someday): Allow defining a list of middlewares to stack on top of the service. This would
@@ -821,6 +826,23 @@ struct Worker {
   #
   # If not set, `ctx.access.getIdentity()` resolves to `undefined` (even when `accessBlobHeader`
   # is configured and `ctx.access.aud` is available).
+}
+
+struct SandboxedWorker {
+  workerId @0 :Text;
+  # Stable identity of the Worker. This is metadata for supervisor policy and diagnostics; the
+  # remote guest cannot change it.
+
+  version @1 :Text;
+  # Immutable version of the Worker code. A sandbox may only be reused for this exact pair of
+  # workerId and version.
+
+  address @2 :Text;
+  # Address of the initial process-backed guest transport. This is intentionally transport
+  # configuration rather than part of the Worker event ABI.
+
+  capnpConnectHost @3 :Text;
+  # HTTP CONNECT authority used to establish the Cap'n Proto connection to the guest.
 }
 
 struct ExternalServer {

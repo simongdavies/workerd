@@ -259,6 +259,8 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   kj::Own<Service> makeExternalService(kj::StringPtr name,
       config::ExternalServer::Reader conf,
       kj::HttpHeaderTable::Builder& headerTableBuilder);
+  kj::Promise<kj::Own<Service>> makeSandboxedWorkerService(
+      kj::StringPtr name, config::SandboxedWorker::Reader conf);
   kj::Own<Service> makeNetworkService(config::Network::Reader conf);
   kj::Own<Service> makeDiskDirectoryService(kj::StringPtr name,
       config::DiskDirectory::Reader conf,
@@ -335,6 +337,7 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   class InvalidConfigActorClass;
   class ExternalHttpService;
   class ExternalTcpService;
+  class SandboxService;
   class NetworkService;
   class DiskDirectoryService;
   class WorkerService;

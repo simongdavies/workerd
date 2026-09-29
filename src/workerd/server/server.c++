@@ -7,6 +7,7 @@
 #include "alarm-scheduler.h"
 #include "container-client.h"
 #include "pyodide.h"
+#include "sandbox-service.h"
 #include "workerd-api.h"
 
 #include <workerd/api/actor-state.h>
@@ -2382,6 +2383,75 @@ class Server::ExternalHttpService final: public Service {
     }
   };
 };
+
+class Server::SandboxService final: public Service {
+ public:
+  SandboxService(kj::Own<SandboxSupervisor> supervisor,
+      capnp::HttpOverCapnpFactory& httpOverCapnpFactory,
+      capnp::ByteStreamFactory& byteStreamFactory)
+      : supervisor(kj::mv(supervisor)),
+        httpOverCapnpFactory(httpOverCapnpFactory),
+        byteStreamFactory(byteStreamFactory) {}
+
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    kj::Maybe<kj::StringPtr> cfBlobJson;
+    KJ_IF_SOME(cf, metadata.cfBlobJson) {
+      cfBlobJson = cf;
+    }
+
+    auto dispatcher = supervisor->startEvent(cfBlobJson);
+    return kj::heap<RpcWorkerInterface>(httpOverCapnpFactory, byteStreamFactory,
+        getUnsupportedFrankenvalueHandler(), kj::mv(dispatcher))
+        .attach(kj::addRef(*supervisor));
+  }
+
+  bool hasHandler(kj::StringPtr handlerName) override {
+    return handlerName == "fetch"_kj;
+  }
+
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+      IoChannelFactory::ChannelTokenUsage usage) override {
+    JSG_FAIL_REQUIRE(DOMDataCloneError, "Sandboxed Worker services cannot be passed over RPC.");
+  }
+
+ private:
+  kj::Own<SandboxSupervisor> supervisor;
+  capnp::HttpOverCapnpFactory& httpOverCapnpFactory;
+  capnp::ByteStreamFactory& byteStreamFactory;
+};
+
+kj::Promise<kj::Own<Server::Service>> Server::makeSandboxedWorkerService(
+    kj::StringPtr name, config::SandboxedWorker::Reader conf) {
+  if (!experimental) {
+    reportConfigError(kj::str("Sandboxed Worker service \"", name,
+        "\" is an experimental feature. You must run workerd with `--experimental` to use it."));
+    co_return makeInvalidConfigService();
+  }
+
+  if (!conf.hasWorkerId() || conf.getWorkerId() == nullptr) {
+    reportConfigError(kj::str("Sandboxed Worker service \"", name, "\" has no workerId."));
+    co_return makeInvalidConfigService();
+  }
+  if (!conf.hasVersion() || conf.getVersion() == nullptr) {
+    reportConfigError(kj::str("Sandboxed Worker service \"", name, "\" has no version."));
+    co_return makeInvalidConfigService();
+  }
+  if (!conf.hasAddress() || conf.getAddress() == nullptr) {
+    reportConfigError(kj::str("Sandboxed Worker service \"", name, "\" has no address."));
+    co_return makeInvalidConfigService();
+  }
+  if (!conf.hasCapnpConnectHost() || conf.getCapnpConnectHost() == nullptr) {
+    reportConfigError(kj::str("Sandboxed Worker service \"", name, "\" has no capnpConnectHost."));
+    co_return makeInvalidConfigService();
+  }
+
+  auto address = co_await network.parseAddress(conf.getAddress(), 80);
+  auto supervisor = newNetworkSandboxSupervisor(
+      WorkerVersionKey(kj::str(conf.getWorkerId()), kj::str(conf.getVersion())), kj::mv(address),
+      kj::str(conf.getCapnpConnectHost()), globalContext->headerTable, timer, entropySource);
+  co_return kj::refcounted<SandboxService>(
+      kj::mv(supervisor), globalContext->httpOverCapnpFactory, globalContext->byteStreamFactory);
+}
 
 kj::Own<Server::Service> Server::makeExternalService(kj::StringPtr name,
     config::ExternalServer::Reader conf,
@@ -6182,6 +6252,9 @@ kj::Promise<kj::Own<Server::Service>> Server::makeService(config::Service::Reade
 
     case config::Service::DISK:
       co_return makeDiskDirectoryService(name, conf.getDisk(), headerTableBuilder);
+
+    case config::Service::SANDBOXED_WORKER:
+      co_return co_await makeSandboxedWorkerService(name, conf.getSandboxedWorker());
   }
 
   reportConfigError(kj::str("Service named \"", name,

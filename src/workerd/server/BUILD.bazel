@@ -86,6 +86,77 @@ wd_cc_binary(
     ],
 )
 
+copy_file(
+    name = "copy-helloworld-worker",
+    src = "//samples/helloworld_esm:worker.js",
+    out = "helloworld-worker.js",
+)
+
+copy_file(
+    name = "copy-web-streams-worker",
+    src = "//samples/web-streams:worker.js",
+    out = "web-streams-worker.js",
+)
+
+copy_file(
+    name = "copy-streams-util",
+    src = "//samples/web-streams:streams-util.js",
+    out = "streams-util.js",
+)
+
+wd_cc_embed(
+    name = "helloworld-worker-embed",
+    src = "helloworld-worker.js",
+    base_name = "helloworld_worker",
+)
+
+wd_cc_embed(
+    name = "web-streams-worker-embed",
+    src = "web-streams-worker.js",
+    base_name = "web_streams_worker",
+)
+
+wd_cc_embed(
+    name = "streams-util-embed",
+    src = "streams-util.js",
+    base_name = "streams_util",
+)
+
+wd_cc_embed(
+    name = "wintertc-smoke-embed",
+    src = "sandbox-executor/wintertc-smoke.js",
+    base_name = "wintertc_smoke",
+)
+
+wd_cc_binary(
+    name = "workerd-sandbox-executor",
+    srcs = [
+        "sandbox-executor/hyperlight-driver.h",
+        "sandbox-executor/sandbox-executor.c++",
+        "sandbox-executor/sandbox-runtime.c++",
+        "sandbox-executor/sandbox-runtime.h",
+    ],
+    copts = ["-fPIE"],
+    linkopts = ["-static-pie"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":helloworld-worker-embed",
+        ":streams-util-embed",
+        ":web-streams-worker-embed",
+        ":wintertc-smoke-embed",
+        ":workerd-api",
+        "//src/workerd/io",
+        "//src/workerd/io:compatibility-date",
+        "//src/workerd/jsg",
+        "//src/workerd/util:autogate",
+        "//src/workerd/util:setup-async-io",
+        "@capnp-cpp//src/capnp/compat:json",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj:kj-async-core",
+        "@capnp-cpp//src/kj:kj-async-io",
+    ],
+)
+
 # The CLI main()'s two backend-divergent I/O paths -- the --watch file watcher and the SIGTERM
 # graceful drain -- behind backend-agnostic entry points (workerd::server::makeFileWatcher /
 # captureSigterm / onSigterm), so workerd.c++ links them unchanged in both configs. The single
@@ -264,6 +335,22 @@ wd_cc_library(
     ],
 )
 
+wd_cc_library(
+    name = "sandbox-service",
+    srcs = ["sandbox-service.c++"],
+    hdrs = ["sandbox-service.h"],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/workerd/io:worker-interface_capnp",
+        "@capnp-cpp//src/capnp",
+        "@capnp-cpp//src/capnp:capnp-rpc",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj:kj-async",
+        "@capnp-cpp//src/kj:kj-async-io",
+        "@capnp-cpp//src/kj/compat:kj-http",
+    ],
+)
+
 # Calls kj::setupAsyncIo() (Server::run's own loop) but does not supply it: the BINARY picks the I/O backend by linking
 # //src/workerd/util:setup-async-io (the tokio backend; kj_test and wd_cc_benchmark do this for
 # every test binary) or @capnp-cpp//src/kj:kj-async (kj's own event loop). A binary that links
@@ -284,6 +371,7 @@ wd_cc_library(
         ":container-client",
         ":facet-tree-index",
         ":fallback-service",
+        ":sandbox-service",
         ":workerd-api",
         ":workerd_capnp",
         "//src/cloudflare",

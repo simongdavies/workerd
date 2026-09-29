@@ -1,0 +1,26 @@
+{
+  "smoke": "WinterTC minimum-common API smoke (not conformance)",
+  "url": true,
+  "urlPattern": true,
+  "request": true,
+  "response": true,
+  "headers": true,
+  "formData": true,
+  "blob": true,
+  "textCodec": true,
+  "cryptoDigest": true,
+  "cryptoRandom": true,
+  "readableStream": true,
+  "transformStream": true,
+  "compression": true,
+  "performance": true,
+  "webAssembly": "blocked by executor embedder policy",
+  "timers": "not exercised: executor timer channel is disabled",
+  "capabilityBackedUnavailable": [
+    "outbound fetch",
+    "WebSocket",
+    "connect",
+    "bindings",
+    "actors"
+  ]
+}

@@ -4552,6 +4552,115 @@ KJ_TEST("Server: external server") {
   conn.recvHttp200("OK");
 }
 
+KJ_TEST("Server: sandboxed Worker requires experimental mode") {
+  TestServer test(R"((
+    services = [
+      ( name = "sandbox",
+        sandboxedWorker = (
+          workerId = "worker-a",
+          version = "v1",
+          address = "guest-addr",
+          capnpConnectHost = "sandbox"
+        )
+      )
+    ],
+    sockets = [
+      (name = "main", address = "test-addr", service = "sandbox")
+    ]
+  ))"_kj);
+
+  test.expectErrors("Sandboxed Worker service \"sandbox\" is an experimental feature. "
+                    "You must run workerd with `--experimental` to use it.\n");
+}
+
+KJ_TEST("Server: sandboxed Worker fetch streams over RPC") {
+  TestServer test(R"((
+    services = [
+      ( name = "sandbox",
+        sandboxedWorker = (
+          workerId = "worker-a",
+          version = "v1",
+          address = "guest-addr",
+          capnpConnectHost = "sandbox"
+        )
+      ),
+      ( name = "guest",
+        worker = (
+          compatibilityDate = "2025-08-01",
+          modules = [
+            ( name = "worker.js",
+              esModule =
+                `export default {
+                `  async fetch(request) {
+                `    const body = await request.text();
+                `    return new Response("guest:" + new URL(request.url).pathname + ":" + body);
+                `  }
+                `}
+            )
+          ]
+        )
+      )
+    ],
+    sockets = [
+      (name = "main", address = "test-addr", service = "sandbox"),
+      ( name = "guest-rpc",
+        address = "guest-addr",
+        service = "guest",
+        http = (capnpConnectHost = "sandbox")
+      )
+    ]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.send(R"(
+    POST /streamed HTTP/1.1
+    Host: foo
+    Content-Length: 7
+
+    payload)"_blockquote);
+  conn.recvHttp200("guest:/streamed:payload");
+}
+
+KJ_TEST("Server: sandboxed Worker RPC disconnect closes request without local fallback") {
+  TestServer test(R"((
+    services = [
+      ( name = "sandbox",
+        sandboxedWorker = (
+          workerId = "worker-a",
+          version = "v1",
+          address = "guest-addr",
+          capnpConnectHost = "sandbox"
+        )
+      )
+    ],
+    sockets = [
+      (name = "main", address = "test-addr", service = "sandbox")
+    ]
+  ))"_kj);
+
+  test.server.allowExperimental();
+  test.start();
+
+  auto conn = test.connect("test-addr");
+  conn.sendHttpGet("/");
+
+  {
+    auto guest = test.receiveSubrequest("guest-addr");
+    guest.send(R"(
+      HTTP/1.1 200 OK
+
+    )"_blockquote);
+    guest.getStream().abortRead();
+    guest.getStream().shutdownWrite();
+  }
+
+  char byte;
+  KJ_EXPECT(conn.getStream().tryRead(&byte, 1, 1).wait(test.getWaitScope()) == 0);
+}
+
 KJ_TEST("Server: external server proxy style") {
   TestServer test(R"((
     services = [
