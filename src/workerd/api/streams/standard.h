@@ -540,6 +540,8 @@ class ReadableStreamBYOBRequest: public jsg::Object {
   }
 
   bool isPartiallyFulfilled();
+  bool isValid();
+  bool respondForTee(jsg::Lock& js, jsg::JsBufferSource view);
 
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
 

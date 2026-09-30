@@ -24,6 +24,7 @@ using ByobController = jsg::Ref<ReadableByteStreamController>;
 namespace {
 struct ValueReadable;
 struct ByteReadable;
+class ByteTeeCoordinator;
 }  // namespace
 
 // =======================================================================================
@@ -768,6 +769,8 @@ class ReadableStreamJsController final: public ReadableStreamController, public 
   explicit ReadableStreamJsController(StreamStates::Errored errored);
   explicit ReadableStreamJsController(jsg::Lock& js, ValueReadable& consumer);
   explicit ReadableStreamJsController(jsg::Lock& js, ByteReadable& consumer);
+  ReadableStreamJsController(
+      jsg::Lock& js, ByteReadable& consumer, jsg::Ref<ByteTeeCoordinator> teeCoordinator);
 
   jsg::Ref<ReadableStream> addRef() override;
 
@@ -891,10 +894,13 @@ class ReadableStreamJsController final: public ReadableStreamController, public 
   template <typename T>
   jsg::Promise<T> readAll(jsg::Lock& js, uint64_t limit);
 
+  void setupByteTeeBranch(jsg::Lock& js, UnderlyingSource underlyingSource);
+
   friend ReadableLockImpl;
   friend ReadableLockImpl::PipeLocked;
   friend struct ValueReadable;
   friend struct ByteReadable;
+  friend class ByteTeeCoordinator;
 
   template <typename Controller>
   friend jsg::Promise<ReadResult> deferControllerStateChange(jsg::Lock& js,
@@ -2036,12 +2042,60 @@ struct ValueReadable final: public kj::PtrTarget,
   }
 };
 
+class ByteTeeCoordinator final: public jsg::Object {
+ public:
+  explicit ByteTeeCoordinator(jsg::Lock& js);
+
+  void setSource(jsg::Ref<ReadableStream> source);
+  jsg::Ref<ReadableStream> createBranch(jsg::Lock& js, uint branch);
+
+  void onSourceClose(jsg::Lock& js);
+  void onSourceError(jsg::Lock& js, jsg::JsValue reason);
+
+  void visitForGc(jsg::GcVisitor& visitor);
+
+  JSG_RESOURCE_TYPE(ByteTeeCoordinator) {}
+
+ private:
+  struct Branch {
+    kj::Maybe<jsg::WeakRef<ReadableStream>> stream;
+    kj::Maybe<jsg::WeakRef<ReadableByteStreamController>> controller;
+    kj::Maybe<jsg::JsRef<jsg::JsValue>> cancelReason;
+    kj::Maybe<jsg::Promise<void>::Resolver> cancelResolver;
+    kj::Vector<kj::byte> pendingByobBytes;
+    kj::Vector<kj::byte> deferredSourceBytes;
+    bool pullRequested = false;
+    bool canceled = false;
+    bool lockedWhenSourceClosed = false;
+  };
+
+  kj::Maybe<jsg::Ref<ReadableStream>> source;
+  Branch branches[2];
+  bool reading = false;
+  bool sourceClosed = false;
+  bool finished = false;
+  bool cancelingSource = false;
+
+  void start(jsg::Lock& js, uint branch, UnderlyingSource::Controller controller);
+  jsg::Promise<void> pull(jsg::Lock& js, uint branch);
+  jsg::Promise<void> cancel(jsg::Lock& js, uint branch, jsg::JsValue reason);
+  jsg::Promise<void> distribute(jsg::Lock& js,
+      ReadResult result,
+      uint sourceBranch,
+      kj::Maybe<uint> byobBranch,
+      kj::Maybe<jsg::Ref<ReadableStreamBYOBRequest>> byobRequest);
+  void resolvePendingCancel(jsg::Lock& js);
+  void rejectPendingCancel(jsg::Lock& js, jsg::JsValue reason);
+};
+
 struct ByteReadable final: public kj::PtrTarget,
                            public api::ByteQueue::ConsumerImpl::StateListener {
 
   using State = ReadableState<ByobController, ByteQueue>;
   kj::Maybe<State> state;
+  kj::Maybe<jsg::WeakRef<ByteTeeCoordinator>> teeCoordinator;
   kj::Maybe<int> autoAllocateChunkSize;
+  bool autoAllocateChunkSizeExplicit;
   bool reading = false;
   bool pendingCancel = false;
 
@@ -2060,13 +2114,16 @@ struct ByteReadable final: public kj::PtrTarget,
 
   ByteReadable(ByobController controller,
       kj::Ptr<ReadableStreamJsController> owner,
-      kj::Maybe<int> autoAllocateChunkSize)
+      kj::Maybe<int> autoAllocateChunkSize,
+      bool autoAllocateChunkSizeExplicit)
       : state(State(kj::mv(controller), addWeakToThis(), kj::mv(owner))),
-        autoAllocateChunkSize(autoAllocateChunkSize) {}
+        autoAllocateChunkSize(autoAllocateChunkSize),
+        autoAllocateChunkSizeExplicit(autoAllocateChunkSizeExplicit) {}
 
   ByteReadable(jsg::Lock& js, kj::Ptr<ReadableStreamJsController> owner, ByteReadable& other)
       : state(KJ_ASSERT_NONNULL(other.state).clone(js, addWeakToThis(), kj::mv(owner))),
-        autoAllocateChunkSize(other.autoAllocateChunkSize) {}
+        autoAllocateChunkSize(other.autoAllocateChunkSize),
+        autoAllocateChunkSizeExplicit(other.autoAllocateChunkSizeExplicit) {}
 
   KJ_DISALLOW_COPY_AND_MOVE(ByteReadable);
 
@@ -2083,6 +2140,10 @@ struct ByteReadable final: public kj::PtrTarget,
   // new consumer.
   kj::Own<ByteReadable> clone(jsg::Lock& js, kj::Ptr<ReadableStreamJsController> owner) {
     return kj::heap<ByteReadable>(js, kj::mv(owner), *this);
+  }
+
+  void setTeeCoordinator(jsg::Lock& js, jsg::Ref<ByteTeeCoordinator> coordinator) {
+    teeCoordinator = coordinator.getWeakRef(js);
   }
 
   jsg::Promise<ReadResult> read(
@@ -2223,6 +2284,11 @@ struct ByteReadable final: public kj::PtrTarget,
   }
 
   void onConsumerClose(jsg::Lock& js) override {
+    KJ_IF_SOME(coordinator, teeCoordinator) {
+      KJ_IF_SOME(c, coordinator.tryAddRef(js)) {
+        c->onSourceClose(js);
+      }
+    }
     // Note that the owner may drop this readable in doClose so it
     // is not safe to access anything on this after calling doClose.
     KJ_IF_SOME(s, state) {
@@ -2231,6 +2297,11 @@ struct ByteReadable final: public kj::PtrTarget,
   }
 
   void onConsumerError(jsg::Lock& js, jsg::JsValue reason) override {
+    KJ_IF_SOME(coordinator, teeCoordinator) {
+      KJ_IF_SOME(c, coordinator.tryAddRef(js)) {
+        c->onSourceError(js, reason);
+      }
+    }
     // Note that the owner may drop this readable in doClose so it
     // is not safe to access anything on this after calling doError.
     KJ_IF_SOME(s, state) {
@@ -2298,6 +2369,416 @@ struct ByteReadable final: public kj::PtrTarget,
     return state.map([](State& state) { return state.controller.addRef(); });
   }
 };
+
+ByteTeeCoordinator::ByteTeeCoordinator(jsg::Lock&) {}
+
+void ByteTeeCoordinator::setSource(jsg::Ref<ReadableStream> newSource) {
+  KJ_ASSERT(source == kj::none);
+  source = kj::mv(newSource);
+}
+
+jsg::Ref<ReadableStream> ByteTeeCoordinator::createBranch(jsg::Lock& js, uint branch) {
+  KJ_ASSERT(branch < 2);
+  auto self = JSG_THIS;
+  auto controller = kj::heap<ReadableStreamJsController>();
+  controller->setupByteTeeBranch(js,
+      UnderlyingSource{
+        .type = kj::str("bytes"),
+        .start = JSG_VISITABLE_LAMBDA((self = self.addRef(), branch), (self),
+            (jsg::Lock & js, UnderlyingSource::Controller controller) mutable {
+              self->start(js, branch, kj::mv(controller));
+              return js.resolvedPromise();
+            }),
+        .pull = JSG_VISITABLE_LAMBDA((self = self.addRef(), branch), (self),
+            (jsg::Lock & js, UnderlyingSource::Controller) mutable {
+              return self->pull(js, branch);
+            }),
+        .cancel = JSG_VISITABLE_LAMBDA((self = self.addRef(), branch), (self),
+            (jsg::Lock & js, jsg::JsValue reason) mutable {
+              return self->cancel(js, branch, reason);
+            }),
+      });
+  auto stream = js.alloc<ReadableStream>(kj::mv(controller));
+  branches[branch].stream = stream.getWeakRef(js);
+  return stream;
+}
+
+void ByteTeeCoordinator::start(
+    jsg::Lock& js, uint branch, UnderlyingSource::Controller controller) {
+  auto& byteController = KJ_ASSERT_NONNULL(
+      controller.tryGet<ByobController>(), "Byte tee branch must be byte-oriented");
+  branches[branch].controller = byteController.getWeakRef(js);
+}
+
+jsg::Promise<void> ByteTeeCoordinator::pull(jsg::Lock& js, uint branch) {
+  KJ_ASSERT(branch < 2);
+  auto& requested = branches[branch];
+  if (finished || requested.canceled) {
+    return js.resolvedPromise();
+  }
+
+  requested.pullRequested = true;
+  if (reading) {
+    return js.resolvedPromise();
+  }
+
+  kj::Maybe<uint> byobBranch;
+  kj::Maybe<jsg::Ref<ReadableStreamBYOBRequest>> byobRequest;
+  kj::Maybe<ReadableStreamController::ByobOptions> byobOptions;
+
+  KJ_IF_SOME(weakController, requested.controller) {
+    KJ_IF_SOME(controller, weakController.tryAddRef(js)) {
+      KJ_IF_SOME(request, controller->getByobRequest(js)) {
+        auto view = KJ_ASSERT_NONNULL(request->getView(js));
+        byobOptions = ReadableStreamController::ByobOptions{
+          .bufferView = jsg::JsArrayBufferView(view).addRef(js),
+          .atLeast = 1,
+        };
+        byobBranch = branch;
+        byobRequest = request.addRef();
+      }
+    }
+  }
+
+  auto& sourceStream = KJ_ASSERT_NONNULL(source);
+  reading = true;
+  auto readPromise = KJ_ASSERT_NONNULL(sourceStream->getController().read(js, kj::mv(byobOptions)));
+
+  auto self = JSG_THIS;
+  return readPromise.then(js,
+      JSG_VISITABLE_LAMBDA(
+          (self = self.addRef(), branch, byobBranch, byobRequest = kj::mv(byobRequest)),
+          (self, byobRequest),
+          (jsg::Lock & js, ReadResult result) mutable->jsg::Promise<void> {
+            return self->distribute(js, kj::mv(result), branch, byobBranch, kj::mv(byobRequest));
+          }),
+      JSG_VISITABLE_LAMBDA(
+          (self = self.addRef()), (self), (jsg::Lock & js, jsg::Value reason) mutable {
+            self->reading = false;
+            self->onSourceError(js, jsg::JsValue(reason.getHandle(js)));
+            return js.resolvedPromise();
+          }));
+}
+
+jsg::Promise<void> ByteTeeCoordinator::cancel(jsg::Lock& js, uint branch, jsg::JsValue reason) {
+  KJ_ASSERT(branch < 2);
+  auto& canceled = branches[branch];
+  if (canceled.canceled || finished) {
+    return js.resolvedPromise();
+  }
+
+  canceled.canceled = true;
+  canceled.pullRequested = false;
+  canceled.pendingByobBytes.clear();
+  canceled.deferredSourceBytes.clear();
+  canceled.cancelReason = reason.addRef(js);
+
+  auto& other = branches[1 - branch];
+  if (!other.canceled) {
+    auto prp = js.newPromiseAndResolver<void>();
+    canceled.cancelResolver = kj::mv(prp.resolver);
+    return kj::mv(prp.promise);
+  }
+
+  auto compositeReason =
+      jsg::JsValue(js.arr(KJ_ASSERT_NONNULL(branches[0].cancelReason).getHandle(js),
+          KJ_ASSERT_NONNULL(branches[1].cancelReason).getHandle(js)));
+  cancelingSource = true;
+
+  auto& sourceStream = KJ_ASSERT_NONNULL(source);
+  auto self = JSG_THIS;
+  return sourceStream->getController()
+      .cancel(js, compositeReason)
+      .then(js,
+          JSG_VISITABLE_LAMBDA((self = self.addRef()), (self),
+              (jsg::Lock & js) mutable {
+                self->cancelingSource = false;
+                self->resolvePendingCancel(js);
+              }),
+          JSG_VISITABLE_LAMBDA(
+              (self = self.addRef()), (self), (jsg::Lock & js, jsg::Value failure) mutable {
+                self->cancelingSource = false;
+                auto reason = jsg::JsValue(failure.getHandle(js));
+                self->rejectPendingCancel(js, reason);
+                js.throwException(kj::mv(failure));
+              }));
+}
+
+jsg::Promise<void> ByteTeeCoordinator::distribute(jsg::Lock& js,
+    ReadResult result,
+    uint sourceBranch,
+    kj::Maybe<uint> byobBranch,
+    kj::Maybe<jsg::Ref<ReadableStreamBYOBRequest>> byobRequest) {
+  if (finished) {
+    reading = false;
+    return js.resolvedPromise();
+  }
+
+  JSG_TRY(js) {
+    for (auto& branch: branches) {
+      branch.pullRequested = false;
+    }
+
+    kj::Maybe<ByobController> controllers[2];
+    for (uint branch = 0; branch < 2; ++branch) {
+      KJ_IF_SOME(weakController, branches[branch].controller) {
+        controllers[branch] = weakController.tryAddRef(js);
+      }
+    }
+    bool active[2] = {
+      !branches[0].canceled && controllers[0] != kj::none,
+      !branches[1].canceled && controllers[1] != kj::none,
+    };
+
+    auto restorePendingByobBytes = [&](uint branch) {
+      auto& pending = branches[branch].pendingByobBytes;
+      if (active[branch] && pending.size() > 0) {
+        auto chunk = jsg::JsUint8Array::create(js, pending.asPtr());
+        KJ_ASSERT_NONNULL(controllers[branch])->enqueue(js, jsg::JsBufferSource(kj::mv(chunk)));
+      }
+      pending.clear();
+    };
+
+    auto flushDeferredSourceBytes = [&](uint branch) {
+      auto& deferred = branches[branch].deferredSourceBytes;
+      if (active[branch] && deferred.size() > 0) {
+        auto chunk = jsg::JsUint8Array::create(js, deferred.asPtr());
+        KJ_ASSERT_NONNULL(controllers[branch])->enqueue(js, jsg::JsBufferSource(kj::mv(chunk)));
+      }
+      deferred.clear();
+    };
+
+    if (result.done) {
+      KJ_IF_SOME(selected, byobBranch) {
+        bool requestIsActive = byobRequest
+                                   .map([](jsg::Ref<ReadableStreamBYOBRequest>& request) {
+          return request->isValid();
+        }).orDefault(false);
+        if (!requestIsActive) {
+          restorePendingByobBytes(selected);
+        }
+      }
+      flushDeferredSourceBytes(sourceBranch);
+      reading = false;
+      onSourceClose(js);
+      return js.resolvedPromise();
+    }
+
+    auto value = KJ_ASSERT_NONNULL(result.value).getHandle(js);
+    auto view = KJ_ASSERT_NONNULL(value.tryCast<jsg::JsArrayBufferView>());
+    auto chunk = jsg::JsBufferSource(view);
+    auto& deferred = branches[sourceBranch].deferredSourceBytes;
+    kj::Maybe<jsg::JsUint8Array> combinedChunk;
+    if (deferred.size() > 0) {
+      auto bytes = chunk.copy();
+      deferred.addAll(bytes);
+      combinedChunk = jsg::JsUint8Array::create(js, deferred.asPtr());
+      deferred.clear();
+    }
+
+    kj::Maybe<jsg::JsUint8Array> clone;
+    if (active[0] && active[1]) {
+      auto bytes = chunk.copy();
+      clone = jsg::JsUint8Array::create(js, bytes.asPtr());
+    }
+
+    KJ_IF_SOME(selected, byobBranch) {
+      auto other = 1 - selected;
+      bool requestIsActive = byobRequest
+                                 .map([](jsg::Ref<ReadableStreamBYOBRequest>& request) {
+        return request->isValid();
+      }).orDefault(false);
+      if (active[selected] && requestIsActive) {
+        if (combinedChunk != kj::none) {
+          KJ_ASSERT_NONNULL(byobRequest)->invalidate(js);
+          KJ_ASSERT_NONNULL(controllers[selected])
+              ->enqueue(js, jsg::JsBufferSource(KJ_ASSERT_NONNULL(combinedChunk)));
+        } else {
+          auto bytes = chunk.copy();
+          branches[selected].pendingByobBytes.addAll(bytes);
+          if (KJ_ASSERT_NONNULL(byobRequest)->respondForTee(js, kj::mv(chunk))) {
+            branches[selected].pendingByobBytes.clear();
+          }
+        }
+        if (active[other]) {
+          KJ_ASSERT_NONNULL(controllers[other])
+              ->enqueue(js, jsg::JsBufferSource(KJ_ASSERT_NONNULL(clone)));
+        }
+      } else if (active[selected]) {
+        KJ_ASSERT_NONNULL(byobRequest)->invalidate(js);
+        bool branchHadDemand = sourceClosed ? branches[selected].lockedWhenSourceClosed
+                                            : branches[selected]
+                                                  .stream
+                                                  .map([&](jsg::WeakRef<ReadableStream>& stream) {
+          return stream.tryAddRef(js)
+              .map([](jsg::Ref<ReadableStream> stream) {
+            return stream->isLocked();
+          }).orDefault(false);
+        }).orDefault(false);
+        if (branchHadDemand) {
+          if (branches[selected].pendingByobBytes.size() > 0) {
+            restorePendingByobBytes(selected);
+            auto bytes = chunk.copy();
+            branches[selected].deferredSourceBytes.addAll(bytes);
+            branches[selected].pullRequested = false;
+          } else {
+            KJ_ASSERT_NONNULL(controllers[selected])->enqueue(js, kj::mv(chunk));
+          }
+        } else {
+          auto& pending = branches[selected].pendingByobBytes;
+          auto bytes = chunk.copy();
+          pending.addAll(bytes);
+          auto restored = jsg::JsUint8Array::create(js, pending.asPtr());
+          pending.clear();
+          KJ_ASSERT_NONNULL(controllers[selected])
+              ->enqueue(js, jsg::JsBufferSource(kj::mv(restored)));
+        }
+        if (active[other]) {
+          KJ_ASSERT_NONNULL(controllers[other])
+              ->enqueue(js, jsg::JsBufferSource(KJ_ASSERT_NONNULL(clone)));
+        }
+      } else if (active[other]) {
+        KJ_ASSERT_NONNULL(controllers[other])->enqueue(js, kj::mv(chunk));
+      }
+    } else if (combinedChunk != kj::none && active[sourceBranch]) {
+      KJ_ASSERT_NONNULL(controllers[sourceBranch])
+          ->enqueue(js, jsg::JsBufferSource(KJ_ASSERT_NONNULL(combinedChunk)));
+      auto other = 1 - sourceBranch;
+      if (active[other]) {
+        KJ_ASSERT_NONNULL(controllers[other])
+            ->enqueue(js, jsg::JsBufferSource(KJ_ASSERT_NONNULL(clone)));
+      }
+    } else if (active[0]) {
+      KJ_ASSERT_NONNULL(controllers[0])->enqueue(js, kj::mv(chunk));
+      if (active[1]) {
+        KJ_ASSERT_NONNULL(controllers[1])
+            ->enqueue(js, jsg::JsBufferSource(KJ_ASSERT_NONNULL(clone)));
+      }
+    } else if (active[1]) {
+      KJ_ASSERT_NONNULL(controllers[1])->enqueue(js, kj::mv(chunk));
+    }
+
+    reading = false;
+    if (sourceClosed) {
+      flushDeferredSourceBytes(sourceBranch);
+      onSourceClose(js);
+      return js.resolvedPromise();
+    }
+    for (uint branch = 0; branch < 2; ++branch) {
+      if (branches[branch].pullRequested && !branches[branch].canceled) {
+        (void)pull(js, branch);
+        break;
+      }
+    }
+    return js.resolvedPromise();
+  }
+  JSG_CATCH(exception) {
+    reading = false;
+    auto reason = jsg::JsValue(exception.getHandle(js));
+    onSourceError(js, reason);
+    auto& sourceStream = KJ_ASSERT_NONNULL(source);
+    return sourceStream->getController().cancel(js, reason).then(js, [](jsg::Lock&) {
+    }, [](jsg::Lock&, jsg::Value) {});
+  };
+}
+
+void ByteTeeCoordinator::onSourceClose(jsg::Lock& js) {
+  if (finished) return;
+  if (reading) {
+    for (auto& branch: branches) {
+      branch.lockedWhenSourceClosed = branch.stream
+                                          .map([&](jsg::WeakRef<ReadableStream>& stream) {
+        return stream.tryAddRef(js)
+            .map([](jsg::Ref<ReadableStream> stream) {
+          return stream->isLocked();
+        }).orDefault(false);
+      }).orDefault(false);
+    }
+    sourceClosed = true;
+    return;
+  }
+  finished = true;
+  reading = false;
+  for (auto& branch: branches) {
+    if (!branch.canceled) {
+      KJ_IF_SOME(weakController, branch.controller) {
+        KJ_IF_SOME(controller, weakController.tryAddRef(js)) {
+          if (controller->canCloseOrEnqueue()) {
+            if (branch.deferredSourceBytes.size() > 0) {
+              auto chunk = jsg::JsUint8Array::create(js, branch.deferredSourceBytes.asPtr());
+              branch.deferredSourceBytes.clear();
+              controller->enqueue(js, jsg::JsBufferSource(kj::mv(chunk)));
+            }
+            controller->close(js);
+          }
+        }
+      }
+    }
+  }
+  if (!cancelingSource) {
+    resolvePendingCancel(js);
+  }
+}
+
+void ByteTeeCoordinator::onSourceError(jsg::Lock& js, jsg::JsValue reason) {
+  if (finished) return;
+  if (reading) return;
+  finished = true;
+  reading = false;
+  for (auto& branch: branches) {
+    if (!branch.canceled) {
+      KJ_IF_SOME(weakController, branch.controller) {
+        KJ_IF_SOME(controller, weakController.tryAddRef(js)) {
+          if (controller->canCloseOrEnqueue()) {
+            if (branch.deferredSourceBytes.size() > 0) {
+              auto chunk = jsg::JsUint8Array::create(js, branch.deferredSourceBytes.asPtr());
+              branch.deferredSourceBytes.clear();
+              controller->enqueue(js, jsg::JsBufferSource(kj::mv(chunk)));
+            }
+            controller->error(js, reason);
+          }
+        }
+      }
+    }
+  }
+  if (!cancelingSource) {
+    resolvePendingCancel(js);
+  }
+}
+
+void ByteTeeCoordinator::resolvePendingCancel(jsg::Lock& js) {
+  for (auto& branch: branches) {
+    auto maybeResolver = kj::mv(branch.cancelResolver);
+    branch.cancelResolver = kj::none;
+    KJ_IF_SOME(resolver, maybeResolver) {
+      resolver.resolve(js);
+    }
+  }
+}
+
+void ByteTeeCoordinator::rejectPendingCancel(jsg::Lock& js, jsg::JsValue reason) {
+  for (auto& branch: branches) {
+    auto maybeResolver = kj::mv(branch.cancelResolver);
+    branch.cancelResolver = kj::none;
+    KJ_IF_SOME(resolver, maybeResolver) {
+      resolver.reject(js, reason);
+    }
+  }
+}
+
+void ByteTeeCoordinator::visitForGc(jsg::GcVisitor& visitor) {
+  KJ_IF_SOME(s, source) {
+    visitor.visit(s);
+  }
+  for (auto& branch: branches) {
+    KJ_IF_SOME(reason, branch.cancelReason) {
+      visitor.visit(reason);
+    }
+    KJ_IF_SOME(resolver, branch.cancelResolver) {
+      visitor.visit(resolver);
+    }
+  }
+}
 }  // namespace
 
 // =======================================================================================
@@ -2449,7 +2930,10 @@ void ReadableStreamBYOBRequest::invalidate(jsg::Lock& js) {
     // If the user code happened to have retained a reference to the view or
     // the buffer, we need to detach it so that those references cannot be used
     // to modify or observe modifications.
-    impl.view.getHandle(js).detachInPlace(js);
+    auto view = impl.view.getHandle(js);
+    if (!view.isDetached()) {
+      view.detachInPlace(js);
+    }
     impl.controller->runIfAlive(
         [](ReadableByteStreamController& controller) { controller.maybeByobRequest = kj::none; });
   }
@@ -2578,6 +3062,35 @@ bool ReadableStreamBYOBRequest::isPartiallyFulfilled() {
     return impl.readRequest->isPartiallyFulfilled();
   }
   return false;
+}
+
+bool ReadableStreamBYOBRequest::isValid() {
+  return maybeImpl.map([](Impl& impl) {
+    return !impl.readRequest->isInvalidated();
+  }).orDefault(false);
+}
+
+bool ReadableStreamBYOBRequest::respondForTee(jsg::Lock& js, jsg::JsBufferSource view) {
+  auto& impl = KJ_ASSERT_NONNULL(maybeImpl);
+  KJ_ASSERT(impl.controller->isValid());
+  KJ_ASSERT(!impl.readRequest->isInvalidated());
+  auto amount = view.size();
+  KJ_ASSERT(amount > 0);
+  auto detached = view.detachAndTake(js);
+  KJ_ASSERT(detached.size() == amount);
+  bool fulfilled = false;
+  impl.controller->runIfAlive([&](ReadableByteStreamController& controller) {
+    KJ_ASSERT(controller.canCloseOrEnqueue());
+    fulfilled = impl.readRequest->respond(js, amount);
+    if (!fulfilled) {
+      impl.updateView(js);
+    }
+    controller.pull(js);
+    if (fulfilled) {
+      invalidate(js);
+    }
+  });
+  return fulfilled;
 }
 
 // ======================================================================================
@@ -2717,6 +3230,16 @@ ReadableStreamJsController::ReadableStreamJsController(jsg::Lock& js, ValueReada
 
 ReadableStreamJsController::ReadableStreamJsController(jsg::Lock& js, ByteReadable& consumer) {
   state.transitionTo<kj::Own<ByteReadable>>(consumer.clone(js, addPtrToThis()));
+}
+
+ReadableStreamJsController::ReadableStreamJsController(
+    jsg::Lock& js, ByteReadable& consumer, jsg::Ref<ByteTeeCoordinator> teeCoordinator) {
+  auto source = consumer.clone(js, addPtrToThis());
+  if (!source->autoAllocateChunkSizeExplicit) {
+    source->autoAllocateChunkSize = kj::none;
+  }
+  source->setTeeCoordinator(js, kj::mv(teeCoordinator));
+  state.transitionTo<kj::Own<ByteReadable>>(kj::mv(source));
 }
 
 jsg::Ref<ReadableStream> ReadableStreamJsController::addRef() {
@@ -3126,11 +3649,13 @@ ReadableStreamController::Tee ReadableStreamJsController::tee(jsg::Lock& js) {
     KJ_CASE_ONEOF(consumer, kj::Own<ByteReadable>) {
       // Same rationale as the ValueReadable case above.
       KJ_DEFER((void)state.deferTransitionTo<StreamStates::Closed>());
-      // We create two additional streams that clone this stream's consumer state,
-      // then close this stream's consumer.
+      auto coordinator = js.alloc<ByteTeeCoordinator>(js);
+      auto source = js.alloc<ReadableStream>(
+          kj::heap<ReadableStreamJsController>(js, *consumer, coordinator.addRef()));
+      coordinator->setSource(source.addRef());
       return Tee{
-        .branch1 = js.alloc<ReadableStream>(kj::heap<ReadableStreamJsController>(js, *consumer)),
-        .branch2 = js.alloc<ReadableStream>(kj::heap<ReadableStreamJsController>(js, *consumer)),
+        .branch1 = coordinator->createBranch(js, 0),
+        .branch2 = coordinator->createBranch(js, 1),
       };
     }
   }
@@ -3166,6 +3691,8 @@ void ReadableStreamJsController::setup(jsg::Lock& js,
     }
 
     kj::Maybe<int> autoAllocateChunkSize;
+    bool autoAllocateChunkSizeExplicit =
+        underlyingSource.autoAllocateChunkSize.map([](int) { return true; }).orDefault(false);
     if (useSpecCompliantBehavior) {
       // Spec-compliant: only set if user explicitly provides it
       autoAllocateChunkSize =
@@ -3190,7 +3717,8 @@ void ReadableStreamJsController::setup(jsg::Lock& js,
     // their lifetimes are identical (in practice) and memory accounting itself has a memory
     // overhead. The same applies to ValueReadable below.
     state.transitionTo<kj::Own<ByteReadable>>(
-        kj::heap<ByteReadable>(controller.addRef(), addPtrToThis(), autoAllocateChunkSize)
+        kj::heap<ByteReadable>(controller.addRef(), addPtrToThis(), autoAllocateChunkSize,
+            autoAllocateChunkSizeExplicit)
             .attach(js.getExternalMemoryAdjustment(
                 sizeof(ByteReadable) + sizeof(ReadableByteStreamController))));
     controller->start(js);
@@ -3205,6 +3733,17 @@ void ReadableStreamJsController::setup(jsg::Lock& js,
                 sizeof(ValueReadable) + sizeof(ReadableStreamDefaultController))));
     controller->start(js);
   }
+}
+
+void ReadableStreamJsController::setupByteTeeBranch(
+    jsg::Lock& js, UnderlyingSource underlyingSource) {
+  auto controller = js.alloc<ReadableByteStreamController>(
+      kj::mv(underlyingSource), StreamQueuingStrategy{.highWaterMark = 0});
+  state.transitionTo<kj::Own<ByteReadable>>(
+      kj::heap<ByteReadable>(controller.addRef(), addPtrToThis(), kj::none, false)
+          .attach(js.getExternalMemoryAdjustment(
+              sizeof(ByteReadable) + sizeof(ReadableByteStreamController))));
+  controller->start(js);
 }
 
 kj::Maybe<kj::Ptr<ReadableStreamController::PipeController>> ReadableStreamJsController::
