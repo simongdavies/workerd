@@ -1067,8 +1067,13 @@ void ReadableImpl<Self>::start(jsg::Lock& js, jsg::Ref<Self> self) {
         doError(js, err);
       });
 
-  maybeRunAlgorithm(js, algorithms.start, kj::mv(onSuccess), kj::mv(onFailure), kj::mv(self));
+  auto startAlgorithm = kj::mv(algorithms.start);
   algorithms.start = kj::none;
+  KJ_IF_SOME(start, startAlgorithm) {
+    start(js, self.addRef()).then(js, kj::mv(onSuccess), kj::mv(onFailure));
+  } else {
+    js.resolvedPromise().then(js, kj::mv(onSuccess));
+  }
 }
 
 template <typename Self>
@@ -1228,6 +1233,10 @@ template <typename Self>
 void ReadableImpl<Self>::pullIfNeeded(jsg::Lock& js, jsg::Ref<Self> self) {
   // Determining if we need to pull is fairly complicated. All of the following
   // must hold true:
+  if (!flags.started) {
+    return;
+  }
+
   if (!shouldCallPull()) {
     return;
   }
@@ -2127,7 +2136,7 @@ struct ByteReadable final: public kj::PtrTarget,
                     .view = jsg::JsArrayBufferView(store).addRef(js),
                     .elementSize = 1,
                     .originalOffset = 0,
-                    .type = ByteQueue::ReadRequest::Type::BYOB,
+                    .type = ByteQueue::ReadRequest::Type::AUTO_ALLOCATE,
                   }));
         } else {
           prp.resolver.reject(js, js.error("Failed to allocate buffer for read."));
@@ -2162,17 +2171,9 @@ struct ByteReadable final: public kj::PtrTarget,
 
     // We are canceled! There's nothing else to do.
     KJ_IF_SOME(byob, byobOptions) {
-      // If a BYOB buffer was given, we need to give it back wrapped in a TypedArray
-      // whose size is set to zero.
-      auto view = jsg::JsArrayBufferView(byob.bufferView.getHandle(js));
-      view = view.detachAndTake(js).slice(js, 0, 0);
-      return js.resolvedPromise(ReadResult{
-        .value = jsg::JsValue(view).addRef(js),
-        .done = true,
-      });
-    } else {
-      return js.resolvedPromise(ReadResult{.done = true});
+      byob.bufferView.getHandle(js).detachInPlace(js);
     }
+    return js.resolvedPromise(ReadResult{.done = true});
   }
 
   jsg::Promise<DrainingReadResult> drainingRead(jsg::Lock& js, size_t maxRead) {
@@ -2373,8 +2374,8 @@ void ReadableStreamDefaultController::enqueue(jsg::Lock& js, jsg::Optional<jsg::
   }
 }
 
-void ReadableStreamDefaultController::error(jsg::Lock& js, jsg::JsValue reason) {
-  impl.doError(js, reason);
+void ReadableStreamDefaultController::error(jsg::Lock& js, jsg::Optional<jsg::JsValue> reason) {
+  impl.doError(js, reason.orDefault(js.undefined()));
 }
 
 // When a consumer receives a read request, but does not have the data available to
@@ -2456,6 +2457,17 @@ void ReadableStreamBYOBRequest::invalidate(jsg::Lock& js) {
   maybeImpl = kj::none;
 }
 
+void ReadableStreamBYOBRequest::invalidateForEnqueue(jsg::Lock& js) {
+  KJ_IF_SOME(impl, maybeImpl) {
+    impl.view.getHandle(js).detachInPlace(js);
+    impl.controller->runIfAlive([&](ReadableByteStreamController& controller) {
+      controller.requeueByobRequest(kj::mv(impl.readRequest));
+      controller.maybeByobRequest = kj::none;
+    });
+  }
+  maybeImpl = kj::none;
+}
+
 void ReadableStreamBYOBRequest::respond(jsg::Lock& js, int bytesWritten) {
   auto& impl = JSG_REQUIRE_NONNULL(
       maybeImpl, TypeError, "This ReadableStreamBYOBRequest has been invalidated.");
@@ -2499,10 +2511,10 @@ void ReadableStreamBYOBRequest::respond(jsg::Lock& js, int bytesWritten) {
           impl.updateView(js);
         }
       }
-      controller.pull(js);
       if (shouldInvalidate) {
         invalidate(js);
       }
+      controller.pull(js);
     }
   });
 }
@@ -2565,10 +2577,10 @@ void ReadableStreamBYOBRequest::respondWithNewView(jsg::Lock& js, jsg::JsBufferS
         }
       }
 
-      controller.pull(js);
       if (shouldInvalidate) {
         invalidate(js);
       }
+      controller.pull(js);
     }
   });
 }
@@ -2578,6 +2590,13 @@ bool ReadableStreamBYOBRequest::isPartiallyFulfilled() {
     return impl.readRequest->isPartiallyFulfilled();
   }
   return false;
+}
+
+bool ReadableStreamBYOBRequest::isInvalidated() const {
+  KJ_IF_SOME(impl, maybeImpl) {
+    return impl.readRequest->isInvalidated();
+  }
+  return true;
 }
 
 // ======================================================================================
@@ -2616,7 +2635,7 @@ jsg::Promise<void> ReadableByteStreamController::cancel(
     jsg::Lock& js, jsg::Optional<jsg::JsValue> maybeReason) {
   KJ_IF_SOME(byobRequest, maybeByobRequest) {
     if (impl.consumerCount() == 1) {
-      byobRequest->invalidate(js);
+      byobRequest->invalidateForEnqueue(js);
     }
   }
   return impl.cancel(js, JSG_THIS, maybeReason.orDefault(js.undefined()));
@@ -2652,22 +2671,30 @@ void ReadableByteStreamController::enqueue(jsg::Lock& js, jsg::JsBufferSource ch
   JSG_REQUIRE(impl.canCloseOrEnqueue(), TypeError, "This ReadableByteStreamController is closed.");
 
   KJ_IF_SOME(byobRequest, maybeByobRequest) {
+    auto request = byobRequest.addRef();
     KJ_IF_SOME(view, byobRequest->getView(js)) {
       JSG_REQUIRE(
           view.size() > 0, TypeError, "The byobRequest.view is zero-length or was detached");
     }
-    byobRequest->invalidate(js);
+    request->invalidateForEnqueue(js);
   }
 
   impl.enqueue(js, kj::rc<ByteQueue::Entry>(js, chunk.detachAndTake(js)), kj::mv(self));
 }
 
-void ReadableByteStreamController::error(jsg::Lock& js, jsg::JsValue reason) {
-  impl.doError(js, reason);
+void ReadableByteStreamController::error(jsg::Lock& js, jsg::Optional<jsg::JsValue> reason) {
+  impl.doError(js, reason.orDefault(js.undefined()));
 }
 
 kj::Maybe<jsg::Ref<ReadableStreamBYOBRequest>> ReadableByteStreamController::getByobRequest(
     jsg::Lock& js) {
+  KJ_IF_SOME(byobRequest, maybeByobRequest) {
+    if (byobRequest->isInvalidated() && !impl.state.is<StreamStates::Closed>()) {
+      auto stale = byobRequest.addRef();
+      stale->invalidate(js);
+    }
+  }
+
   if (maybeByobRequest == kj::none) {
     KJ_IF_SOME(queue, impl.state.tryGetUnsafe<ByteQueue>()) {
       KJ_IF_SOME(pendingByob, queue.nextPendingByobReadRequest()) {
@@ -2681,6 +2708,12 @@ kj::Maybe<jsg::Ref<ReadableStreamBYOBRequest>> ReadableByteStreamController::get
 
   return maybeByobRequest.map(
       [&](jsg::Ref<ReadableStreamBYOBRequest>& req) { return req.addRef(); });
+}
+
+void ReadableByteStreamController::requeueByobRequest(kj::Own<ByteQueue::ByobRequest> request) {
+  KJ_IF_SOME(queue, impl.state.tryGetUnsafe<ByteQueue>()) {
+    queue.requeuePendingByobReadRequest(kj::mv(request));
+  }
 }
 
 // When a consumer receives a read request, but does not have the data available to
@@ -2891,6 +2924,12 @@ kj::Maybe<jsg::Promise<ReadResult>> ReadableStreamJsController::read(
     }
 
     if (state.is<StreamStates::Closed>() || state.pendingStateIs<StreamStates::Closed>()) {
+      if (canceling) {
+        return js.resolvedPromise(ReadResult{
+          .value = jsg::JsValue(js.undefined()).addRef(js),
+          .done = true,
+        });
+      }
       // If it is a BYOB read, then the spec requires that we return an empty
       // view of the same type provided, that uses the same backing memory
       // as that provided, but with zero-length.
@@ -3154,6 +3193,8 @@ void ReadableStreamJsController::setup(jsg::Lock& js,
   expectedLength = underlyingSource.expectedLength;
 
   if (type == "bytes") {
+    JSG_REQUIRE(queuingStrategy.size == kj::none, RangeError,
+        "The strategy for a byte stream cannot have a size function.");
     // Per spec, autoAllocateChunkSize should only be set if the user explicitly provides it.
     // If not set, the underlying source's pull method won't receive a byobRequest for
     // non-BYOB reads and must use controller.enqueue() instead.
@@ -3162,7 +3203,7 @@ void ReadableStreamJsController::setup(jsg::Lock& js,
     // to control this behavior. Default to legacy behavior if flags aren't available.
     bool useSpecCompliantBehavior = false;
     KJ_IF_SOME(flags, FeatureFlags::tryGet(js)) {
-      useSpecCompliantBehavior = flags.getNoAutoAllocateChunkSize();
+      useSpecCompliantBehavior = flags.getNoAutoAllocateChunkSize() || flags.getPedanticWpt();
     }
 
     kj::Maybe<int> autoAllocateChunkSize;

@@ -911,6 +911,7 @@ KJ_TEST("ByteQueue with default consumer with atLeast") {
                 .elementSize = 1,
                 .originalOffset = 0,
                 .atLeast = atLeast,
+                .type = ByteQueue::ReadRequest::Type::BYOB,
               }));
       return kj::mv(prp.promise);
     };
@@ -958,15 +959,15 @@ KJ_TEST("ByteQueue with default consumer with atLeast") {
     store1.asArrayPtr()[1] = 2;
     push(kj::mv(store1));
 
-    KJ_ASSERT(queue.desiredSize() == 0);
+    KJ_ASSERT(queue.desiredSize() == 2);
 
     auto store2 = jsg::JsBufferSource(jsg::JsUint8Array::create(js, 2));
     store2.asArrayPtr()[0] = 3;
     store2.asArrayPtr()[1] = 4;
     push(kj::mv(store2));
 
-    // Backpressure should be accumulating because the read has not yet fullilled.
-    KJ_ASSERT(queue.desiredSize() == -2);
+    // Bytes copied into a pending pull-into descriptor are no longer queued.
+    KJ_ASSERT(queue.desiredSize() == 2);
 
     auto store3 = jsg::JsBufferSource(jsg::JsUint8Array::create(js, 2));
     store3.asArrayPtr()[0] = 5;
@@ -1001,6 +1002,7 @@ KJ_TEST("ByteQueue with multiple default consumers with atLeast (same rate)") {
                 .elementSize = 1,
                 .originalOffset = 0,
                 .atLeast = atLeast,
+                .type = ByteQueue::ReadRequest::Type::BYOB,
               }));
       return kj::mv(prp.promise);
     };
@@ -1066,15 +1068,15 @@ KJ_TEST("ByteQueue with multiple default consumers with atLeast (same rate)") {
     store1.asArrayPtr()[1] = 2;
     push(kj::mv(store1));
 
-    KJ_ASSERT(queue.desiredSize() == 0);
+    KJ_ASSERT(queue.desiredSize() == 2);
 
     auto store2 = jsg::JsBufferSource(jsg::JsUint8Array::create(js, 2));
     store2.asArrayPtr()[0] = 3;
     store2.asArrayPtr()[1] = 4;
     push(kj::mv(store2));
 
-    // Backpressure should be accumulating because the read has not yet fullilled.
-    KJ_ASSERT(queue.desiredSize() == -2);
+    // Bytes copied into pending pull-into descriptors are no longer queued.
+    KJ_ASSERT(queue.desiredSize() == 2);
 
     auto store3 = jsg::JsBufferSource(jsg::JsUint8Array::create(js, 2));
     store3.asArrayPtr()[0] = 5;
@@ -1109,6 +1111,7 @@ KJ_TEST("ByteQueue with multiple default consumers with atLeast (different rate)
                 .elementSize = 1,
                 .originalOffset = 0,
                 .atLeast = atLeast,
+                .type = ByteQueue::ReadRequest::Type::BYOB,
               }));
       return kj::mv(prp.promise);
     };
@@ -1192,7 +1195,7 @@ KJ_TEST("ByteQueue with multiple default consumers with atLeast (different rate)
     store1.asArrayPtr()[1] = 2;
     push(kj::mv(store1));
 
-    KJ_ASSERT(queue.desiredSize() == 0);
+    KJ_ASSERT(queue.desiredSize() == 2);
 
     auto store2 = jsg::JsBufferSource(jsg::JsUint8Array::create(js, 2));
     store2.asArrayPtr()[0] = 3;
@@ -1203,12 +1206,10 @@ KJ_TEST("ByteQueue with multiple default consumers with atLeast (different rate)
     // between 3 and 5 bytes and it has received four so far.
     KJ_ASSERT(consumer1.size() == 0);
 
-    // Consumer2 should have 4 bytes buffered since its first read was for 5 bytes
-    // and we've only received 4 so far.
-    KJ_ASSERT(consumer2.size() == 4);
+    // Consumer2 has four bytes in its pending pull-into descriptor, not its queue.
+    KJ_ASSERT(consumer2.size() == 0);
 
-    // Queue backpressure should reflect that consumer2 has data buffered.
-    KJ_ASSERT(queue.desiredSize() == -2);
+    KJ_ASSERT(queue.desiredSize() == 2);
 
     auto store3 = jsg::JsBufferSource(jsg::JsUint8Array::create(js, 2));
     store3.asArrayPtr()[0] = 5;
@@ -1217,7 +1218,7 @@ KJ_TEST("ByteQueue with multiple default consumers with atLeast (different rate)
 
     // Most of the backpressure should have been resolved since we delivered 5 bytes
     // to consumer2, but there's still one byte remaining.
-    KJ_ASSERT(queue.desiredSize() = 1);
+    KJ_ASSERT(queue.desiredSize() == 1);
     KJ_ASSERT(queue.size() == 1);
 
     js.runMicrotasks();
