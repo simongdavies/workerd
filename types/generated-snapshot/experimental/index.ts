@@ -76,8 +76,24 @@ export type WorkerGlobalScopeEventMap = {
   unhandledrejection: PromiseRejectionEvent;
   rejectionhandled: PromiseRejectionEvent;
 };
+export type WorkerGlobalScopeOnErrorEventHandler = (
+  this: WorkerGlobalScope,
+  message: string,
+  source: string,
+  lineno: number,
+  colno: number,
+  error: any,
+) => any;
 export declare abstract class WorkerGlobalScope extends EventTarget<WorkerGlobalScopeEventMap> {
   EventTarget: typeof EventTarget;
+  /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/error_event) */
+  onerror: WorkerGlobalScopeOnErrorEventHandler | null;
+  /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/unhandledrejection_event) */
+  onunhandledrejection:
+    ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
+  /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/rejectionhandled_event) */
+  onrejectionhandled:
+    ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
 }
 /* The **`console`** object provides access to the debugging console (e.g., the Web console in Firefox). *
  * The **`console`** object provides access to the debugging console (e.g., the Web console in Firefox).
@@ -413,6 +429,14 @@ export declare function removeEventListener<
 export declare function dispatchEvent(
   event: WorkerGlobalScopeEventMap[keyof WorkerGlobalScopeEventMap],
 ): boolean;
+/* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/error_event) */
+export declare const onerror: WorkerGlobalScopeOnErrorEventHandler | null;
+/* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/unhandledrejection_event) */
+export declare const onunhandledrejection:
+  ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
+/* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/rejectionhandled_event) */
+export declare const onrejectionhandled:
+  ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
 /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/Window/btoa) */
 export declare function btoa(data: string): string;
 /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/Window/atob) */

@@ -132,7 +132,7 @@ class ErrorEvent final: public Event {
     JSG_STRUCT(bubbles, cancelable, composed, message, filename, lineno, colno, error);
   };
 
-  ErrorEvent(ErrorEventInit init);
+  ErrorEvent(ErrorEventInit init, bool cancelable = false);
   ErrorEvent(kj::String type, ErrorEventInit init);
   ErrorEvent(jsg::Lock& js, jsg::JsValue error);
 
@@ -168,8 +168,10 @@ class ErrorEvent final: public Event {
 // ======================================================================================
 class PromiseRejectionEvent final: public Event {
  public:
-  PromiseRejectionEvent(
-      v8::PromiseRejectEvent type, jsg::V8Ref<v8::Promise> promise, jsg::Value reason);
+  PromiseRejectionEvent(v8::PromiseRejectEvent type,
+      jsg::V8Ref<v8::Promise> promise,
+      jsg::Value reason,
+      bool cancelable);
 
   static jsg::Ref<PromiseRejectionEvent> constructor(kj::String type) = delete;
 

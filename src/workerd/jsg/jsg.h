@@ -320,6 +320,15 @@ namespace workerd::jsg {
         decltype(&Self::setter), &Self::setter>();                                                 \
   } while (false)
 
+// Like JSG_INSTANCE_PROPERTY, but omits the property from RTTI. Use this only when a derived
+// context type must repeat an instance-template property that RTTI already inherits from its base.
+#define JSG_RUNTIME_INSTANCE_PROPERTY(name, getter, setter)                                        \
+  do {                                                                                             \
+    static const char NAME[] = #name;                                                              \
+    registry.template registerRuntimeInstanceProperty<NAME, decltype(&Self::getter),               \
+        &Self::getter, decltype(&Self::setter), &Self::setter>();                                  \
+  } while (false)
+
 // Use inside a JSG_RESOURCE_TYPE block to declare a property on this object's prototype that
 // should be accessible to JavaScript. `name` is the JavaScript member name, while `getter` and
 // `setter` are the names of C++ methods that get and set this property.

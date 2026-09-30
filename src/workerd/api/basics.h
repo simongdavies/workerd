@@ -453,6 +453,7 @@ class EventTarget: public jsg::Object {
   // The result of a setEventHandlerAttribute() assignment: cleared, or activated with a
   // non-callable object, or activated with a callable handler.
   enum class EventHandlerAssignment { CLEARED, OBJECT, CALLABLE };
+  enum class EventHandlerReturnBehavior { CANCEL_ON_TRUE, IGNORE };
 
   // Implement HTML's event handler IDL attribute semantics for an on<type> attribute (e.g.
   // AbortSignal's onabort): assigning any object activates a trampoline listener that
@@ -465,13 +466,19 @@ class EventTarget: public jsg::Object {
   EventHandlerAssignment setEventHandlerAttribute(jsg::Lock& js,
       kj::StringPtr type,
       jsg::Optional<kj::OneOf<HandlerFunction, jsg::JsValue>> handler);
+  EventHandlerAssignment setEventHandlerAttribute(jsg::Lock& js,
+      kj::StringPtr type,
+      jsg::JsValue value,
+      kj::Maybe<HandlerFunction> handler,
+      EventHandlerReturnBehavior returnBehavior);
 
   // Registers an internal listener occupying a normal position in the listener list. The
   // identity may later be passed to removeEventListener() to deactivate it.
   void addEventHandlerListener(jsg::Lock& js,
       kj::StringPtr type,
       jsg::HashableV8Ref<v8::Object> identity,
-      HandlerFunction callback);
+      HandlerFunction callback,
+      EventHandlerReturnBehavior returnBehavior = EventHandlerReturnBehavior::CANCEL_ON_TRUE);
 
  private:
   struct EventHandler {
@@ -480,6 +487,7 @@ class EventTarget: public jsg::Object {
     // matching.
     jsg::HashableV8Ref<v8::Object> identity;
     HandlerFunction callback;
+    EventHandlerReturnBehavior returnBehavior = EventHandlerReturnBehavior::CANCEL_ON_TRUE;
 
     // When once is true, the handler will be removed after it is invoked one time.
     bool once = false;
@@ -542,6 +550,7 @@ class EventTarget: public jsg::Object {
       kj::Maybe<HandlerFunction> fn;
     };
     kj::Maybe<Handler> handler;
+    EventHandlerReturnBehavior returnBehavior = EventHandlerReturnBehavior::CANCEL_ON_TRUE;
 
     // While activated, the identity of the trampoline listener entry occupying the
     // attribute's position in the listener list.

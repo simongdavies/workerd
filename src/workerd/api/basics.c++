@@ -233,10 +233,12 @@ EventTarget::EventHandlerSet& EventTarget::getOrCreate(kj::StringPtr type) {
 void EventTarget::addEventHandlerListener(jsg::Lock& js,
     kj::StringPtr type,
     jsg::HashableV8Ref<v8::Object> identity,
-    HandlerFunction callback) {
+    HandlerFunction callback,
+    EventHandlerReturnBehavior returnBehavior) {
   auto eventHandler = kj::heap<EventHandler>(EventHandler{
     .identity = kj::mv(identity),
     .callback = kj::mv(callback),
+    .returnBehavior = returnBehavior,
   });
   auto& handlerSet = getOrCreate(type);
   auto sizeBefore = handlerSet.handlers.size();
@@ -258,11 +260,6 @@ kj::Maybe<jsg::JsValue> EventTarget::getEventHandlerAttribute(jsg::Lock& js, kj:
 EventTarget::EventHandlerAssignment EventTarget::setEventHandlerAttribute(jsg::Lock& js,
     kj::StringPtr type,
     jsg::Optional<kj::OneOf<HandlerFunction, jsg::JsValue>> handler) {
-  const auto getOrCreateAttribute = [&]() -> EventHandlerAttribute& {
-    return eventHandlerAttributes.findOrCreate(
-        type, [&] { return decltype(eventHandlerAttributes)::Entry{kj::str(type), {}}; });
-  };
-
   // Per HTML's event handler semantics: callables (unwrapped as HandlerFunction) become the
   // active handler; non-callable objects are retained as the attribute value but are never
   // invoked; anything else deactivates the handler (treated as null).
@@ -271,26 +268,36 @@ EventTarget::EventHandlerAssignment EventTarget::setEventHandlerAttribute(jsg::L
       KJ_CASE_ONEOF(fn, HandlerFunction) {
         auto value = jsg::JsValue(
             KJ_ASSERT_NONNULL(fn.tryGetHandle(js.v8Isolate), "handler function has no wrapper"));
-        auto& attribute = getOrCreateAttribute();
-        attribute.handler = EventHandlerAttribute::Handler{
-          .value = jsg::JsRef(js, value),
-          .fn = kj::mv(fn),
-        };
-        activateEventHandlerAttribute(js, type, attribute);
-        return EventHandlerAssignment::CALLABLE;
+        return setEventHandlerAttribute(
+            js, type, value, kj::mv(fn), EventHandlerReturnBehavior::CANCEL_ON_TRUE);
       }
       KJ_CASE_ONEOF(value, jsg::JsValue) {
-        if (value.isObject()) {
-          auto& attribute = getOrCreateAttribute();
-          attribute.handler = EventHandlerAttribute::Handler{
-            .value = jsg::JsRef(js, value),
-            .fn = kj::none,
-          };
-          activateEventHandlerAttribute(js, type, attribute);
-          return EventHandlerAssignment::OBJECT;
-        }
+        return setEventHandlerAttribute(
+            js, type, value, kj::none, EventHandlerReturnBehavior::CANCEL_ON_TRUE);
       }
     }
+  }
+
+  return setEventHandlerAttribute(
+      js, type, js.null(), kj::none, EventHandlerReturnBehavior::CANCEL_ON_TRUE);
+}
+
+EventTarget::EventHandlerAssignment EventTarget::setEventHandlerAttribute(jsg::Lock& js,
+    kj::StringPtr type,
+    jsg::JsValue value,
+    kj::Maybe<HandlerFunction> handler,
+    EventHandlerReturnBehavior returnBehavior) {
+  if (value.isObject()) {
+    const bool callable = handler != kj::none;
+    auto& attribute = eventHandlerAttributes.findOrCreate(
+        type, [&] { return decltype(eventHandlerAttributes)::Entry{kj::str(type), {}}; });
+    attribute.handler = EventHandlerAttribute::Handler{
+      .value = jsg::JsRef(js, value),
+      .fn = kj::mv(handler),
+    };
+    attribute.returnBehavior = returnBehavior;
+    activateEventHandlerAttribute(js, type, attribute);
+    return callable ? EventHandlerAssignment::CALLABLE : EventHandlerAssignment::OBJECT;
   }
 
   // Deactivate: clear the value and remove the trampoline listener, so a later reassignment
@@ -337,7 +344,7 @@ void EventTarget::activateEventHandlerAttribute(
         return kj::none;
       });
 
-  addEventHandlerListener(js, type, kj::mv(identity), kj::mv(trampoline));
+  addEventHandlerListener(js, type, kj::mv(identity), kj::mv(trampoline), attribute.returnBehavior);
 }
 
 namespace {
@@ -377,6 +384,7 @@ EventTarget::DispatchResult EventTarget::dispatchEventImpl(
       kj::Maybe<jsg::HashableV8Ref<v8::Object>> identity;
       HandlerFunction callback;
       bool once = false;
+      EventHandlerReturnBehavior returnBehavior = EventHandlerReturnBehavior::CANCEL_ON_TRUE;
     };
 
     kj::Vector<Callback> callbacks;
@@ -405,6 +413,7 @@ EventTarget::DispatchResult EventTarget::dispatchEventImpl(
           .identity = handler->identity.addRef(js),
           .callback = handler->callback.addRef(js),
           .once = handler->once,
+          .returnBehavior = handler->returnBehavior,
         });
       }
     }
@@ -450,8 +459,9 @@ EventTarget::DispatchResult EventTarget::dispatchEventImpl(
         auto ret = callback.callback(js, event.addRef());
         KJ_IF_SOME(r, ret) {
           auto handle = r.getHandle(js);
-          // Returning true is the same as calling preventDefault() on the event.
-          if (handle->IsTrue()) {
+          // Some event handler IDL attributes define a return-value cancellation behavior.
+          if (callback.returnBehavior == EventHandlerReturnBehavior::CANCEL_ON_TRUE &&
+              handle->IsTrue()) {
             event->preventDefault();
           }
           if (flags.warnOnHandlerReturn && !handle->IsBoolean()) {

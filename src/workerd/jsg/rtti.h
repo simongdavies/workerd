@@ -672,6 +672,9 @@ struct MemberCounter {
     ++members;
   }
 
+  template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
+  inline void registerRuntimeInstanceProperty() {}
+
   template <const char* name, typename Getter, Getter getter, bool readOnly>
   inline void registerLazyInstanceProperty() {
     ++members;
@@ -755,6 +758,9 @@ struct MembersBuilder {
     using GetterTraits = FunctionTraits<Getter>;
     BuildRtti<Configuration, typename GetterTraits::ReturnType>::build(prop.initType(), rtti);
   }
+
+  template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
+  inline void registerRuntimeInstanceProperty() {}
 
   template <const char* name, typename Getter, Getter getter>
   inline void registerReadonlyInstanceProperty() {

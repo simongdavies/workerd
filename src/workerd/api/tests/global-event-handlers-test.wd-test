@@ -1,0 +1,29 @@
+using Workerd = import "/workerd/workerd.capnp";
+
+const unitTests :Workerd.Config = (
+  services = [
+    ( name = "global-event-handlers-enabled",
+      worker = (
+        modules = [
+          (name = "worker", esModule = embed "global-event-handlers-test.js")
+        ],
+        compatibilityFlags = [
+          "nodejs_compat",
+          "worker_global_scope_event_handlers",
+          "unhandled_rejection_after_microtask_checkpoint",
+        ],
+      ),
+    ),
+    ( name = "global-event-handlers-disabled",
+      worker = (
+        modules = [
+          (name = "worker", esModule = embed "global-event-handlers-test.js")
+        ],
+        compatibilityFlags = [
+          "nodejs_compat",
+          "no_worker_global_scope_event_handlers",
+        ],
+      ),
+    ),
+  ],
+);

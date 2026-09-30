@@ -147,8 +147,8 @@ void MessageEvent::visitForGc(jsg::GcVisitor& visitor) {
 
 // ======================================================================================
 // Runtime-only (the JS constructor uses the (type, init) overload); always trusted.
-ErrorEvent::ErrorEvent(ErrorEventInit init)
-    : Event(kDefaultErrorEventName, {}, Trusted::YES),
+ErrorEvent::ErrorEvent(ErrorEventInit init, bool cancelable)
+    : Event(kDefaultErrorEventName, Event::Init{.cancelable = cancelable}, Trusted::YES),
       init(kj::mv(init)) {}
 
 ErrorEvent::ErrorEvent(kj::String type, ErrorEventInit init)
@@ -218,10 +218,16 @@ constexpr kj::StringPtr getPromiseRejectionEventName(v8::PromiseRejectEvent type
 
 }  // namespace
 
-PromiseRejectionEvent::PromiseRejectionEvent(
-    v8::PromiseRejectEvent type, jsg::V8Ref<v8::Promise> promise, jsg::Value reason)
+PromiseRejectionEvent::PromiseRejectionEvent(v8::PromiseRejectEvent type,
+    jsg::V8Ref<v8::Promise> promise,
+    jsg::Value reason,
+    bool cancelable)
     // Runtime-only; always trusted.
-    : Event(getPromiseRejectionEventName(type), {}, Trusted::YES),
+    : Event(getPromiseRejectionEventName(type),
+          Event::Init{
+            .cancelable = cancelable && type == v8::PromiseRejectEvent::kPromiseRejectWithNoHandler,
+          },
+          Trusted::YES),
       promise(kj::mv(promise)),
       reason(kj::mv(reason)) {}
 

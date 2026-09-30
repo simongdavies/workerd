@@ -625,6 +625,11 @@ wd_test(
 )
 
 wd_test(
+    src = "global-event-handlers-test.wd-test",
+    data = ["global-event-handlers-test.js"],
+)
+
+wd_test(
     size = "large",
     src = "unhandled-rejection-test.wd-test",
     args = ["--experimental"],
