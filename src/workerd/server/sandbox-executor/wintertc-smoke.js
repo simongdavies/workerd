@@ -76,9 +76,9 @@ export default {
       compression: decompressed === 'abc',
       performance: typeof performance.now() === 'number',
       webAssembly,
-      timers: 'not exercised: executor timer channel is disabled',
+      timers: 'not exercised by smoke',
+      outboundFetch: 'not exercised by smoke',
       capabilityBackedUnavailable: [
-        'outbound fetch',
         'WebSocket',
         'connect',
         'bindings',

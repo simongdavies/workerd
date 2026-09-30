@@ -15,12 +15,7 @@
   "compression": true,
   "performance": true,
   "webAssembly": "blocked by executor embedder policy",
-  "timers": "not exercised: executor timer channel is disabled",
-  "capabilityBackedUnavailable": [
-    "outbound fetch",
-    "WebSocket",
-    "connect",
-    "bindings",
-    "actors"
-  ]
+  "timers": "not exercised by smoke",
+  "outboundFetch": "not exercised by smoke",
+  "capabilityBackedUnavailable": ["WebSocket", "connect", "bindings", "actors"]
 }

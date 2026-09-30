@@ -4,6 +4,8 @@
 
 #include "sandbox-runtime.h"
 
+#include "sandbox-fetch.h"
+
 #include <workerd/api/global-scope.h>
 #include <workerd/api/memory-cache.h>
 #include <workerd/io/actor-cache.h>
@@ -41,29 +43,41 @@ class Cache final: public CacheClient {
 
 class Timer final: public kj::Timer {
  public:
+  explicit Timer(kj::Timer& inner): inner(inner) {}
+
   kj::TimePoint now() const override {
-    return kj::systemCoarseMonotonicClock().now();
+    return inner.now();
   }
-  kj::Promise<void> atTime(kj::TimePoint) override {
-    return kj::NEVER_DONE;
+  kj::Promise<void> atTime(kj::TimePoint time) override {
+    return inner.atTime(time);
   }
-  kj::Promise<void> afterDelay(kj::Duration) override {
-    return kj::NEVER_DONE;
+  kj::Promise<void> afterDelay(kj::Duration delay) override {
+    return inner.afterDelay(delay);
   }
+
+ private:
+  kj::Timer& inner;
 };
 
 class TimerChannelImpl final: public TimerChannel {
  public:
+  explicit TimerChannelImpl(kj::Timer& timer): timer(timer) {}
+
   void syncTime() override {}
   kj::Date now(kj::Maybe<kj::Date>) override {
     return kj::systemPreciseCalendarClock().now();
   }
-  kj::Promise<void> atTime(kj::Date) override {
-    return kj::NEVER_DONE;
+  kj::Promise<void> atTime(kj::Date when) override {
+    auto now = kj::systemPreciseCalendarClock().now();
+    if (when <= now) return kj::READY_NOW;
+    return timer.afterDelay(when - now);
   }
-  kj::Promise<void> afterLimitTimeout(kj::Duration) override {
-    return kj::NEVER_DONE;
+  kj::Promise<void> afterLimitTimeout(kj::Duration delay) override {
+    return timer.afterDelay(delay);
   }
+
+ private:
+  kj::Timer& timer;
 };
 
 class EntropySource final: public kj::EntropySource {
@@ -84,9 +98,7 @@ class LimitEnforcerImpl final: public LimitEnforcer {
     return {};
   }
   void topUpActor() override {}
-  void newSubrequest(bool) override {
-    KJ_FAIL_REQUIRE("subrequests are unavailable");
-  }
+  void newSubrequest(bool) override {}
   void newKvRequest(KvOpType) override {
     KJ_FAIL_REQUIRE("KV is unavailable");
   }
@@ -189,17 +201,27 @@ class ErrorReporter final: public Worker::ValidationErrorReporter {
 
 class ChannelFactory final: public IoChannelFactory {
  public:
-  explicit ChannelFactory(TimerChannel& timer): timer(timer) {}
+  ChannelFactory(TimerChannel& timer, kj::Rc<FetchBroker> fetchBroker)
+      : timer(timer),
+        fetchBroker(kj::mv(fetchBroker)),
+        nextRequestId(kj::rc<uint64_t>(1)) {}
 
   void abortIsolate(kj::StringPtr reason) override {
     KJ_FAIL_REQUIRE("isolate aborted", reason);
   }
-  kj::Own<WorkerInterface> startSubrequest(uint, SubrequestMetadata) override {
-    KJ_FAIL_REQUIRE("subrequests are unavailable");
+  kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) override {
+    KJ_REQUIRE(channel == 0, "only global outbound fetch is available");
+    KJ_REQUIRE(*nextRequestId != kj::maxValue, "outbound fetch request ID space exhausted");
+    return newOutboundFetchWorker(fetchBroker.addRef(), timer, kj::str((*nextRequestId)++));
   }
-  kj::Own<SubrequestChannel> getSubrequestChannelResolved(
-      uint, kj::Maybe<Frankenvalue>, kj::Maybe<VersionRequest>, Persistent) override {
-    KJ_FAIL_REQUIRE("subrequests are unavailable");
+  kj::Own<SubrequestChannel> getSubrequestChannelResolved(uint channel,
+      kj::Maybe<Frankenvalue> props,
+      kj::Maybe<VersionRequest> versionRequest,
+      Persistent persistent) override {
+    KJ_REQUIRE(channel == 0 && props == kj::none && versionRequest == kj::none &&
+            persistent == Persistent::NO,
+        "only the global outbound fetch channel is available");
+    return newOutboundFetchChannel(fetchBroker.addRef(), timer, nextRequestId.addRef());
   }
   kj::Own<ActorClassChannel> getActorClassResolved(
       uint, kj::Maybe<Frankenvalue>, Persistent) override {
@@ -235,6 +257,8 @@ class ChannelFactory final: public IoChannelFactory {
 
  private:
   TimerChannel& timer;
+  kj::Rc<FetchBroker> fetchBroker;
+  kj::Rc<uint64_t> nextRequestId;
 };
 
 class TaskErrorHandler final: public kj::TaskSet::ErrorHandler {
@@ -327,13 +351,13 @@ CompatibilityFlags::Reader buildCompatibilityFlags(capnp::MallocMessageBuilder& 
 }  // namespace
 
 struct SandboxRuntime::Impl {
-  Impl(const WorkerBundle& bundle)
+  Impl(const WorkerBundle& bundle, kj::Rc<FetchBroker> fetchBroker)
       : errorReporter(kj::heap<ErrorReporter>()),
         config(buildConfig(configArena, bundle)),
         compatibilityFlags(buildCompatibilityFlags(compatibilityArena, bundle, *errorReporter)),
         io(kj::setupAsyncIo()),
-        timer(kj::heap<Timer>()),
-        timerChannel(kj::heap<TimerChannelImpl>()),
+        timer(kj::heap<Timer>(io.provider->getTimer())),
+        timerChannel(kj::heap<TimerChannelImpl>(io.provider->getTimer())),
         entropySource(kj::heap<EntropySource>()),
         threadContextHeaderBundle(headerTableBuilder),
         httpOverCapnpFactory(byteStreamFactory,
@@ -383,7 +407,7 @@ struct SandboxRuntime::Impl {
         errorHandler(kj::heap<TaskErrorHandler>()),
         waitUntilTasks(*errorHandler),
         headerTable(headerTableBuilder.build()),
-        channelFactory(kj::rc<ChannelFactory>(*timerChannel)) {}
+        channelFactory(kj::rc<ChannelFactory>(*timerChannel, kj::mv(fetchBroker))) {}
 
   Response runRequest(kj::HttpMethod method,
       kj::StringPtr url,
@@ -438,7 +462,8 @@ struct SandboxRuntime::Impl {
   kj::Rc<ChannelFactory> channelFactory;
 };
 
-SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle): impl(kj::heap<Impl>(bundle)) {}
+SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle, kj::Rc<FetchBroker> fetchBroker)
+    : impl(kj::heap<Impl>(bundle, kj::mv(fetchBroker))) {}
 SandboxRuntime::~SandboxRuntime() noexcept(false) {}
 
 Response SandboxRuntime::runRequest(kj::HttpMethod method,

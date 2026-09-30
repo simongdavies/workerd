@@ -4,17 +4,14 @@
 
 #pragma once
 
+#include "sandbox-fetch.h"
+
 #include <workerd/io/worker.h>
 
 #include <kj/async.h>
 #include <kj/compat/http.h>
 
 namespace workerd::server::sandbox_executor {
-
-struct Header {
-  kj::String name;
-  kj::String value;
-};
 
 struct Response {
   uint statusCode;
@@ -44,7 +41,7 @@ struct WorkerBundle {
 
 class SandboxRuntime {
  public:
-  explicit SandboxRuntime(const WorkerBundle& bundle);
+  SandboxRuntime(const WorkerBundle& bundle, kj::Rc<FetchBroker> fetchBroker);
   ~SandboxRuntime() noexcept(false);
 
   Response runRequest(kj::HttpMethod method,

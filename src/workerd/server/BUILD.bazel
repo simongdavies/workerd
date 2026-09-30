@@ -133,6 +133,8 @@ wd_cc_binary(
     srcs = [
         "sandbox-executor/hyperlight-driver.h",
         "sandbox-executor/sandbox-executor.c++",
+        "sandbox-executor/sandbox-fetch.c++",
+        "sandbox-executor/sandbox-fetch.h",
         "sandbox-executor/sandbox-runtime.c++",
         "sandbox-executor/sandbox-runtime.h",
     ],

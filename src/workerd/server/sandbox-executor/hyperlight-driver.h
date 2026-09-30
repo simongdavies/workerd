@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,12 +23,156 @@ using DispatchFunction = int (*)(const uint8_t*, size_t);
 
 static constexpr auto CALL_DEVICE = "/dev/hlcall";
 static constexpr unsigned long CALL_MAX_LENGTH = _IOR('H', 1, uint64_t);
+static constexpr uint32_t HLCALL_HOSTCALL_ABI_VERSION = 1;
+static constexpr uint32_t HLCALL_HOSTCALL_MAX_ARGS = 4;
+static constexpr uint64_t HLCALL_IOC_MAXLEN = 64 * 1024;
+
+enum HlHostCallType : uint32_t {
+  HLCALL_TYPE_I32 = 1,
+  HLCALL_TYPE_U64 = 2,
+  HLCALL_TYPE_STRING = 3,
+  HLCALL_TYPE_VECBYTES = 4,
+};
+
+struct hlcall_host_arg {
+  uint32_t type;
+  uint32_t reserved;
+  uint64_t value;
+  const void* data;
+  uint64_t len;
+};
+
+struct hlcall_host_call {
+  uint32_t version;
+  uint32_t return_type;
+  const char* function;
+  uint64_t function_len;
+  uint32_t arg_count;
+  uint32_t reserved;
+  hlcall_host_arg args[HLCALL_HOSTCALL_MAX_ARGS];
+  void* output;
+  uint64_t output_cap;
+  uint64_t output_len;
+  int32_t output_i32;
+  uint32_t reserved2;
+  uint64_t output_u64;
+};
+
+static constexpr unsigned long HLCALL_IOC_HOSTCALL = _IOWR('H', 3, struct hlcall_host_call);
+
+static_assert(sizeof(hlcall_host_arg) == 32);
+static_assert(offsetof(hlcall_host_arg, type) == 0);
+static_assert(offsetof(hlcall_host_arg, value) == 8);
+static_assert(offsetof(hlcall_host_arg, data) == 16);
+static_assert(offsetof(hlcall_host_arg, len) == 24);
+static_assert(sizeof(hlcall_host_call) == 200);
+static_assert(offsetof(hlcall_host_call, function) == 8);
+static_assert(offsetof(hlcall_host_call, args) == 32);
+static_assert(offsetof(hlcall_host_call, output) == 160);
+static_assert(offsetof(hlcall_host_call, output_i32) == 184);
+static_assert(offsetof(hlcall_host_call, output_u64) == 192);
 
 inline int callFd = -1;
 inline int protocolOutputFd = STDOUT_FILENO;
 inline uint8_t* callBuffer = nullptr;
 inline size_t callBufferCapacity = 0;
 inline constexpr size_t MAX_PROTOCOL_WRITE_BYTES = 1024;
+
+inline hlcall_host_arg hostCallU64(uint64_t value) {
+  return {
+    .type = HLCALL_TYPE_U64,
+    .reserved = 0,
+    .value = value,
+    .data = nullptr,
+    .len = 0,
+  };
+}
+
+inline hlcall_host_arg hostCallStringArg(kj::StringPtr value) {
+  return {
+    .type = HLCALL_TYPE_STRING,
+    .reserved = 0,
+    .value = 0,
+    .data = value.begin(),
+    .len = value.size(),
+  };
+}
+
+inline hlcall_host_arg hostCallBytesArg(kj::ArrayPtr<const kj::byte> value) {
+  return {
+    .type = HLCALL_TYPE_VECBYTES,
+    .reserved = 0,
+    .value = 0,
+    .data = value.begin(),
+    .len = value.size(),
+  };
+}
+
+inline void invokeHostCall(hlcall_host_call& call) {
+  KJ_REQUIRE(callFd >= 0, "Hyperlight call device is not initialized");
+  KJ_REQUIRE(call.version == HLCALL_HOSTCALL_ABI_VERSION, "invalid Hyperlight host-call version");
+  KJ_REQUIRE(call.function_len > 0 && call.function_len <= 128,
+      "invalid Hyperlight host-call function name");
+  KJ_REQUIRE(call.arg_count <= HLCALL_HOSTCALL_MAX_ARGS, "too many Hyperlight host-call arguments");
+  for (size_t i = 0; i < call.arg_count; ++i) {
+    KJ_REQUIRE(call.args[i].len <= HLCALL_IOC_MAXLEN, "Hyperlight host-call argument is too large");
+  }
+  KJ_REQUIRE(call.output_cap <= HLCALL_IOC_MAXLEN, "Hyperlight host-call output is too large");
+
+  if (ioctl(callFd, HLCALL_IOC_HOSTCALL, &call) < 0) {
+    if (errno == ENOTTY) {
+      KJ_FAIL_REQUIRE(
+          "Hyperlight kernel does not support the guest userspace host-call ABI", strerror(errno));
+    }
+    KJ_FAIL_REQUIRE("Hyperlight host call failed", strerror(errno));
+  }
+  KJ_REQUIRE(call.output_len <= call.output_cap, "Hyperlight host call returned oversized output");
+}
+
+inline hlcall_host_call makeHostCall(
+    kj::StringPtr function, uint32_t returnType, kj::ArrayPtr<const hlcall_host_arg> args) {
+  hlcall_host_call call = {};
+  call.version = HLCALL_HOSTCALL_ABI_VERSION;
+  call.return_type = returnType;
+  call.function = function.begin();
+  call.function_len = function.size();
+  call.arg_count = args.size();
+  for (auto i: kj::indices(args)) {
+    call.args[i] = args[i];
+  }
+  return call;
+}
+
+inline kj::String hostCallString(kj::StringPtr function, kj::ArrayPtr<const hlcall_host_arg> args) {
+  auto output = kj::heapArray<char>(HLCALL_IOC_MAXLEN + 1);
+  auto call = makeHostCall(function, HLCALL_TYPE_STRING, args);
+  call.output = output.begin();
+  call.output_cap = HLCALL_IOC_MAXLEN;
+  invokeHostCall(call);
+  auto result = kj::heapArray<char>(call.output_len + 1);
+  memcpy(result.begin(), output.begin(), call.output_len);
+  result[call.output_len] = '\0';
+  return kj::String(kj::mv(result));
+}
+
+inline kj::Array<kj::byte> hostCallBytes(
+    kj::StringPtr function, kj::ArrayPtr<const hlcall_host_arg> args, size_t outputCapacity) {
+  KJ_REQUIRE(outputCapacity <= HLCALL_IOC_MAXLEN, "Hyperlight byte result capacity is too large");
+  auto output = kj::heapArray<kj::byte>(outputCapacity);
+  auto call = makeHostCall(function, HLCALL_TYPE_VECBYTES, args);
+  call.output = output.begin();
+  call.output_cap = output.size();
+  invokeHostCall(call);
+  auto result = kj::heapArray<kj::byte>(call.output_len);
+  memcpy(result.begin(), output.begin(), call.output_len);
+  return result;
+}
+
+inline int32_t hostCallI32(kj::StringPtr function, kj::ArrayPtr<const hlcall_host_arg> args) {
+  auto call = makeHostCall(function, HLCALL_TYPE_I32, args);
+  invokeHostCall(call);
+  return call.output_i32;
+}
 
 inline bool inBuffer(size_t length, size_t offset, size_t amount) {
   return offset <= length && amount <= length - offset;

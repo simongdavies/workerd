@@ -58,3 +58,21 @@ python3 src/workerd/server/tests/sandbox/make-executor-bundle.py wintertc-smoke
 `ecma-429-support-matrix.json` records the representative executor API smoke and the corresponding
 upstream Workerd WPT baseline. The executor probe is a smoke test, not a WinterTC or ECMA-429
 conformance suite. It distinguishes pure Web API behavior from APIs unavailable by sandbox policy.
+
+## Hyperlight outbound fetch protocol
+
+Global `fetch()` uses Workerd subrequest channel 0 and a typed Hyperlight host-call adapter. The
+guest supplies the HTTP method, URL, ordered header block, and request body. Network policy remains
+host-only and is never represented in the guest protocol. Other subrequest channels, raw
+connections, WebSockets, actors, and capability-backed networking remain unavailable.
+
+Protocol v2 is the default. `WorkerdFetchV2Start`, `Write`, `Finish`, `Poll`, `Read`, and `Cancel`
+form a bounded streaming operation. Start negotiates write and read payload chunks, currently
+preferring 32 KiB and never exceeding the 64 KiB host-call ABI. Write transmits the JSON header block
+before body bytes and applies host backpressure. Poll can expose response metadata before upload
+finishes. Read returns a pending, data, or EOF tag and streams response bytes directly into
+Workerd's native HTTP response. Dropping the Workerd request cancels the host operation.
+
+Protocol v1 remains a non-streaming bring-up fallback. It buffers at most 1 MiB of request body and
+4 MiB of response body, permits at most 16 concurrent operations, and has a 10 second total
+deadline. It is not fetch-parity and should not be selected where v2 is available.
