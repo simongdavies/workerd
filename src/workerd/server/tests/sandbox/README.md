@@ -31,6 +31,42 @@ not a security boundary and has not yet been replaced by Hyperlight.
 
 ## Hyperlight executor bundle protocol
 
+Build and validate the static executor from the repository root:
+
+```sh
+docker build --platform=linux/amd64 -t workerd-dev -f .devcontainer/Dockerfile .devcontainer
+mkdir -p "$HOME/.cache/workerd-bazel" "$HOME/workerd-artifacts"
+docker run --rm --platform=linux/amd64 \
+  -v "$PWD:/workspace" \
+  -v "$HOME/.cache/workerd-bazel:/root/.cache/bazel" \
+  -v "$HOME/workerd-artifacts:/artifacts" \
+  -w /workspace \
+  workerd-dev \
+  bash -lc '
+    set -eux
+    bazel build //src/workerd/server:workerd-sandbox-executor \
+      --//:io_backend=cxx \
+      --workspace_status_command=/bin/true \
+      --jobs="$(nproc)" \
+      --repo_env=CC=/usr/lib/llvm-22/bin/clang \
+      --repo_env=AR=/usr/lib/llvm-22/bin/llvm-ar \
+      --linkopt=--ld-path=/usr/lib/llvm-22/bin/ld.lld \
+      --host_linkopt=--ld-path=/usr/lib/llvm-22/bin/ld.lld
+
+    executor=bazel-bin/src/workerd/server/workerd-sandbox-executor
+    "$executor" --self-test
+    /usr/lib/llvm-22/bin/llvm-strip "$executor"
+    file_output=$(file "$executor")
+    printf "%s\n" "$file_output"
+    printf "%s\n" "$file_output" | grep -Eq "x86-64|Advanced Micro Devices X86-64"
+    ! readelf -l "$executor" | grep -q INTERP
+    ldd "$executor" 2>&1 | grep -q "statically linked"
+    cp "$executor" /artifacts/workerd-sandbox-executor
+    chmod 0755 /artifacts/workerd-sandbox-executor
+    sha256sum /artifacts/workerd-sandbox-executor
+  '
+```
+
 The Hyperlight executor keeps the `init(string)` and `fetch(string)` calls. `init` accepts one
 canonical compact JSON object:
 
