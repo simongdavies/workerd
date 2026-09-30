@@ -541,6 +541,11 @@ enum SerializationTag {
   # A "wrapped binding": an application-level object (e.g. a D1Database) implemented in TypeScript
   # inside the runtime that wraps a single inner service stub. Serializes as the inner stub's
   # payload (per `serviceStub`) followed by the wrapper module name. See api/wrapped-binding.{h,c++}.
+
+  messagePort @18;
+  # A same-isolate MessagePort transfer. The serialized payload contains an index into a
+  # MessagePort transfer table supplied by the serialization context. It is not valid for RPC or
+  # persistent serialization.
 }
 
 enum StreamEncoding {

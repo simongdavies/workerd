@@ -1268,6 +1268,12 @@ wd_test(
     data = ["messageport-test.js"],
 )
 
+wd_test(
+    src = "messageport-legacy-test.wd-test",
+    args = ["--experimental"],
+    data = ["messageport-legacy-test.js"],
+)
+
 js_binary(
     name = "starttls-nodejs-server",
     entry_point = "starttls-nodejs-server.js",

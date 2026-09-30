@@ -1671,4 +1671,15 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   # When enabled, a Worker whose entrypoint is Python are automatically
   # considered as a Python Worker. This flag will be obsoleted once the feature
   # is stable.
+
+  messagePortStandardSemantics @190 :Bool
+      $compatEnableFlag("message_port_standard_semantics")
+      $compatDisableFlag("no_message_port_standard_semantics")
+      $compatEnableDate("2026-10-01");
+  # Enables MessagePort transfer lists and standards-compliant queue activation, close events, and
+  # message listener exception handling. addEventListener("message", ...) alone no longer starts a
+  # port, an enabled port remains enabled after listeners are removed, listener exceptions are only
+  # reported rather than being converted into messageerror events, and explicit close() dispatches
+  # a close event only on the entangled peer rather than on both ports. Message events expose a
+  # null source rather than the receiving port.
 }

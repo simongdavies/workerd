@@ -3,6 +3,8 @@
 #include "blob.h"
 #include "messagechannel.h"
 
+#include <workerd/io/worker.h>
+
 namespace workerd::api {
 
 namespace {
@@ -21,47 +23,55 @@ MessageEvent::MessageEvent(jsg::Lock& js,
     kj::String lastEventId,
     kj::Maybe<jsg::Ref<MessagePort>> source,
     kj::Maybe<jsg::Url&> urlForOrigin,
-    Trusted trusted)
+    Trusted trusted,
+    kj::Array<jsg::Ref<MessagePort>> ports)
     : Event(kMessageEventName, {}, trusted),
       data(jsg::JsRef(js, data)),
       lastEventId(kj::mv(lastEventId)),
       maybeSource(kj::mv(source)),
-      maybeOrigin(urlForOrigin.map([](auto& url) { return kj::str(url.getOrigin()); })) {}
+      maybeOrigin(urlForOrigin.map([](auto& url) { return kj::str(url.getOrigin()); })),
+      ports(kj::mv(ports)) {}
 MessageEvent::MessageEvent(jsg::Lock& js,
     jsg::JsRef<jsg::JsValue> data,
     kj::String lastEventId,
     kj::Maybe<jsg::Ref<MessagePort>> source,
     kj::Maybe<jsg::Url&> urlForOrigin,
-    Trusted trusted)
+    Trusted trusted,
+    kj::Array<jsg::Ref<MessagePort>> ports)
     : Event(kMessageEventName, {}, trusted),
       data(kj::mv(data)),
       lastEventId(kj::mv(lastEventId)),
       maybeSource(kj::mv(source)),
-      maybeOrigin(urlForOrigin.map([](auto& url) { return kj::str(url.getOrigin()); })) {}
+      maybeOrigin(urlForOrigin.map([](auto& url) { return kj::str(url.getOrigin()); })),
+      ports(kj::mv(ports)) {}
 MessageEvent::MessageEvent(jsg::Lock& js,
     kj::String type,
     const jsg::JsValue& data,
     kj::String lastEventId,
     kj::Maybe<jsg::Ref<MessagePort>> source,
     kj::Maybe<jsg::Url&> urlForOrigin,
-    Trusted trusted)
+    Trusted trusted,
+    kj::Array<jsg::Ref<MessagePort>> ports)
     : Event(kj::mv(type), {}, trusted),
       data(jsg::JsRef(js, kj::mv(data))),
       lastEventId(kj::mv(lastEventId)),
       maybeSource(kj::mv(source)),
-      maybeOrigin(urlForOrigin.map([](auto& url) { return kj::str(url.getOrigin()); })) {}
+      maybeOrigin(urlForOrigin.map([](auto& url) { return kj::str(url.getOrigin()); })),
+      ports(kj::mv(ports)) {}
 MessageEvent::MessageEvent(jsg::Lock& js,
     kj::String type,
     kj::OneOf<jsg::JsRef<jsg::JsValue>, jsg::Ref<Blob>> data,
     kj::String lastEventId,
     kj::Maybe<jsg::Ref<MessagePort>> source,
     kj::Maybe<jsg::Url&> urlForOrigin,
-    Trusted trusted)
+    Trusted trusted,
+    kj::Array<jsg::Ref<MessagePort>> ports)
     : Event(kj::mv(type), {}, trusted),
       data(kj::mv(data)),
       lastEventId(kj::mv(lastEventId)),
       maybeSource(kj::mv(source)),
-      maybeOrigin(urlForOrigin.map([](auto& url) { return kj::str(url.getOrigin()); })) {}
+      maybeOrigin(urlForOrigin.map([](auto& url) { return kj::str(url.getOrigin()); })),
+      ports(kj::mv(ports)) {}
 
 MessageEvent::MessageEvent(jsg::Lock& js, kj::String type, Initializer initializer)
     : Event(kj::mv(type),
@@ -111,10 +121,26 @@ kj::StringPtr MessageEvent::getLastEventId() {
 kj::Maybe<jsg::Ref<MessagePort>> MessageEvent::getSource() {
   return maybeSource.map([](auto& port) mutable -> jsg::Ref<MessagePort> { return port.addRef(); });
 }
-kj::Array<jsg::Ref<MessagePort>> MessageEvent::getPorts() {
-  // The runtime never attaches ports (we don't support transferring MessagePorts), so this
-  // is empty except for user-constructed events that passed ports in their init.
-  return KJ_MAP(port, ports) -> jsg::Ref<MessagePort> { return port.addRef(); };
+jsg::JsArray MessageEvent::getPorts(
+    jsg::Lock& js, const jsg::TypeHandler<jsg::Ref<MessagePort>>& portHandler) {
+  auto standardSemantics =
+      Worker::Isolate::from(js).getApi().getFeatureFlags().getMessagePortStandardSemantics();
+  if (standardSemantics) {
+    KJ_IF_SOME(array, portsArray) {
+      return array.getHandle(js);
+    }
+  }
+
+  auto result = js.arr();
+  for (auto& port: ports) {
+    result.add(js, jsg::JsValue(portHandler.wrap(js, port.addRef())));
+  }
+  if (standardSemantics) {
+    jsg::check(v8::Local<v8::Array>(result)->SetIntegrityLevel(
+        js.v8Context(), v8::IntegrityLevel::kFrozen));
+    portsArray = jsg::JsRef(js, result);
+  }
+  return result;
 }
 
 void MessageEvent::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
@@ -130,6 +156,7 @@ void MessageEvent::visitForMemoryInfo(jsg::MemoryTracker& tracker) const {
   for (auto& port: ports) {
     tracker.trackField("port", port);
   }
+  tracker.trackField("portsArray", portsArray);
 }
 
 void MessageEvent::visitForGc(jsg::GcVisitor& visitor) {
@@ -143,6 +170,7 @@ void MessageEvent::visitForGc(jsg::GcVisitor& visitor) {
   }
   visitor.visit(maybeSource);
   visitor.visitAll(ports);
+  visitor.visit(portsArray);
 }
 
 // ======================================================================================

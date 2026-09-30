@@ -17,14 +17,16 @@ class MessageEvent final: public Event {
       kj::String lastEventId = kj::String(),
       kj::Maybe<jsg::Ref<MessagePort>> source = kj::none,
       kj::Maybe<jsg::Url&> urlForOrigin = kj::none,
-      Trusted trusted = Trusted::NO);
+      Trusted trusted = Trusted::NO,
+      kj::Array<jsg::Ref<MessagePort>> ports = {});
 
   MessageEvent(jsg::Lock& js,
       jsg::JsRef<jsg::JsValue> data,
       kj::String lastEventId = kj::String(),
       kj::Maybe<jsg::Ref<MessagePort>> source = kj::none,
       kj::Maybe<jsg::Url&> urlForOrigin = kj::none,
-      Trusted trusted = Trusted::NO);
+      Trusted trusted = Trusted::NO,
+      kj::Array<jsg::Ref<MessagePort>> ports = {});
 
   MessageEvent(jsg::Lock& js,
       kj::String type,
@@ -32,7 +34,8 @@ class MessageEvent final: public Event {
       kj::String lastEventId = kj::String(),
       kj::Maybe<jsg::Ref<MessagePort>> source = kj::none,
       kj::Maybe<jsg::Url&> urlForOrigin = kj::none,
-      Trusted trusted = Trusted::NO);
+      Trusted trusted = Trusted::NO,
+      kj::Array<jsg::Ref<MessagePort>> ports = {});
 
   MessageEvent(jsg::Lock& js,
       kj::String type,
@@ -40,7 +43,8 @@ class MessageEvent final: public Event {
       kj::String lastEventId = kj::String(),
       kj::Maybe<jsg::Ref<MessagePort>> source = kj::none,
       kj::Maybe<jsg::Url&> urlForOrigin = kj::none,
-      Trusted trusted = Trusted::NO);
+      Trusted trusted = Trusted::NO,
+      kj::Array<jsg::Ref<MessagePort>> ports = {});
 
   // The spec's MessageEventInit dictionary. Only `data` is ever meaningful to the runtime
   // itself; the remaining members exist so that user-constructed events reflect the
@@ -78,7 +82,7 @@ class MessageEvent final: public Event {
   // support is MessagePort, return that if its set or null if not.
   kj::Maybe<jsg::Ref<MessagePort>> getSource();
 
-  kj::Array<jsg::Ref<MessagePort>> getPorts();
+  jsg::JsArray getPorts(jsg::Lock& js, const jsg::TypeHandler<jsg::Ref<MessagePort>>& portHandler);
 
   JSG_RESOURCE_TYPE(MessageEvent) {
     JSG_INHERIT(Event);
@@ -90,7 +94,10 @@ class MessageEvent final: public Event {
     JSG_READONLY_INSTANCE_PROPERTY(ports, getPorts);
 
     JSG_TS_ROOT();
-    JSG_TS_OVERRIDE({ readonly data: any; });
+    JSG_TS_OVERRIDE({
+      readonly data: any;
+      readonly ports: readonly MessagePort[];
+    });
   }
 
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
@@ -102,9 +109,8 @@ class MessageEvent final: public Event {
   kj::Maybe<jsg::Ref<MessagePort>> maybeSource;
   kj::Maybe<kj::String> maybeOrigin;
 
-  // The runtime never attaches ports (we do not support transferring MessagePorts);
-  // user-constructed events reflect the ports passed in their init.
   kj::Array<jsg::Ref<MessagePort>> ports;
+  kj::Maybe<jsg::JsRef<jsg::JsArray>> portsArray;
 
   void visitForGc(jsg::GcVisitor& visitor);
 };
