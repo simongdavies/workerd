@@ -381,7 +381,7 @@ class ConsumerImpl final: public kj::PtrTarget {
     // Already closed or errored - nothing to do.
     KJ_IF_SOME(ready, state.tryGetActiveUnsafe()) {
       for (auto& request: ready.readRequests) {
-        request->resolveAsDone(js);
+        request->resolveAsCanceled(js);
       }
       state.template transitionTo<Closed>();
     }
@@ -524,12 +524,7 @@ class ConsumerImpl final: public kj::PtrTarget {
 
   void cancelPendingReads(jsg::Lock& js, jsg::JsValue reason) {
     // Already closed or errored - nothing to do.
-    state.whenActive([&](Ready& ready) {
-      for (auto& request: ready.readRequests) {
-        request->resolver.reject(js, reason);
-      }
-      ready.readRequests.clear();
-    });
+    state.whenActive([&](Ready& ready) { Self::handleReaderRelease(js, ready, reason); });
   }
 
   void visitForGc(jsg::GcVisitor& visitor) {
@@ -624,6 +619,9 @@ class ConsumerImpl final: public kj::PtrTarget {
     // If the state is already errored or closed then there is nothing to drain.
     KJ_IF_SOME(ready, state.tryGetActiveUnsafe()) {
       UpdateBackpressureScope scope(addWeakToThis());
+      if (maybeReason == kj::none && isClosing()) {
+        maybeReason = Self::getCloseError(js, ready);
+      }
       KJ_IF_SOME(reason, maybeReason) {
         // If maybeReason != nullptr, then we are draining because of an error.
         // In that case, we want to reset/clear the buffer and reject any remaining
@@ -725,6 +723,7 @@ class ValueQueue final {
   struct ReadRequest {
     jsg::Promise<ReadResult>::Resolver resolver;
 
+    void resolveAsCanceled(jsg::Lock& js);
     void resolveAsDone(jsg::Lock& js);
     void resolve(jsg::Lock& js, jsg::JsRef<jsg::JsValue> value);
     void reject(jsg::Lock& js, jsg::JsValue value);
@@ -859,6 +858,8 @@ class ValueQueue final {
       kj::Weak<ConsumerImpl> consumer,
       kj::Weak<QueueImpl> queue,
       kj::Own<ReadRequest> request);
+  static void handleReaderRelease(jsg::Lock& js, ConsumerImpl::Ready& state, jsg::JsValue reason);
+  static kj::Maybe<jsg::JsValue> getCloseError(jsg::Lock& js, ConsumerImpl::Ready& state);
   static bool handleMaybeClose(
       jsg::Lock& js, ConsumerImpl::Ready& state, kj::Weak<ConsumerImpl> consumer);
 
@@ -876,7 +877,7 @@ class ByteQueue final {
   class ByobRequest;
 
   struct ReadRequest final: public kj::PtrTarget {
-    enum class Type { DEFAULT, BYOB };
+    enum class Type { DEFAULT, AUTO_ALLOCATE, BYOB, RELEASED, RELEASED_AUTO_ALLOCATE };
     jsg::Promise<ReadResult>::Resolver resolver;
     // The reference here should be cleared when the ByobRequest is invalidated,
     // which happens either when respond(), respondWithNewView(), or invalidate()
@@ -898,9 +899,12 @@ class ByteQueue final {
 
     ReadRequest(jsg::Promise<ReadResult>::Resolver resolver, PullInto pullInto);
     ~ReadRequest() noexcept(false);
+    void resolveAsCanceled(jsg::Lock& js);
     void resolveAsDone(jsg::Lock& js);
     void resolve(jsg::Lock& js);
+    void resolve(jsg::Lock& js, jsg::JsUint8Array view);
     void reject(jsg::Lock& js, jsg::JsValue value);
+    void rejectForRelease(jsg::Lock& js, jsg::JsValue value);
 
     kj::Own<ByobRequest> makeByobReadRequest(
         kj::Weak<ConsumerImpl> consumer, kj::Weak<QueueImpl> queue);
@@ -936,6 +940,10 @@ class ByteQueue final {
     bool respond(jsg::Lock& js, size_t amount);
 
     bool respondWithNewView(jsg::Lock& js, jsg::JsBufferSource view);
+
+    void rebindConsumer(kj::Weak<ConsumerImpl> newConsumer) {
+      consumer = kj::mv(newConsumer);
+    }
 
     // Disconnects this ByobRequest instance from the associated ByteQueue::ReadRequest.
     // The term "invalidate" is adopted from the streams spec for handling BYOB requests.
@@ -988,6 +996,8 @@ class ByteQueue final {
     explicit Entry(jsg::Lock& js, jsg::JsBufferSource store);
 
     kj::ArrayPtr<kj::byte> toArrayPtr(jsg::Lock& js);
+
+    jsg::JsUint8Array getView(jsg::Lock& js, size_t offset, size_t length);
 
     size_t getSize() const;
 
@@ -1058,6 +1068,8 @@ class ByteQueue final {
 
     kj::Own<Consumer> clone(
         jsg::Lock& js, kj::Weak<ConsumerImpl::StateListener> stateListener = nullptr);
+    kj::Own<Consumer> cloneForTee(
+        jsg::Lock& js, kj::Weak<ConsumerImpl::StateListener> stateListener);
     bool hasReadRequests();
     bool hasPendingDrainingRead();
     void cancelPendingReads(jsg::Lock& js, jsg::JsValue reason);
@@ -1102,6 +1114,8 @@ class ByteQueue final {
   // will be disconnected as appropriate.
   kj::Maybe<kj::Own<ByobRequest>> nextPendingByobReadRequest();
 
+  void requeuePendingByobReadRequest(kj::Own<ByobRequest> request);
+
   void visitForGc(jsg::GcVisitor& visitor);
 
   inline kj::StringPtr jsgGetMemoryName() const;
@@ -1120,6 +1134,8 @@ class ByteQueue final {
       kj::Weak<ConsumerImpl> consumer,
       kj::Weak<QueueImpl> queue,
       kj::Own<ReadRequest> request);
+  static void handleReaderRelease(jsg::Lock& js, ConsumerImpl::Ready& state, jsg::JsValue reason);
+  static kj::Maybe<jsg::JsValue> getCloseError(jsg::Lock& js, ConsumerImpl::Ready& state);
   static bool handleMaybeClose(
       jsg::Lock& js, ConsumerImpl::Ready& state, kj::Weak<ConsumerImpl> consumer);
 

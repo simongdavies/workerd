@@ -5,10 +5,13 @@ and byte streams.
 
 ## Endpoints
 
-- `/sync` - Default stream with uppercase transform (synchronous)
+- `/sync` - Deterministic 9,441-byte stream with uppercase transform (synchronous)
 - `/async` - Default stream with uppercase transform (with delays)
 - `/bytes/sync` - Byte stream, no transform (synchronous)
 - `/bytes/async` - Byte stream, no transform (with delays)
+
+The sandbox executor self-test pins the `/sync` size so Azure cold, restored, and prewarmed pool
+measurements use the same payload.
 
 ## Running
 

@@ -4,6 +4,7 @@
 
 #include "sandbox-runtime.h"
 
+#include "hyperlight-driver.h"
 #include "sandbox-fetch.h"
 
 #include <workerd/api/global-scope.h>
@@ -20,12 +21,15 @@
 #include <workerd/util/stream-utils.h>
 
 #include <capnp/compat/http-over-capnp.h>
+#include <capnp/compat/json.h>
 #include <kj/async-io.h>
 
 namespace workerd::server::sandbox_executor {
 namespace {
 
 constexpr kj::StringPtr SCRIPT_ID = "sandbox-executor"_kj;
+constexpr uint64_t MAX_TIMER_ID = 9'007'199'254'740'991;
+constexpr kj::Duration TIMER_POLL_INTERVAL = 1 * kj::MILLISECONDS;
 
 jsg::V8System v8System({"--single-threaded"_kj, "--max-old-space-size=64"_kj,
   "--max-semi-space-size=4"_kj, "--no-concurrent-marking"_kj, "--no-concurrent-sweeping"_kj,
@@ -59,9 +63,125 @@ class Timer final: public kj::Timer {
   kj::Timer& inner;
 };
 
+struct TimerResult {
+  enum class State {
+    PENDING,
+    FIRED,
+    CANCELLED,
+    ERROR,
+  };
+
+  uint64_t timerId;
+  State state;
+  kj::Maybe<kj::String> errorCode;
+  kj::Maybe<kj::String> errorMessage;
+};
+
+TimerResult parseTimerResult(kj::StringPtr input) {
+  capnp::JsonCodec codec;
+  capnp::MallocMessageBuilder message;
+  auto root = message.initRoot<capnp::JsonValue>();
+  codec.decodeRaw(input, root);
+  KJ_REQUIRE(root.isObject(), "timer response must be an object");
+  auto fields = root.getObject();
+  KJ_REQUIRE(fields.size() == 4, "timer response must contain exactly four fields");
+  kj::Maybe<double> protocolVersion;
+  kj::Maybe<double> timerIdValue;
+  kj::Maybe<kj::String> stateValue;
+  kj::Maybe<capnp::JsonValue::Reader> errorValue;
+  for (auto field: fields) {
+    auto name = field.getName();
+    auto value = field.getValue();
+    if (name == "protocol_version"_kj) {
+      KJ_REQUIRE(protocolVersion == kj::none && value.isNumber(), "invalid timer protocol version");
+      protocolVersion = value.getNumber();
+    } else if (name == "timer_id"_kj) {
+      KJ_REQUIRE(timerIdValue == kj::none && value.isNumber(), "invalid timer ID");
+      timerIdValue = value.getNumber();
+    } else if (name == "state"_kj) {
+      KJ_REQUIRE(stateValue == kj::none && value.isString(), "invalid timer state");
+      stateValue = kj::str(value.getString());
+    } else if (name == "error"_kj) {
+      KJ_REQUIRE(errorValue == kj::none, "duplicate timer error");
+      errorValue = value;
+    } else {
+      KJ_FAIL_REQUIRE("unknown timer response field", name);
+    }
+  }
+  KJ_REQUIRE(KJ_REQUIRE_NONNULL(protocolVersion, "missing timer protocol version") == 1,
+      "invalid timer protocol version");
+  auto timerIdNumber = KJ_REQUIRE_NONNULL(timerIdValue, "missing timer ID");
+  KJ_REQUIRE(timerIdNumber >= 0 && timerIdNumber <= MAX_TIMER_ID &&
+          timerIdNumber == static_cast<double>(static_cast<uint64_t>(timerIdNumber)),
+      "invalid timer ID");
+  auto timerId = static_cast<uint64_t>(timerIdNumber);
+  auto& stateName = KJ_REQUIRE_NONNULL(stateValue, "missing timer state");
+
+  TimerResult::State state;
+  if (stateName == "pending"_kj) {
+    state = TimerResult::State::PENDING;
+  } else if (stateName == "fired"_kj) {
+    state = TimerResult::State::FIRED;
+  } else if (stateName == "cancelled"_kj) {
+    state = TimerResult::State::CANCELLED;
+  } else if (stateName == "error"_kj) {
+    state = TimerResult::State::ERROR;
+  } else {
+    KJ_FAIL_REQUIRE("unknown timer state", stateName);
+  }
+
+  kj::Maybe<kj::String> errorCode;
+  kj::Maybe<kj::String> errorMessage;
+  auto error = KJ_REQUIRE_NONNULL(errorValue, "missing timer error");
+  if (state == TimerResult::State::ERROR) {
+    KJ_REQUIRE(error.isObject(), "timer error state must include an error object");
+    auto errorFields = error.getObject();
+    KJ_REQUIRE(errorFields.size() == 2, "invalid timer error object");
+    for (auto field: errorFields) {
+      if (field.getName() == "code"_kj) {
+        KJ_REQUIRE(
+            errorCode == kj::none && field.getValue().isString(), "invalid timer error code");
+        errorCode = kj::str(field.getValue().getString());
+      } else if (field.getName() == "message"_kj) {
+        KJ_REQUIRE(
+            errorMessage == kj::none && field.getValue().isString(), "invalid timer error message");
+        errorMessage = kj::str(field.getValue().getString());
+      } else {
+        KJ_FAIL_REQUIRE("unknown timer error field", field.getName());
+      }
+    }
+    KJ_REQUIRE(errorCode != kj::none && errorMessage != kj::none, "incomplete timer error object");
+  } else {
+    KJ_REQUIRE(error.isNull(), "successful timer response must contain a null error");
+    KJ_REQUIRE(timerId > 0, "successful timer response must contain a timer ID");
+  }
+
+  return TimerResult{timerId, state, kj::mv(errorCode), kj::mv(errorMessage)};
+}
+
+class HyperlightTimerHostChannel final: public TimerHostChannel {
+ public:
+  kj::String start(uint64_t delayNs) override {
+    auto arg = hostCallU64(delayNs);
+    return hostCallString("WorkerdTimerV1Start"_kj, kj::arrayPtr(&arg, 1));
+  }
+
+  kj::String read(uint64_t timerId) override {
+    auto arg = hostCallU64(timerId);
+    return hostCallString("WorkerdTimerV1Read"_kj, kj::arrayPtr(&arg, 1));
+  }
+
+  int32_t cancel(uint64_t timerId) override {
+    auto arg = hostCallU64(timerId);
+    return hostCallI32("WorkerdTimerV1Cancel"_kj, kj::arrayPtr(&arg, 1));
+  }
+};
+
 class TimerChannelImpl final: public TimerChannel {
  public:
-  explicit TimerChannelImpl(kj::Timer& timer): timer(timer) {}
+  TimerChannelImpl(kj::Rc<TimerHostChannel> host, kj::Timer& pollTimer)
+      : host(kj::mv(host)),
+        pollTimer(pollTimer) {}
 
   void syncTime() override {}
   kj::Date now(kj::Maybe<kj::Date>) override {
@@ -69,15 +189,63 @@ class TimerChannelImpl final: public TimerChannel {
   }
   kj::Promise<void> atTime(kj::Date when) override {
     auto now = kj::systemPreciseCalendarClock().now();
-    if (when <= now) return kj::READY_NOW;
-    return timer.afterDelay(when - now);
+    return afterLimitTimeout(when <= now ? 0 * kj::NANOSECONDS : when - now);
   }
   kj::Promise<void> afterLimitTimeout(kj::Duration delay) override {
-    return timer.afterDelay(delay);
+    KJ_REQUIRE(delay >= 0 * kj::NANOSECONDS, "timer delay must not be negative");
+    auto delayNs = static_cast<uint64_t>(delay / kj::NANOSECONDS);
+    auto started = parseTimerResult(host->start(delayNs));
+    if (started.state == TimerResult::State::ERROR) {
+      KJ_REQUIRE(started.timerId == 0, "failed timer start returned an ID");
+      auto& code = KJ_REQUIRE_NONNULL(started.errorCode);
+      KJ_REQUIRE(code == "invalid_duration"_kj || code == "overloaded"_kj,
+          "unknown timer start error code", code);
+      KJ_FAIL_REQUIRE("timer start failed", code, KJ_REQUIRE_NONNULL(started.errorMessage));
+    }
+    KJ_REQUIRE(started.state == TimerResult::State::PENDING, "timer start did not return pending");
+    auto timerId = started.timerId;
+    auto cleanupHost = host.addRef();
+    return awaitTimer(timerId).attach(kj::defer([host = kj::mv(cleanupHost), timerId]() mutable {
+      try {
+        auto result = host->cancel(timerId);
+        if (result == 0) {
+          auto terminal = parseTimerResult(host->read(timerId));
+          KJ_REQUIRE(terminal.timerId == timerId && terminal.state == TimerResult::State::CANCELLED,
+              "cancelled timer did not return its terminal state", timerId);
+        } else if (result != -ENOENT) {
+          KJ_LOG(ERROR, "Hyperlight timer cancellation failed", timerId, result);
+        }
+      } catch (const kj::Exception& exception) {
+        KJ_LOG(ERROR, "Hyperlight timer cancellation host call failed", timerId, exception);
+      }
+    }));
   }
 
  private:
-  kj::Timer& timer;
+  kj::Promise<void> awaitTimer(uint64_t timerId) {
+    auto result = parseTimerResult(host->read(timerId));
+    KJ_REQUIRE(result.timerId == timerId, "timer response ID mismatch");
+    switch (result.state) {
+      case TimerResult::State::PENDING:
+        return pollTimer.afterDelay(TIMER_POLL_INTERVAL).then([this, timerId]() {
+          return awaitTimer(timerId);
+        });
+      case TimerResult::State::FIRED:
+        return kj::READY_NOW;
+      case TimerResult::State::CANCELLED:
+        KJ_FAIL_REQUIRE("timer was cancelled before firing", timerId);
+      case TimerResult::State::ERROR:
+        KJ_REQUIRE(KJ_REQUIRE_NONNULL(result.errorCode) == "unknown_timer"_kj &&
+                KJ_REQUIRE_NONNULL(result.errorMessage) == "unknown or released timer"_kj,
+            "invalid unknown timer response");
+        KJ_FAIL_REQUIRE("timer read failed", KJ_REQUIRE_NONNULL(result.errorCode),
+            KJ_REQUIRE_NONNULL(result.errorMessage));
+    }
+    KJ_UNREACHABLE;
+  }
+
+  kj::Rc<TimerHostChannel> host;
+  kj::Timer& pollTimer;
 };
 
 class EntropySource final: public kj::EntropySource {
@@ -263,7 +431,9 @@ class ChannelFactory final: public IoChannelFactory {
 
 class TaskErrorHandler final: public kj::TaskSet::ErrorHandler {
  public:
-  void taskFailed(kj::Exception&&) override {}
+  void taskFailed(kj::Exception&& exception) override {
+    KJ_LOG(ERROR, "sandbox background task failed", exception);
+  }
 };
 
 class MemoryOutputStream final: public kj::AsyncOutputStream, public kj::Refcounted {
@@ -357,7 +527,7 @@ struct SandboxRuntime::Impl {
         compatibilityFlags(buildCompatibilityFlags(compatibilityArena, bundle, *errorReporter)),
         io(kj::setupAsyncIo()),
         timer(kj::heap<Timer>(io.provider->getTimer())),
-        timerChannel(kj::heap<TimerChannelImpl>(io.provider->getTimer())),
+        timerChannel(newTimerChannel(newHyperlightTimerHostChannel(), io.provider->getTimer())),
         entropySource(kj::heap<EntropySource>()),
         threadContextHeaderBundle(headerTableBuilder),
         httpOverCapnpFactory(byteStreamFactory,
@@ -471,6 +641,14 @@ Response SandboxRuntime::runRequest(kj::HttpMethod method,
     kj::ArrayPtr<const Header> headers,
     kj::StringPtr body) {
   return impl->runRequest(method, url, headers, body);
+}
+
+kj::Rc<TimerHostChannel> newHyperlightTimerHostChannel() {
+  return kj::rc<HyperlightTimerHostChannel>();
+}
+
+kj::Own<TimerChannel> newTimerChannel(kj::Rc<TimerHostChannel> host, kj::Timer& pollTimer) {
+  return kj::heap<TimerChannelImpl>(kj::mv(host), pollTimer);
 }
 
 }  // namespace workerd::server::sandbox_executor

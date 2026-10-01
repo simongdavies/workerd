@@ -4,6 +4,7 @@
 
 #include "sandbox-fetch.h"
 
+#include <workerd/jsg/exception.h>
 #include <workerd/util/stream-utils.h>
 
 namespace workerd::server::sandbox_executor {
@@ -40,31 +41,40 @@ class OutboundFetchWorker final: public WorkerInterface {
       const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody,
       kj::HttpService::Response& response) override {
-    KJ_REQUIRE(url.size() <= MAX_OUTBOUND_FETCH_URL_BYTES &&
-            (url.startsWith("http://") || url.startsWith("https://")),
-        "invalid outbound fetch URL");
+    try {
+      KJ_REQUIRE(url.size() <= MAX_OUTBOUND_FETCH_URL_BYTES &&
+              (url.startsWith("http://") || url.startsWith("https://")),
+          "invalid outbound fetch URL");
 
-    kj::Vector<Header> requestHeaders;
-    size_t aggregateHeaderBytes = 0;
-    headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
-      KJ_REQUIRE(
-          requestHeaders.size() < MAX_OUTBOUND_FETCH_HEADERS, "too many outbound fetch headers");
-      KJ_REQUIRE(validHeaderName(name) && validHeaderValue(value), "invalid outbound fetch header");
-      aggregateHeaderBytes += name.size() + value.size();
-      KJ_REQUIRE(aggregateHeaderBytes <= MAX_OUTBOUND_FETCH_HEADER_BYTES,
-          "outbound fetch headers exceed limit");
-      requestHeaders.add(Header{kj::str(name), kj::str(value)});
-    });
+      kj::Vector<Header> requestHeaders;
+      size_t aggregateHeaderBytes = 0;
+      headers.forEach([&](kj::StringPtr name, kj::StringPtr value) {
+        KJ_REQUIRE(
+            requestHeaders.size() < MAX_OUTBOUND_FETCH_HEADERS, "too many outbound fetch headers");
+        KJ_REQUIRE(
+            validHeaderName(name) && validHeaderValue(value), "invalid outbound fetch header");
+        aggregateHeaderBytes += name.size() + value.size();
+        KJ_REQUIRE(aggregateHeaderBytes <= MAX_OUTBOUND_FETCH_HEADER_BYTES,
+            "outbound fetch headers exceed limit");
+        requestHeaders.add(Header{kj::str(name), kj::str(value)});
+      });
 
-    co_await broker->request(
-        FetchRequest{
-          .requestId = kj::str(requestId),
-          .method = method,
-          .url = kj::str(url),
-          .headers = requestHeaders.releaseAsArray(),
-          .bodyLength = requestBody.tryGetLength(),
-        },
-        headers, requestBody, response, timer);
+      co_await broker->request(
+          FetchRequest{
+            .requestId = kj::str(requestId),
+            .method = method,
+            .url = kj::str(url),
+            .headers = requestHeaders.releaseAsArray(),
+            .bodyLength = requestBody.tryGetLength(),
+          },
+          headers, requestBody, response, timer);
+    } catch (kj::Exception& exception) {
+      if (jsg::isTunneledException(exception.getDescription())) {
+        throw kj::mv(exception);
+      }
+      throw kj::Exception(exception.getType(), exception.getFile(), exception.getLine(),
+          kj::str(JSG_EXCEPTION(Error), ": outbound fetch failed: ", exception.getDescription()));
+    }
   }
 
   kj::Promise<void> connect(kj::StringPtr,

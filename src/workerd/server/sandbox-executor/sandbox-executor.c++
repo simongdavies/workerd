@@ -767,20 +767,23 @@ class HyperlightFetchHostChannel final: public FetchHostChannel {
 kj::Exception fetchFailureToException(FetchFailure failure) {
   switch (failure.error) {
     case FetchError::DENIED:
-      return KJ_EXCEPTION(FAILED, "outbound fetch denied by host", failure.message);
+      return JSG_KJ_EXCEPTION(FAILED, Error, "outbound fetch denied by host: ", failure.message);
     case FetchError::TIMEOUT:
-      return KJ_EXCEPTION(OVERLOADED, "outbound fetch timed out", failure.message);
+      return JSG_KJ_EXCEPTION(OVERLOADED, Error, "outbound fetch timed out: ", failure.message);
     case FetchError::CANCELED:
-      return KJ_EXCEPTION(DISCONNECTED, "outbound fetch canceled", failure.message);
+      return JSG_KJ_EXCEPTION(
+          DISCONNECTED, DOMAbortError, "outbound fetch canceled: ", failure.message);
     case FetchError::MALFORMED_RESPONSE:
-      return KJ_EXCEPTION(
-          FAILED, "host returned a malformed outbound fetch response", failure.message);
+      return JSG_KJ_EXCEPTION(
+          FAILED, Error, "host returned a malformed outbound fetch response: ", failure.message);
     case FetchError::HOST_FAILURE:
-      return KJ_EXCEPTION(FAILED, "outbound fetch host call failed", failure.message);
+      return JSG_KJ_EXCEPTION(FAILED, Error, "outbound fetch host call failed: ", failure.message);
     case FetchError::OVERLOADED:
-      return KJ_EXCEPTION(OVERLOADED, "outbound fetch host is overloaded", failure.message);
+      return JSG_KJ_EXCEPTION(
+          OVERLOADED, Error, "outbound fetch host is overloaded: ", failure.message);
     case FetchError::SIZE_LIMIT:
-      return KJ_EXCEPTION(FAILED, "outbound fetch exceeded host size limit", failure.message);
+      return JSG_KJ_EXCEPTION(
+          FAILED, Error, "outbound fetch exceeded host size limit: ", failure.message);
   }
   KJ_UNREACHABLE;
 }
@@ -1223,8 +1226,11 @@ class StreamingV2FetchBroker final: public FetchBroker {
       kj::AsyncInputStream& requestBody,
       kj::HttpService::Response& httpResponse,
       TimerChannel& timer) override {
-    KJ_REQUIRE(activeOperations < MAX_CONCURRENT_OUTBOUND_FETCHES,
-        "too many concurrent outbound fetch v2 operations");
+    if (activeOperations >= MAX_CONCURRENT_OUTBOUND_FETCHES) {
+      kj::throwRecoverableException(JSG_KJ_EXCEPTION(
+          OVERLOADED, Error, "overloaded: too many concurrent outbound fetch v2 operations"));
+      KJ_UNREACHABLE;
+    }
     ++activeOperations;
     KJ_DEFER(--activeOperations);
     auto headerBlock = serializeFetchHeaderBlock(request.headers);
@@ -1496,8 +1502,21 @@ class Executor {
   kj::String fetch(kj::ArrayPtr<const char> requestJson) {
     auto& worker = KJ_REQUIRE_NONNULL(runtime, "executor is not initialized");
     auto request = parseRequest(requestJson);
-    auto response = worker->runRequest(request.method, request.url, request.headers, request.body);
-    return serializeResponse(request.requestId, response);
+    try {
+      auto response =
+          worker->runRequest(request.method, request.url, request.headers, request.body);
+      return serializeResponse(request.requestId, response);
+    } catch (const kj::Exception& exception) {
+      kj::Vector<char> body;
+      body.addAll("{\"error\":\"worker_execution_failed\",\"exception\":"_kj);
+      appendJsonString(body, exception.getDescription());
+      body.add('}');
+      body.add('\0');
+      auto headers = kj::heapArray<Header>(1);
+      headers[0] = Header{kj::str("content-type"), kj::str("application/json")};
+      return serializeResponse(
+          request.requestId, Response{502, kj::mv(headers), kj::String(body.releaseAsArray())});
+    }
   }
 
  private:
@@ -1519,7 +1538,11 @@ int dispatch(const uint8_t* call, size_t callLength) {
       return writeProtocolMessage(protocolOutputFd, response.slice(0, response.size()));
     }
     return -1;
+  } catch (const kj::Exception& exception) {
+    KJ_LOG(ERROR, "sandbox executor dispatch failed", exception);
+    return -1;
   } catch (...) {
+    KJ_LOG(ERROR, "sandbox executor dispatch failed with a non-KJ exception");
     return -1;
   }
 }
@@ -1541,6 +1564,107 @@ class SelfTestTimer final: public TimerChannel {
 
   size_t waits = 0;
   bool block = false;
+};
+
+class SelfTestPollTimer final: public kj::Timer {
+ public:
+  kj::TimePoint now() const override {
+    return kj::origin<kj::TimePoint>();
+  }
+  kj::Promise<void> atTime(kj::TimePoint time) override {
+    return afterDelay(time - now());
+  }
+  kj::Promise<void> afterDelay(kj::Duration delay) override {
+    delays.add(delay);
+    if (block) return kj::NEVER_DONE;
+    return kj::READY_NOW;
+  }
+
+  kj::Vector<kj::Duration> delays;
+  bool block = false;
+};
+
+class FakeTimerHostChannel final: public TimerHostChannel {
+ public:
+  struct Entry {
+    uint64_t id;
+    size_t pendingReads;
+    bool cancelled = false;
+    bool released = false;
+  };
+
+  kj::String start(uint64_t delayNs) override {
+    startDelays.add(delayNs);
+    KJ_IF_SOME(override, startOverride) {
+      return kj::str(override);
+    }
+    if (startErrorCode != kj::none) {
+      return kj::str(
+          R"JSON({"protocol_version":1,"timer_id":0,"state":"error","error":{"message":")JSON",
+          KJ_REQUIRE_NONNULL(startErrorMessage), R"JSON(","code":")JSON",
+          KJ_REQUIRE_NONNULL(startErrorCode), R"JSON("}})JSON");
+    }
+    auto id = nextId++;
+    entries.add(Entry{id, readsBeforeFire});
+    if (reorderStartFields) {
+      return kj::str(R"JSON({"state":"pending","error":null,"timer_id":)JSON", id,
+          R"JSON(,"protocol_version":1})JSON");
+    }
+    return kj::str(R"JSON({"protocol_version":1,"timer_id":)JSON", id,
+        R"JSON(,"state":"pending","error":null})JSON");
+  }
+
+  kj::String read(uint64_t timerId) override {
+    readIds.add(timerId);
+    KJ_IF_SOME(override, readOverride) {
+      return kj::str(override);
+    }
+    auto entry = find(timerId);
+    if (entry == nullptr || entry->released) {
+      return kj::str(R"JSON({"protocol_version":1,"timer_id":)JSON", timerId,
+          R"JSON(,"state":"error","error":{"code":"unknown_timer","message":"unknown or released timer"}})JSON");
+    }
+    if (entry->cancelled) {
+      entry->released = true;
+      return kj::str(R"JSON({"protocol_version":1,"timer_id":)JSON", timerId,
+          R"JSON(,"state":"cancelled","error":null})JSON");
+    }
+    if (entry->pendingReads > 0) {
+      --entry->pendingReads;
+      return kj::str(R"JSON({"protocol_version":1,"timer_id":)JSON", timerId,
+          R"JSON(,"state":"pending","error":null})JSON");
+    }
+    entry->released = true;
+    return kj::str(R"JSON({"protocol_version":1,"timer_id":)JSON", timerId,
+        R"JSON(,"state":"fired","error":null})JSON");
+  }
+
+  int32_t cancel(uint64_t timerId) override {
+    cancelIds.add(timerId);
+    auto entry = find(timerId);
+    if (entry == nullptr || entry->released) return -ENOENT;
+    entry->cancelled = true;
+    return 0;
+  }
+
+  Entry* find(uint64_t timerId) {
+    for (auto& entry: entries) {
+      if (entry.id == timerId) return &entry;
+    }
+    return nullptr;
+  }
+
+  uint64_t nextId = 1;
+  size_t readsBeforeFire = 0;
+  bool reorderStartFields = false;
+  kj::Maybe<kj::String> startOverride;
+  kj::Maybe<kj::String> readOverride;
+  kj::Maybe<kj::String> startErrorCode;
+  kj::Maybe<kj::String> startErrorMessage;
+  kj::Vector<uint64_t> startDelays;
+  kj::Vector<uint64_t> readIds;
+  kj::Vector<uint64_t> cancelIds;
+  kj::Vector<Entry> entries;
 };
 
 class SelfTestInputStream final: public kj::AsyncInputStream {
@@ -1602,6 +1726,23 @@ class CapturingResponse final: public kj::HttpService::Response {
   kj::Maybe<uint64_t> expectedBodySize;
   kj::Vector<Header> headers;
   kj::Vector<byte> body;
+};
+
+class FailingFetchBroker final: public FetchBroker {
+ public:
+  explicit FailingFetchBroker(kj::Exception exception): exception(kj::mv(exception)) {}
+
+  kj::Promise<void> request(FetchRequest,
+      const kj::HttpHeaders&,
+      kj::AsyncInputStream&,
+      kj::HttpService::Response&,
+      TimerChannel&) override {
+    kj::throwRecoverableException(kj::mv(exception));
+    KJ_UNREACHABLE;
+  }
+
+ private:
+  kj::Exception exception;
 };
 
 class FakeV2FetchHostChannel final: public V2FetchHostChannel {
@@ -1706,6 +1847,88 @@ class FakeV2FetchHostChannel final: public V2FetchHostChannel {
   kj::Vector<byte> writes;
 };
 
+class ConcurrentV2FetchHostChannel final: public V2FetchHostChannel {
+ public:
+  kj::String start(kj::StringPtr) override {
+    auto id = ++startCount;
+    pollCounts.add(0);
+    readOffsets.add(0);
+    return kj::str(R"JSON({"protocol_version":2,"operation_id":)JSON", id,
+        R"JSON(,"max_write_chunk":5,"max_read_chunk":7,"error":null})JSON");
+  }
+
+  int32_t write(uint64_t operationId, kj::ArrayPtr<const byte> bytes) override {
+    KJ_REQUIRE(operationId > 0 && operationId <= startCount);
+    return static_cast<int32_t>(bytes.size());
+  }
+
+  int32_t finish(uint64_t operationId) override {
+    KJ_REQUIRE(operationId > 0 && operationId <= startCount);
+    return 0;
+  }
+
+  kj::String poll(uint64_t operationId) override {
+    auto& count = pollCounts[operationId - 1];
+    if (count++ == 0) {
+      return kj::str(R"JSON({"protocol_version":2,"operation_id":)JSON", operationId,
+          R"JSON(,"state":"uploading","response":null,"error":null})JSON");
+    }
+    return kj::str(R"JSON({"protocol_version":2,"operation_id":)JSON", operationId,
+        R"JSON(,"state":"response","response":{"protocol_version":2,"request_id":"r-1","status":200,"header_block_length":2,"body_length":0},"error":null})JSON");
+  }
+
+  kj::Array<byte> read(uint64_t operationId, size_t maxBytes) override {
+    KJ_REQUIRE(operationId > 0 && operationId <= startCount && maxBytes == 7);
+    auto& offset = readOffsets[operationId - 1];
+    if (offset == 0) {
+      offset = 2;
+      auto result = kj::heapArray<byte>(3);
+      result[0] = 1;
+      result[1] = '[';
+      result[2] = ']';
+      return result;
+    }
+    auto result = kj::heapArray<byte>(1);
+    result[0] = 2;
+    return result;
+  }
+
+  int32_t cancel(uint64_t operationId) override {
+    KJ_REQUIRE(operationId > 0 && operationId <= startCount);
+    return 0;
+  }
+
+  uint64_t startCount = 0;
+  kj::Vector<size_t> pollCounts;
+  kj::Vector<size_t> readOffsets;
+};
+
+class ControlledSelfTestTimer final: public TimerChannel {
+ public:
+  void syncTime() override {}
+  kj::Date now(kj::Maybe<kj::Date>) override {
+    return kj::UNIX_EPOCH;
+  }
+  kj::Promise<void> atTime(kj::Date) override {
+    return kj::READY_NOW;
+  }
+  kj::Promise<void> afterLimitTimeout(kj::Duration) override {
+    auto paf = kj::newPromiseAndFulfiller<void>();
+    fulfillers.add(kj::mv(paf.fulfiller));
+    return kj::mv(paf.promise);
+  }
+
+  void releaseAll() {
+    for (auto& fulfiller: fulfillers) {
+      fulfiller->fulfill();
+    }
+    fulfillers.clear();
+  }
+
+ private:
+  kj::Vector<kj::Own<kj::PromiseFulfiller<void>>> fulfillers;
+};
+
 int selfTest() {
   auto expectRejected = [](kj::ArrayPtr<const char> input) {
     Executor executor;
@@ -1717,6 +1940,74 @@ int selfTest() {
     KJ_FAIL_REQUIRE("invalid init envelope was accepted");
   };
 
+  {
+    auto previousCapacity = callBufferCapacity;
+    KJ_DEFER(callBufferCapacity = previousCapacity);
+    callBufferCapacity = 4096;
+    auto output = kj::heapArray<char>(callBufferCapacity);
+    for (auto function: {"WorkerdTimerV1Start"_kj, "WorkerdTimerV1Read"_kj}) {
+      auto arg = hostCallU64(1);
+      auto call = makeHostCall(function, HLCALL_TYPE_STRING, kj::arrayPtr(&arg, 1));
+      call.output = output.begin();
+      call.output_cap = callBufferCapacity;
+      validateHostCall(call);
+      call.output_cap = callBufferCapacity + 1;
+      try {
+        validateHostCall(call);
+      } catch (const kj::Exception&) {
+        continue;
+      }
+      KJ_FAIL_REQUIRE("timer host call accepted a non-runtime output capacity", function);
+    }
+  }
+
+  auto expectFetchFailure = [](FetchFailure failure, kj::Exception::Type expectedType,
+                                kj::StringPtr expectedDescription) {
+    auto exception = fetchFailureToException(kj::mv(failure));
+    KJ_REQUIRE(exception.getType() == expectedType, "fetch failure used wrong KJ exception type");
+    KJ_REQUIRE(jsg::isTunneledException(exception.getDescription()) &&
+            exception.getDescription().contains(expectedDescription),
+        "fetch failure was not tunneled with its host classification", exception);
+  };
+  expectFetchFailure(FetchFailure{FetchError::DENIED, kj::str("policy_denied: blocked")},
+      kj::Exception::Type::FAILED, "jsg.Error: outbound fetch denied by host: policy_denied"_kj);
+  expectFetchFailure(FetchFailure{FetchError::HOST_FAILURE, kj::str("dns_failed: no records")},
+      kj::Exception::Type::FAILED, "jsg.Error: outbound fetch host call failed: dns_failed"_kj);
+  expectFetchFailure(FetchFailure{FetchError::TIMEOUT, kj::str("timeout: deadline")},
+      kj::Exception::Type::OVERLOADED, "jsg.Error: outbound fetch timed out: timeout"_kj);
+  expectFetchFailure(FetchFailure{FetchError::OVERLOADED, kj::str("overloaded: active limit")},
+      kj::Exception::Type::OVERLOADED,
+      "jsg.Error: outbound fetch host is overloaded: overloaded"_kj);
+  expectFetchFailure(FetchFailure{FetchError::CANCELED, kj::str("cancelled: request aborted")},
+      kj::Exception::Type::DISCONNECTED,
+      "jsg.DOMException(AbortError): outbound fetch canceled: cancelled"_kj);
+
+  auto expectWorkerFailure = [](kj::Exception failure, kj::StringPtr expectedDescription) {
+    kj::EventLoop eventLoop;
+    kj::WaitScope waitScope(eventLoop);
+    SelfTestTimer timer;
+    auto worker =
+        newOutboundFetchWorker(kj::rc<FailingFetchBroker>(kj::mv(failure)), timer, kj::str("r-1"));
+    kj::HttpHeaderTable headerTable;
+    kj::HttpHeaders headers(headerTable);
+    SelfTestInputStream requestBody{kj::ArrayPtr<const byte>()};
+    CapturingResponse response;
+    try {
+      worker
+          ->request(
+              kj::HttpMethod::GET, "http://127.0.0.1:8080/"_kj, headers, requestBody, response)
+          .wait(waitScope);
+      KJ_FAIL_REQUIRE("outbound fetch failure was accepted");
+    } catch (const kj::Exception& exception) {
+      KJ_REQUIRE(exception.getDescription().contains(expectedDescription),
+          "outbound fetch exception used the wrong JavaScript boundary", exception);
+    }
+  };
+  expectWorkerFailure(
+      KJ_EXCEPTION(FAILED, "frozen protocol mismatch"), "jsg.Error: outbound fetch failed: "_kj);
+  expectWorkerFailure(JSG_KJ_EXCEPTION(DISCONNECTED, DOMAbortError, "request aborted"),
+      "jsg.DOMException(AbortError)"_kj);
+
   expectRejected(
       R"JSON({ "protocol_version":1,"worker_version":"noncanonical","compatibility_date":"2023-02-28","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}]})JSON"_kj);
   expectRejected(
@@ -1726,6 +2017,119 @@ int selfTest() {
   auto oversized = kj::heapArray<char>(MAX_ENVELOPE_BYTES + 1);
   memset(oversized.begin(), 'x', oversized.size());
   expectRejected(oversized.asPtr());
+
+  {
+    kj::EventLoop eventLoop;
+    kj::WaitScope waitScope(eventLoop);
+    SelfTestPollTimer pollTimer;
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    auto& fakeRef = *fake;
+    fakeRef.readsBeforeFire = 1;
+    fakeRef.reorderStartFields = true;
+    auto timer = newTimerChannel(kj::mv(fake), pollTimer);
+    timer->afterLimitTimeout(20 * kj::MILLISECONDS).wait(waitScope);
+    KJ_REQUIRE(fakeRef.startDelays.size() == 1 &&
+            fakeRef.startDelays[0] == 20 * kj::MILLISECONDS / kj::NANOSECONDS &&
+            fakeRef.readIds.size() == 2 && fakeRef.readIds[0] == 1 && fakeRef.readIds[1] == 1 &&
+            pollTimer.delays.size() == 1 && pollTimer.delays[0] == 1 * kj::MILLISECONDS &&
+            fakeRef.cancelIds.size() == 1 && fakeRef.cancelIds[0] == 1 &&
+            fakeRef.cancel(1) == -ENOENT,
+        "timer pending/fired/release self-test failed");
+  }
+
+  {
+    kj::EventLoop eventLoop;
+    kj::WaitScope waitScope(eventLoop);
+    SelfTestPollTimer pollTimer;
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    auto& fakeRef = *fake;
+    auto timer = newTimerChannel(kj::mv(fake), pollTimer);
+    timer->afterLimitTimeout(0 * kj::NANOSECONDS).wait(waitScope);
+    KJ_REQUIRE(fakeRef.startDelays.size() == 1 && fakeRef.startDelays[0] == 0 &&
+            fakeRef.readIds.size() == 1 && pollTimer.delays.size() == 0,
+        "zero-delay timer self-test failed");
+  }
+
+  {
+    kj::EventLoop eventLoop;
+    kj::WaitScope waitScope(eventLoop);
+    SelfTestPollTimer pollTimer;
+    pollTimer.block = true;
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    auto& fakeRef = *fake;
+    fakeRef.readsBeforeFire = 100;
+    auto timer = newTimerChannel(kj::mv(fake), pollTimer);
+    {
+      auto pending = timer->afterLimitTimeout(1 * kj::MILLISECONDS).eagerlyEvaluate(nullptr);
+      KJ_REQUIRE(!pending.poll(waitScope), "timer cancellation self-test unexpectedly completed");
+    }
+    KJ_REQUIRE(fakeRef.cancelIds.size() == 1 && fakeRef.cancelIds[0] == 1 &&
+            fakeRef.readIds.size() == 2 && fakeRef.readIds[0] == 1 && fakeRef.readIds[1] == 1 &&
+            fakeRef.cancel(1) == -ENOENT,
+        "timer cancellation cleanup self-test failed");
+  }
+
+  {
+    kj::EventLoop eventLoop;
+    kj::WaitScope waitScope(eventLoop);
+    SelfTestPollTimer pollTimer;
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    auto& fakeRef = *fake;
+    auto timer = newTimerChannel(kj::mv(fake), pollTimer);
+    timer->afterLimitTimeout(1 * kj::MILLISECONDS).wait(waitScope);
+    timer->afterLimitTimeout(20 * kj::MILLISECONDS).wait(waitScope);
+    timer->afterLimitTimeout(35 * kj::MILLISECONDS).wait(waitScope);
+    KJ_REQUIRE(fakeRef.startDelays.size() == 3 &&
+            fakeRef.startDelays[0] == 1 * kj::MILLISECONDS / kj::NANOSECONDS &&
+            fakeRef.startDelays[1] == 20 * kj::MILLISECONDS / kj::NANOSECONDS &&
+            fakeRef.startDelays[2] == 35 * kj::MILLISECONDS / kj::NANOSECONDS &&
+            fakeRef.readIds.size() == 3 && fakeRef.readIds[0] == 1 && fakeRef.readIds[1] == 2 &&
+            fakeRef.readIds[2] == 3,
+        "timer ordering self-test failed");
+  }
+
+  auto expectTimerRejected = [](kj::Rc<FakeTimerHostChannel> fake) {
+    kj::EventLoop eventLoop;
+    kj::WaitScope waitScope(eventLoop);
+    SelfTestPollTimer pollTimer;
+    auto timer = newTimerChannel(kj::mv(fake), pollTimer);
+    try {
+      timer->afterLimitTimeout(0 * kj::NANOSECONDS).wait(waitScope);
+    } catch (const kj::Exception&) {
+      return;
+    }
+    KJ_FAIL_REQUIRE("invalid timer host response was accepted");
+  };
+
+  {
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    fake->startErrorCode = kj::str("invalid_duration");
+    fake->startErrorMessage = kj::str("timer duration overflows monotonic time");
+    expectTimerRejected(kj::mv(fake));
+  }
+  {
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    fake->startErrorCode = kj::str("overloaded");
+    fake->startErrorMessage = kj::str("active timer limit reached");
+    expectTimerRejected(kj::mv(fake));
+  }
+  {
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    fake->startOverride = kj::str("{}");
+    expectTimerRejected(kj::mv(fake));
+  }
+  {
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    fake->readOverride = kj::str(
+        R"JSON({"protocol_version":1,"timer_id":1,"state":"error","error":{"code":"unknown_timer","message":"unknown or released timer"}})JSON");
+    expectTimerRejected(kj::mv(fake));
+  }
+  {
+    auto fake = kj::rc<FakeTimerHostChannel>();
+    fake->readOverride = kj::str(
+        R"JSON({"protocol_version":1,"timer_id":1,"state":"pending","error":null,"extra":true})JSON");
+    expectTimerRejected(kj::mv(fake));
+  }
 
   {
     kj::EventLoop eventLoop;
@@ -1773,6 +2177,65 @@ int selfTest() {
             response.headers[1].value == "two"_kj &&
             response.body.asPtr() == fakeRef.responseBody.asBytes(),
         "v2 response streaming self-test failed");
+  }
+
+  {
+    kj::EventLoop eventLoop;
+    kj::WaitScope waitScope(eventLoop);
+    ControlledSelfTestTimer timer;
+    auto fake = kj::heap<ConcurrentV2FetchHostChannel>();
+    auto& fakeRef = *fake;
+    auto broker = kj::rc<StreamingV2FetchBroker>(kj::mv(fake));
+    kj::HttpHeaderTable headerTable;
+    kj::HttpHeaders headers(headerTable);
+    kj::Vector<kj::Own<SelfTestInputStream>> requestBodies;
+    kj::Vector<kj::Own<CapturingResponse>> responses;
+    kj::Vector<kj::Promise<void>> pending;
+
+    for (size_t i = 0; i < MAX_CONCURRENT_OUTBOUND_FETCHES; ++i) {
+      requestBodies.add(kj::heap<SelfTestInputStream>(kj::ArrayPtr<const byte>()));
+      responses.add(kj::heap<CapturingResponse>());
+      auto promise = broker
+                         ->request(FetchRequest{kj::str("r-1"), kj::HttpMethod::GET,
+                                     kj::str("https://concurrency.example/"),
+                                     kj::heapArray<Header>(0), uint64_t(0)},
+                             headers, *requestBodies.back(), *responses.back(), timer)
+                         .eagerlyEvaluate(nullptr);
+      KJ_REQUIRE(
+          !promise.poll(waitScope), "bounded v2 fetch unexpectedly completed before release");
+      pending.add(kj::mv(promise));
+    }
+    KJ_REQUIRE(fakeRef.startCount == MAX_CONCURRENT_OUTBOUND_FETCHES,
+        "bounded v2 fetch did not start operations 1-16");
+
+    SelfTestInputStream overflowBody{kj::ArrayPtr<const byte>()};
+    CapturingResponse overflowResponse;
+    try {
+      broker
+          ->request(
+              FetchRequest{kj::str("r-1"), kj::HttpMethod::GET,
+                kj::str("https://concurrency.example/"), kj::heapArray<Header>(0), uint64_t(0)},
+              headers, overflowBody, overflowResponse, timer)
+          .wait(waitScope);
+      KJ_FAIL_REQUIRE("17th concurrent v2 fetch operation was accepted");
+    } catch (const kj::Exception& exception) {
+      KJ_REQUIRE(exception.getType() == kj::Exception::Type::OVERLOADED &&
+              jsg::isTunneledException(exception.getDescription()) &&
+              exception.getDescription().contains(
+                  "overloaded: too many concurrent outbound fetch v2 operations"),
+          "17th concurrent v2 fetch operation did not surface stable overload", exception);
+    }
+    KJ_REQUIRE(fakeRef.startCount == MAX_CONCURRENT_OUTBOUND_FETCHES,
+        "overloaded v2 fetch reached the host");
+
+    timer.releaseAll();
+    for (auto& promise: pending) {
+      promise.wait(waitScope);
+    }
+    for (const auto& response: responses) {
+      KJ_REQUIRE(response->statusCode == 200 && response->body.size() == 0,
+          "bounded v2 fetch operation did not fulfill");
+    }
   }
 
   {
@@ -2038,7 +2501,7 @@ int selfTest() {
         kj::str("worker.js"), streamModules.finish()},
       R"JSON({"protocol_version":1,"request_id":"streams","method":"GET","url":"https://example.test/sync","headers":[],"body_base64":""})JSON"_kj,
       [](kj::StringPtr body) {
-    KJ_REQUIRE(body.size() > 0, "web-streams self-test returned no data");
+    KJ_REQUIRE(body.size() == 9441, "web-streams /sync fixture changed size", body.size());
     for (char c: body) {
       KJ_REQUIRE(c < 'a' || c > 'z', "web-streams transform did not uppercase its output");
     }
@@ -2051,6 +2514,17 @@ int selfTest() {
     KJ_REQUIRE(body ==
             R"JSON({"smoke":"WinterTC minimum-common API smoke (not conformance)","url":true,"urlPattern":true,"request":true,"response":true,"headers":true,"formData":true,"blob":true,"textCodec":true,"cryptoDigest":true,"cryptoRandom":true,"readableStream":true,"transformStream":true,"compression":true,"performance":true,"webAssembly":"blocked by executor embedder policy","timers":"not exercised by smoke","outboundFetch":"not exercised by smoke","capabilityBackedUnavailable":["WebSocket","connect","bindings","actors"]})JSON"_kj,
         "WinterTC API smoke self-test failed", body);
+  });
+
+  run(WorkerBundle{kj::str("error-tunnel-v1"), kj::str("2025-12-31"), noFlags(),
+        kj::str("worker.js"),
+        oneModule("worker.js"_kj,
+            "export default { fetch() { throw new Error('executor-error-tunnel'); } };"_kj)},
+      R"JSON({"protocol_version":1,"request_id":"error-tunnel","method":"GET","url":"https://example.test/","headers":[],"body_base64":""})JSON"_kj,
+      [](kj::StringPtr body) {
+    KJ_REQUIRE(body.contains("\"error\":\"worker_execution_failed\""_kj) &&
+            body.contains("executor-error-tunnel"_kj),
+        "executor error tunneling self-test failed", body);
   });
 
   return writeProtocolMessage(protocolOutputFd,

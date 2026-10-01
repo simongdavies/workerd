@@ -76,8 +76,24 @@ export type WorkerGlobalScopeEventMap = {
   unhandledrejection: PromiseRejectionEvent;
   rejectionhandled: PromiseRejectionEvent;
 };
+export type WorkerGlobalScopeOnErrorEventHandler = (
+  this: WorkerGlobalScope,
+  message: string,
+  source: string,
+  lineno: number,
+  colno: number,
+  error: any,
+) => any;
 export declare abstract class WorkerGlobalScope extends EventTarget<WorkerGlobalScopeEventMap> {
   EventTarget: typeof EventTarget;
+  /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/error_event) */
+  onerror: WorkerGlobalScopeOnErrorEventHandler | null;
+  /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/unhandledrejection_event) */
+  onunhandledrejection:
+    ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
+  /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/rejectionhandled_event) */
+  onrejectionhandled:
+    ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
 }
 /* The **`console`** object provides access to the debugging console (e.g., the Web console in Firefox). *
  * The **`console`** object provides access to the debugging console (e.g., the Web console in Firefox).
@@ -413,6 +429,14 @@ export declare function removeEventListener<
 export declare function dispatchEvent(
   event: WorkerGlobalScopeEventMap[keyof WorkerGlobalScopeEventMap],
 ): boolean;
+/* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/error_event) */
+export declare const onerror: WorkerGlobalScopeOnErrorEventHandler | null;
+/* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/unhandledrejection_event) */
+export declare const onunhandledrejection:
+  ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
+/* [MDN Reference](https://developer.mozilla.org/docs/Web/API/WorkerGlobalScope/rejectionhandled_event) */
+export declare const onrejectionhandled:
+  ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
 /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/Window/btoa) */
 export declare function btoa(data: string): string;
 /* [MDN Reference](https://developer.mozilla.org/docs/Web/API/Window/atob) */
@@ -1747,7 +1771,7 @@ export declare class MessageEvent extends Event {
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/MessageEvent/ports)
    */
-  readonly ports: MessagePort[];
+  readonly ports: readonly MessagePort[];
 }
 export interface MessageEventInit {
   bubbles?: boolean;
@@ -2998,7 +3022,7 @@ export declare abstract class ReadableStreamDefaultController<R = any> {
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/ReadableStreamDefaultController/error)
    */
-  error(reason: any): void;
+  error(reason?: any): void;
 }
 /**
  * The **`ReadableByteStreamController`** interface of the Streams API represents a controller for a readable byte stream. It allows control of the state and internal queue of a ReadableStream with an underlying byte source, and enables efficient zero-copy transfer of data from the underlying source to a consumer when the stream's internal queue is empty.
@@ -3035,7 +3059,7 @@ export declare abstract class ReadableByteStreamController {
    *
    * [MDN Reference](https://developer.mozilla.org/docs/Web/API/ReadableByteStreamController/error)
    */
-  error(reason: any): void;
+  error(reason?: any): void;
 }
 /**
  * The **`WritableStreamDefaultController`** interface of the Streams API represents a controller allowing control of a WritableStream's state. When constructing a WritableStream, the underlying sink is given a corresponding WritableStreamDefaultController instance to manipulate.
@@ -4368,6 +4392,8 @@ export declare abstract class MessagePort extends EventTarget {
   start(): void;
   get onmessage(): any | null;
   set onmessage(value: any | null);
+  get onmessageerror(): any | null;
+  set onmessageerror(value: any | null);
 }
 /**
  * The **`MessageChannel`** interface of the Channel Messaging API allows us to create a new message channel and send data through it via its two MessagePort properties.

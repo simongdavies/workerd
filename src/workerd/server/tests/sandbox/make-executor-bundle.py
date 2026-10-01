@@ -49,13 +49,27 @@ def bundle(name: str) -> dict[str, object]:
             "main_module": "worker.js",
             "modules": [module("worker.js", source)],
         }
+    if name == "wintertc-evidence":
+        source = ROOT / "src/workerd/server/tests/sandbox/wintertc-evidence.js"
+        return {
+            "protocol_version": 1,
+            "worker_version": "wintertc-evidence-v1",
+            "compatibility_date": "2025-12-31",
+            "compatibility_flags": [
+                "worker_global_scope_event_handlers",
+                "message_port_standard_semantics",
+            ],
+            "main_module": "worker.js",
+            "modules": [module("worker.js", source)],
+        }
     raise ValueError(f"unknown bundle: {name}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "bundle", choices=["helloworld", "web-streams", "wintertc-smoke"]
+        "bundle",
+        choices=["helloworld", "web-streams", "wintertc-smoke", "wintertc-evidence"],
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

@@ -136,114 +136,7 @@ export default {
   'readable-byte-streams/construct-byob-request.any.js': {},
   'readable-byte-streams/crashtests/tee-locked-stream.any.js': {},
   'readable-byte-streams/enqueue-with-detached-buffer.any.js': {},
-  'readable-byte-streams/general.any.js': {
-    comment: 'See individual comments',
-    expectedFailures: [
-      // TODO(conform): The spec expects that errors thrown synchronously in the start
-      // algorithm should cause the ReadableStream constructor to throw. We currently
-      // don't do that but we do error the stream.
-      // assert_throws_js(Error, () => new ReadableStream({ start() { throw new Error(); }, type:'bytes' }),
-      //     'start() can throw an exception with type: bytes');
-      'ReadableStream with byte source: start() throws an exception',
-      // TODO(conform): The spec expects pull not to have been called yet, but as an optimization
-      // since start is not provided we treat is synchronously and pull proactively, making this
-      // next check invalid.
-      // assert_equals(pullCount, 0, 'No pull as start() just finished and is not yet reflected to the state of the stream');
-      'ReadableStream with byte source: Automatic pull() after start()',
-      // TODO(conform): The spec expects pull not to have been called yet, but as an optimization
-      // since start is not provided we treat is synchronously and pull proactively, making this
-      // next check invalid.
-      //assert_equals(pullCount, 0, 'No pull as start() just finished and is not yet reflected to the state of the stream');
-      'ReadableStream with byte source: Automatic pull() after start() and read()',
-      'ReadableStream with byte source: autoAllocateChunkSize',
-      'ReadableStream with byte source: Automatic pull() after start() and read(view)',
-      'ReadableStream with byte source: Respond to pull() by enqueue() asynchronously',
-      'ReadableStream with byte source: Respond to multiple pull() by separate enqueue()',
-      'ReadableStream with byte source: read() twice, then enqueue() twice',
-      // TODO(conform): The spec would not expect pull to be called because of the close,
-      // but because our implementation calls pull immediately on the first read, we
-      // differ slightly here.
-      // assert_unreached("pull() should not have been called");
-      // TODO(conform): The spec would allow the byobRequest to still be used here, but
-      // our implementation throws when accessed after close.
-      // controller.byobRequest.respond(0);
-      'ReadableStream with byte source: Multiple read(view), close() and respond()',
-      'ReadableStream constructor should not accept a strategy with a size defined if type is "bytes"',
-      'ReadableStream with byte source: enqueue(), getReader(), then read()',
-      // TODO(conform): This is a case where our implementation intentionally
-      // diverges from the spec due to the tee backpressure implementation.
-      // Specifically, the input view is a Uint16Array with one element --
-      // meaning it expects us to provide 2 bytes. The enqueue() only gives
-      // it one byte. Because of how we handle these internally, the read will
-      // not be fulfilled until another byte is provided, but the byobRequest
-      // still is invalidated. In the standard, the byobRequest would still
-      // be valid here.
-      //
-      // Generally speaking, in our implementation, using enqueue() and byobRequest
-      // together is not something that should be done.
-      'ReadableStream with byte source: cancel() with partially filled pending pull() request',
-      "ReadableStream with byte source: Push source that doesn't understand pull signal",
-      'ReadableStream with byte source: enqueue() with Uint16Array, getReader(), then read()',
-      // TODO(conform): Our implementation ends up immediately calling pull
-      // when the read() is called, before the cancel() is able to run. The
-      // spec expects the cancel to happen first.
-      //assert_unreached("pull should not have been called");
-      // TODO(conform): The spec expects the result.value here to be undefined since the read
-      // is canceled. Our impl returns an empty ArrayBuffer...
-      //assert_equals(result.value, undefined, 'result.value');
-      'ReadableStream with byte source: getReader(), read(view), then cancel()',
-      'ReadableStream with byte source: read(view) with Uint32Array, then fill it by multiple enqueue() calls',
-      'ReadableStream with byte source: enqueue(), read(view) partially, then read()',
-      // TODO(conform): The spec expects the read to fail here. Instead, we end up cancelling
-      // it with a zero-length result, with the subsequent read marked as done.
-      'ReadableStream with byte source: read(view) with Uint16Array on close()-d stream with 1 byte enqueue()-d must fail',
-      // TODO(conform): Per the spec, desiredSize should be zero here
-      // but since we are handling the backpressure a bit differently
-      // it won't be zero until the actual read is resolved.
-      //desiredSize = controller.desiredSize;
-      'ReadableStream with byte source: enqueue() 3 byte, getReader(), then read(view) with 2-element Uint16Array',
-      'ReadableStream with byte source: Throwing in pull in response to read() must be ignored if the stream is errored in it',
-      'ReadableStream with byte source: Throwing in pull function must error the stream',
-      // TODO(conform): We handle things a bit differently here from the spec. The spec
-      // would have the enqueue() complete replace the byobRequest.view while we use it
-      // and fill it with the data from the enqueue. This means the following check is
-      // not valid in our implementation.
-      // assert_array_equals([...new Uint8Array(view1.buffer)], [1, 2, 3], 'first result.value.buffer');
-      'ReadableStream with byte source: enqueue() discards auto-allocated BYOB request',
-      // TODO(conform): Calling releaseLock() should cancel the pending reads. It currently does not.
-      'ReadableStream with byte source: releaseLock() with pending read(view), read(view) on second reader, respond()',
-
-      // TODO(conform): Calling releaseLock() should cancel the pending reads. It currently does not.
-      'ReadableStream with byte source: releaseLock() with pending read(view), read(view) on second reader with 1 element Uint16Array, respond(1)',
-
-      // TODO(conform): Calling releaseLock() should cancel the pending reads. It currently does not.
-      'ReadableStream with byte source: releaseLock() with pending read(view), read(view) on second reader with 2 element Uint8Array, respond(3)',
-
-      // TODO(conform): Calling releaseLock() should cancel the pending reads. It currently does not.
-      'ReadableStream with byte source: releaseLock() with pending read(view), read(view) on second reader, respondWithNewView()',
-
-      // TODO(conform): Calling releaseLock() should cancel the pending reads. It currently does not.
-      'ReadableStream with byte source: autoAllocateChunkSize, releaseLock() with pending read(), read() on second reader, respond()',
-
-      // TODO(conform): Calling releaseLock() should cancel the pending reads. It currently does not.
-      'ReadableStream with byte source: autoAllocateChunkSize, releaseLock() with pending read(), read() on second reader, enqueue()',
-
-      // TODO(conform): Calling releaseLock() should cancel the pending reads. It currently does not.
-      'ReadableStream with byte source: autoAllocateChunkSize, releaseLock() with pending read(), read(view) on second reader, respond()',
-      // TODO(conform): The spec allows a byob read to be fulfilled incrementally over multiple
-      // respond calls, we currently do not.
-      'ReadableStream with byte source: read(view) with 1 element Uint16Array, respond(1), releaseLock(), read(view) on second reader with 1 element Uint16Array, respond(1)',
-      // TODO(conform): The spec allows a byob read to be fulfilled incrementally over multiple
-      // respond calls, we currently do not.
-      'ReadableStream with byte source: read(view) with 1 element Uint16Array, respond(1), releaseLock(), read() on second reader, enqueue()',
-      // TODO: investigate this
-      'ReadableStream with byte source: A stream must be errored if close()-d before fulfilling read(view) with Uint16Array',
-      // TODO: investigate this
-      'ReadableStream with byte source: Multiple read(view), big enqueue()',
-      // TODO: investigate this
-      'ReadableStream with byte source: Multiple read(view) and multiple enqueue()',
-    ],
-  },
+  'readable-byte-streams/general.any.js': {},
   'readable-byte-streams/non-transferable-buffers.any.js': {},
   'readable-byte-streams/patched-global.any.js': {
     comment: 'TODO investigate this',
@@ -252,16 +145,8 @@ export default {
     ],
     runInGlobalScope: true,
   },
-  'readable-byte-streams/read-min.any.js': {
-    comment: 'A hanging Promise was canceled.',
-    disabledTests: true,
-  },
-  'readable-byte-streams/respond-after-enqueue.any.js': {
-    comment: 'To be investigated',
-    expectedFailures: [
-      'byobRequest.respond() after enqueue() with double read should not crash',
-    ],
-  },
+  'readable-byte-streams/read-min.any.js': {},
+  'readable-byte-streams/respond-after-enqueue.any.js': {},
   'readable-byte-streams/tee.any.js': {
     comment: 'To be investigated',
     expectedFailures: [
@@ -287,12 +172,7 @@ export default {
       'ReadableStream teeing with byte source: read from branch2 with default reader, then close while branch1 has pending BYOB read',
     ],
   },
-  'readable-byte-streams/templated.any.js': {
-    comment: 'To be investigated',
-    expectedFailures: [
-      'ReadableStream with byte source (empty) BYOB reader: canceling via the reader should cause the reader to act closed',
-    ],
-  },
+  'readable-byte-streams/templated.any.js': {},
 
   'readable-streams/async-iterator.any.js': {
     comment: 'To be investigated',

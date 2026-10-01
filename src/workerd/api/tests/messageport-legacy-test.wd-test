@@ -1,18 +1,17 @@
 using Workerd = import "/workerd/workerd.capnp";
 
 const unitTests :Workerd.Config = (
-  v8Flags = ["--expose-gc"],
   services = [
-    ( name = "messageport-test",
+    ( name = "messageport-legacy-test",
       worker = (
         modules = [
-          (name = "worker", esModule = embed "messageport-test.js")
+          (name = "worker", esModule = embed "messageport-legacy-test.js")
         ],
         compatibilityFlags = [
           "nodejs_compat_v2",
           "expose_global_message_channel",
           "spec_compliant_dispatch_exceptions",
-          "message_port_standard_semantics",
+          "no_message_port_standard_semantics",
         ],
       )
     ),

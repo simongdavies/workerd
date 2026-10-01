@@ -75,9 +75,8 @@ export const readMinStagedFulfillment = {
   },
 };
 
-// min validation: zero rejects TypeError on both sides; min larger than
-// the view rejects TypeError under C++ but RangeError under TypeScript
-// (messages pinned).
+// min validation: zero rejects TypeError; min larger than the view
+// rejects RangeError. Messages remain implementation-specific.
 export const readMinValidation = {
   async test() {
     const { rs } = byteStream();
@@ -91,10 +90,10 @@ export const readMinValidation = {
     reader.releaseLock();
     const reader2 = rs.getReader({ mode: 'byob' });
     await rejects(reader2.read(new Uint8Array(4), { min: 5 }), {
-      name: usingTsImpl ? 'RangeError' : 'TypeError',
+      name: 'RangeError',
       message: usingTsImpl
         ? 'options.min must not exceed the length of the view'
-        : 'Minimum bytes to read (5) exceeds size of buffer (4).',
+        : 'Minimum elements to read (5) exceeds view length (4).',
     });
     reader2.releaseLock();
     const reader3 = rs.getReader({ mode: 'byob' });
@@ -105,15 +104,8 @@ export const readMinValidation = {
   },
 };
 
-// close() while a min-read holds SOME bytes (2 of 3): the read fulfills
-// with the partial bytes, done=false, and a subsequent read resolves
-// done with an empty view — the readAtLeast tail contract, parity on
-// both implementations. The spec differs: 2 of 3 in a Uint8Array is
-// element-aligned, so close() succeeds and the read stays PENDING until
-// the source's respond(0) commits { done: true, value: the 2 bytes }
-// (RespondInClosedState). Only a fractional fill makes close() throw
-// (ledger #7). TypeScript settles the parked read one microtask after
-// close(), leaving the descriptor available for that later response.
+// close() while a min-read holds SOME bytes returns the partial bytes
+// with done=true (spec parity).
 export const closeBelowMin = {
   async test() {
     const { rs, controller } = byteStream();
@@ -125,14 +117,10 @@ export const closeBelowMin = {
     controller().close();
     strictEqual(await reader.closed, undefined);
     const { value, done } = await read;
-    strictEqual(done, false);
+    strictEqual(done, true);
     strictEqual(value.byteLength, 2);
     strictEqual(value[0], 1);
     strictEqual(value[1], 2);
-    const tail = await reader.read(new Uint8Array(4));
-    strictEqual(tail.done, true);
-    ok(tail.value instanceof Uint8Array);
-    strictEqual(tail.value.byteLength, 0);
   },
 };
 

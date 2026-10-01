@@ -396,7 +396,7 @@ genrule(
     name = "trimmed-maximum-compatibility-date-gen",
     srcs = ["maximum-compatibility-date.txt"],
     outs = ["trimmed-maximum-compatibility-date.txt"],
-    cmd = "tr -d '\n' < $(location maximum-compatibility-date.txt) > $(location trimmed-maximum-compatibility-date.txt)",
+    cmd = "tr -d '\r\n' < $(location maximum-compatibility-date.txt) > $(location trimmed-maximum-compatibility-date.txt)",
     cmd_ps = "(Get-Content $(location maximum-compatibility-date.txt) -Raw -Encoding Ascii).TrimEnd() | Set-Content $(location trimmed-maximum-compatibility-date.txt) -NoNewLine -Encoding Ascii",
     visibility = ["//visibility:public"],
 )

@@ -158,9 +158,22 @@ class Cloudflare: public jsg::Object {
 
 class WorkerGlobalScope: public EventTarget, public jsg::ContextGlobal {
  public:
+  using WorkerGlobalScopeOnErrorEventHandler =
+      jsg::Function<jsg::Optional<jsg::Value>(jsg::Arguments<jsg::Value>)>;
+
   jsg::Unimplemented importScripts(kj::String s) {
     return {};
   };
+
+  kj::Maybe<jsg::JsValue> getOnError(jsg::Lock& js);
+  void setOnError(jsg::Lock& js,
+      jsg::Optional<kj::OneOf<WorkerGlobalScopeOnErrorEventHandler, jsg::JsValue>> handler);
+  kj::Maybe<jsg::JsValue> getOnUnhandledRejection(jsg::Lock& js);
+  void setOnUnhandledRejection(
+      jsg::Lock& js, jsg::Optional<kj::OneOf<HandlerFunction, jsg::JsValue>> handler);
+  kj::Maybe<jsg::JsValue> getOnRejectionHandled(jsg::Lock& js);
+  void setOnRejectionHandled(
+      jsg::Lock& js, jsg::Optional<kj::OneOf<HandlerFunction, jsg::JsValue>> handler);
 
   JSG_RESOURCE_TYPE(WorkerGlobalScope, CompatibilityFlags::Reader flags) {
     JSG_INHERIT(EventTarget);
@@ -180,20 +193,37 @@ class WorkerGlobalScope: public EventTarget, public jsg::ContextGlobal {
       JSG_METHOD(importScripts);
     }
 
+    if (flags.getWorkerGlobalScopeEventHandlers()) {
+      JSG_INSTANCE_PROPERTY(onerror, getOnError, setOnError);
+      JSG_INSTANCE_PROPERTY(onunhandledrejection, getOnUnhandledRejection, setOnUnhandledRejection);
+      JSG_INSTANCE_PROPERTY(onrejectionhandled, getOnRejectionHandled, setOnRejectionHandled);
+    }
+
     JSG_TS_DEFINE(type WorkerGlobalScopeEventMap = {
       fetch: FetchEvent;
       scheduled: ScheduledEvent;
       queue: QueueEvent;
       unhandledrejection: PromiseRejectionEvent;
       rejectionhandled: PromiseRejectionEvent;
+    };
+    type WorkerGlobalScopeOnErrorEventHandler = (this: WorkerGlobalScope, message: string, source: string, lineno: number, colno: number, error: any) => any;
+    );
+    JSG_TS_OVERRIDE(extends EventTarget<WorkerGlobalScopeEventMap> {
+      onerror: WorkerGlobalScopeOnErrorEventHandler | null;
+      onunhandledrejection: ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
+      onrejectionhandled: ((this: WorkerGlobalScope, event: PromiseRejectionEvent) => any) | null;
     });
-    JSG_TS_OVERRIDE(extends EventTarget<WorkerGlobalScopeEventMap>);
   }
 
   // Because EventTarget has a constructor(), we have to explicitly delete
   // the constructor() here or we'll end up with compilation errors
   // (EventTarget's constructor confuses the hasConstructorMethod in resource.h)
   static jsg::Ref<WorkerGlobalScope> constructor() = delete;
+
+ private:
+  void setPromiseRejectionEventHandler(jsg::Lock& js,
+      kj::StringPtr type,
+      jsg::Optional<kj::OneOf<HandlerFunction, jsg::JsValue>> handler);
 };
 
 // Controller type for test handler.
@@ -896,6 +926,15 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
     JSG_METHOD(reportError);
 
     JSG_METHOD(fetch);
+
+    if (flags.getWorkerGlobalScopeEventHandlers()) {
+      // Instance-template properties are not inherited by V8 FunctionTemplate::Inherit().
+      JSG_RUNTIME_INSTANCE_PROPERTY(onerror, getOnError, setOnError);
+      JSG_RUNTIME_INSTANCE_PROPERTY(
+          onunhandledrejection, getOnUnhandledRejection, setOnUnhandledRejection);
+      JSG_RUNTIME_INSTANCE_PROPERTY(
+          onrejectionhandled, getOnRejectionHandled, setOnRejectionHandled);
+    }
 
     // Unlike regular interface attributes, which Web IDL requires us to
     // implement as prototype properties, the global scope is special --

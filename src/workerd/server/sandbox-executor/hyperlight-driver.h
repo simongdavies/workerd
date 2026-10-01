@@ -25,7 +25,6 @@ static constexpr auto CALL_DEVICE = "/dev/hlcall";
 static constexpr unsigned long CALL_MAX_LENGTH = _IOR('H', 1, uint64_t);
 static constexpr uint32_t HLCALL_HOSTCALL_ABI_VERSION = 1;
 static constexpr uint32_t HLCALL_HOSTCALL_MAX_ARGS = 4;
-static constexpr uint64_t HLCALL_IOC_MAXLEN = 64 * 1024;
 
 enum HlHostCallType : uint32_t {
   HLCALL_TYPE_I32 = 1,
@@ -108,17 +107,31 @@ inline hlcall_host_arg hostCallBytesArg(kj::ArrayPtr<const kj::byte> value) {
   };
 }
 
-inline void invokeHostCall(hlcall_host_call& call) {
-  KJ_REQUIRE(callFd >= 0, "Hyperlight call device is not initialized");
+inline void validateHostCall(const hlcall_host_call& call) {
+  KJ_REQUIRE(callBufferCapacity > 0, "Hyperlight call device capacity is not initialized");
   KJ_REQUIRE(call.version == HLCALL_HOSTCALL_ABI_VERSION, "invalid Hyperlight host-call version");
   KJ_REQUIRE(call.function_len > 0 && call.function_len <= 128,
       "invalid Hyperlight host-call function name");
   KJ_REQUIRE(call.arg_count <= HLCALL_HOSTCALL_MAX_ARGS, "too many Hyperlight host-call arguments");
+  size_t inputLength = call.function_len;
+  KJ_REQUIRE(inputLength <= callBufferCapacity, "Hyperlight host-call function name is too large");
   for (size_t i = 0; i < call.arg_count; ++i) {
-    KJ_REQUIRE(call.args[i].len <= HLCALL_IOC_MAXLEN, "Hyperlight host-call argument is too large");
+    KJ_REQUIRE(call.args[i].len <= callBufferCapacity - inputLength,
+        "Hyperlight host-call arguments are too large");
+    inputLength += call.args[i].len;
   }
-  KJ_REQUIRE(call.output_cap <= HLCALL_IOC_MAXLEN, "Hyperlight host-call output is too large");
+  if (call.return_type == HLCALL_TYPE_STRING || call.return_type == HLCALL_TYPE_VECBYTES) {
+    KJ_REQUIRE(call.output != nullptr && call.output_cap == callBufferCapacity,
+        "Hyperlight host-call output buffer must match device capacity");
+  } else {
+    KJ_REQUIRE(call.output == nullptr && call.output_cap == 0,
+        "scalar Hyperlight host call included an output buffer");
+  }
+}
 
+inline void invokeHostCall(hlcall_host_call& call) {
+  KJ_REQUIRE(callFd >= 0, "Hyperlight call device is not initialized");
+  validateHostCall(call);
   if (ioctl(callFd, HLCALL_IOC_HOSTCALL, &call) < 0) {
     if (errno == ENOTTY) {
       KJ_FAIL_REQUIRE(
@@ -143,26 +156,36 @@ inline hlcall_host_call makeHostCall(
   return call;
 }
 
+inline kj::String copyHostCallStringResult(kj::ArrayPtr<const char> output) {
+  KJ_REQUIRE(memchr(output.begin(), '\0', output.size()) == nullptr,
+      "Hyperlight host call returned a string containing NUL");
+  auto result = kj::heapArray<char>(output.size() + 1);
+  memcpy(result.begin(), output.begin(), output.size());
+  result[output.size()] = '\0';
+  return kj::String(kj::mv(result));
+}
+
 inline kj::String hostCallString(kj::StringPtr function, kj::ArrayPtr<const hlcall_host_arg> args) {
-  auto output = kj::heapArray<char>(HLCALL_IOC_MAXLEN + 1);
+  KJ_REQUIRE(callBufferCapacity > 0, "Hyperlight call device capacity is not initialized");
+  auto output = kj::heapArray<char>(callBufferCapacity + 1);
   auto call = makeHostCall(function, HLCALL_TYPE_STRING, args);
   call.output = output.begin();
-  call.output_cap = HLCALL_IOC_MAXLEN;
+  call.output_cap = callBufferCapacity;
   invokeHostCall(call);
-  auto result = kj::heapArray<char>(call.output_len + 1);
-  memcpy(result.begin(), output.begin(), call.output_len);
-  result[call.output_len] = '\0';
-  return kj::String(kj::mv(result));
+  return copyHostCallStringResult(output.first(call.output_len));
 }
 
 inline kj::Array<kj::byte> hostCallBytes(
     kj::StringPtr function, kj::ArrayPtr<const hlcall_host_arg> args, size_t outputCapacity) {
-  KJ_REQUIRE(outputCapacity <= HLCALL_IOC_MAXLEN, "Hyperlight byte result capacity is too large");
-  auto output = kj::heapArray<kj::byte>(outputCapacity);
+  KJ_REQUIRE(callBufferCapacity > 0, "Hyperlight call device capacity is not initialized");
+  KJ_REQUIRE(outputCapacity <= callBufferCapacity, "Hyperlight byte result capacity is too large");
+  auto output = kj::heapArray<kj::byte>(callBufferCapacity);
   auto call = makeHostCall(function, HLCALL_TYPE_VECBYTES, args);
   call.output = output.begin();
-  call.output_cap = output.size();
+  call.output_cap = callBufferCapacity;
   invokeHostCall(call);
+  KJ_REQUIRE(call.output_len <= outputCapacity,
+      "Hyperlight host call exceeded requested byte result size");
   auto result = kj::heapArray<kj::byte>(call.output_len);
   memcpy(result.begin(), output.begin(), call.output_len);
   return result;

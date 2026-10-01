@@ -110,15 +110,16 @@ jsg::Promise<ReadResult> ReaderImpl::read(
     // the buffer size. That keeps the multiplication below from overflowing however large buffers
     // are allowed to get, and it catches a negative minElements, which reaches this point
     // sign-extended to a huge size_t.
-    if (atLeast > byteLength) {
-      return js.rejectedPromise<ReadResult>(js.typeError(kj::str(
-          "Minimum bytes to read (", atLeast, ") exceeds size of buffer (", byteLength, ").")));
+    auto elementLength = byteLength / elementSize;
+    if (atLeast > elementLength) {
+      return js.rejectedPromise<ReadResult>(js.rangeError(kj::str(
+          "Minimum elements to read (", atLeast, ") exceeds view length (", elementLength, ").")));
     }
 
     atLeast = atLeast * elementSize;
 
     if (atLeast > byteLength) {
-      return js.rejectedPromise<ReadResult>(js.typeError(kj::str(
+      return js.rejectedPromise<ReadResult>(js.rangeError(kj::str(
           "Minimum bytes to read (", atLeast, ") exceeds size of buffer (", byteLength, ").")));
     }
 
@@ -135,8 +136,6 @@ jsg::Promise<ReadResult> ReaderImpl::read(
 }
 
 void ReaderImpl::releaseLock(jsg::Lock& js) {
-  // TODO(soon): Releasing the lock should cancel any pending reads. This is a recent
-  // modification to the spec that we have not yet implemented.
   assertAttachedOrTerminal();
   // Closed and Released states are no-ops.
   KJ_IF_SOME(attached, state.tryGetActiveUnsafe()) {
@@ -249,9 +248,14 @@ jsg::Promise<ReadResult> ReadableStreamBYOBReader::read(jsg::Lock& js,
     jsg::JsArrayBufferView byobBuffer,
     jsg::Optional<ReadableStreamBYOBReaderReadOptions> maybeOptions) {
   static const ReadableStreamBYOBReaderReadOptions defaultOptions{};
+  auto min = maybeOptions.orDefault(defaultOptions).min.orDefault(1);
+  if (min < 0) {
+    return js.rejectedPromise<ReadResult>(
+        js.typeError("The minimum number of elements to read cannot be negative."_kj));
+  }
   auto options = ReadableStreamController::ByobOptions{
     .bufferView = byobBuffer.addRef(js),
-    .atLeast = maybeOptions.orDefault(defaultOptions).min.orDefault(1),
+    .atLeast = static_cast<size_t>(min),
     .detachBuffer = FeatureFlags::get(js).getStreamsByobReaderDetachesBuffer(),
   };
   return impl.read(js, kj::mv(options));
@@ -259,9 +263,13 @@ jsg::Promise<ReadResult> ReadableStreamBYOBReader::read(jsg::Lock& js,
 
 jsg::Promise<ReadResult> ReadableStreamBYOBReader::readAtLeast(
     jsg::Lock& js, int minElements, jsg::JsArrayBufferView byobBuffer) {
+  if (minElements < 0) {
+    return js.rejectedPromise<ReadResult>(
+        js.typeError("The minimum number of elements to read cannot be negative."_kj));
+  }
   auto options = ReadableStreamController::ByobOptions{
     .bufferView = byobBuffer.addRef(js),
-    .atLeast = minElements,
+    .atLeast = static_cast<size_t>(minElements),
     .detachBuffer = true,
   };
   return impl.read(js, kj::mv(options));

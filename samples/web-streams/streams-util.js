@@ -22,6 +22,7 @@ const WORDS = [
 ];
 
 const enc = new TextEncoder();
+const SYNC_FIXTURE_PATTERN = enc.encode("lorem ipsum dolor sit amet\n");
 
 function generateChunk() {
   const wordsPerChunk = 50 + Math.floor(Math.random() * 50);
@@ -44,6 +45,26 @@ export function createSyncLoremStream(numChunks) {
       }
       controller.enqueue(generateChunk());
       chunksRemaining--;
+    }
+  }, { highWaterMark: 16 });
+}
+
+// Creates the deterministic payload used by executor and pool-acquisition baselines.
+export function createSyncFixtureStream(totalBytes = 9441) {
+  let offset = 0;
+
+  return new ReadableStream({
+    pull(controller) {
+      if (offset === totalBytes) {
+        controller.close();
+        return;
+      }
+      const chunk = new Uint8Array(Math.min(512, totalBytes - offset));
+      for (let i = 0; i < chunk.byteLength; i++) {
+        chunk[i] = SYNC_FIXTURE_PATTERN[(offset + i) % SYNC_FIXTURE_PATTERN.byteLength];
+      }
+      offset += chunk.byteLength;
+      controller.enqueue(chunk);
     }
   }, { highWaterMark: 16 });
 }

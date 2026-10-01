@@ -9,56 +9,24 @@
 
 namespace workerd::api {
 
-// A closely approximate implementation of the Web platform standard MessagePort.
+// An implementation of the Web platform MessagePort API for same-isolate channels.
 // MessagePorts always come in pairs. When a message is posted to
 // one it is delivered to the other, and vice versa. When one port
 // is closed both ports are closed.
 //
-// This intentionally does not implement the full MessagePort spec and we know
-// that it varies from the standard definition in a number of ways:
+// MessagePort transfer is intentionally local to an isolate. Serializing a port for
+// RPC or persistence remains unsupported because that would require an executor host
+// channel rather than the same-isolate entanglement implemented here.
 //
-// - It does not support transfer lists. We do not implement the transfer
-//   list semantics, but we do validate the transfer list input to an extent.
-// - It does not support serialization/deserialization. It's not possible to
-//   send a MessagePort anywhere currently.
-// - The `messageerror` event diverges from the spec. If message data cannot be
-//   serialized it throws synchronously from postMessage() rather than dispatching
-//   `messageerror` on the receiving port; this is easiest for now and makes the
-//   most sense for our current use case since the MessagePort only ever passes
-//   messages around within the same isolate (that is, we're not sending the
-//   serialized data off anywhere, we're just cloning it and dispatching it.)
-//   Instead, a throwing 'message' listener — whose exception is reported per
-//   spec — additionally dispatches a `messageerror` event on this port carrying
-//   the exception as its data, which the spec does not do.
-// - We intentionally do not implement the "port message queue" semantics exactly
-//   as they are described in the spec. While the port has any 'message' listener —
-//   whether assigned to onmessage or added with addEventListener(), which per spec
-//   would not enable the queue but does in Node.js — message delivery is flowing;
-//   when the last one is removed, messages are queued until another is attached or
-//   start() is called. Because we are storing these as JS values, we don't worry
-//   about extra memory accounting for the queue.
+// Remaining differences from the HTML MessagePort definition:
 // - We do not emit the close event on entangled ports when one of them is GC'd.
-// - We do not check to see if a MessagePort is entangled with another when we
-//   call entangle because there's only one way to entangle them currently and
-//   it's impossible for them to be already entangled.
-// - We do not implement disentangle steps other than to invalidate the weak
-//   ref to the other port when one of them is closed.
 // - We do not prevent a MessagePort from being garbage collected while it has
-//   messages queued up. Eventually when we implement ser/deser this might change.
+//   messages queued up.
 // - Unlike the implementation in Node.js, not closing a MessagePort does not
 //   prevent anything from exiting. It's best to close MessagePorts manually
 //   but the current implementation does not require it.
-//
-// Because of these differences we do not currently run the full suite of web
-// platform tests against our implementation -- we know most of them will fail
-// since most of them depend on the ability to transfer MessagePorts or depend
-// on the mechanisms we do not implement. And yes, we know that this means that
-// if we need stricter compliance with the spec in the future we will likely
-// need to introduce a compat flag.
 class MessagePort final: public EventTarget {
  public:
-  // While we do not support transfer lists in the implementation
-  // currently, we do want to validate those inputs.
   using TransferList = kj::Array<jsg::JsRef<jsg::JsValue>>;
   struct PostMessageOptions {
     jsg::Optional<TransferList> transfer;
@@ -66,7 +34,7 @@ class MessagePort final: public EventTarget {
   };
   using TransferListOrOptions = kj::OneOf<TransferList, PostMessageOptions>;
 
-  MessagePort();
+  explicit MessagePort(bool standardSemantics);
   ~MessagePort() noexcept(false) {
     closeImpl();
   }
@@ -87,6 +55,9 @@ class MessagePort final: public EventTarget {
   kj::Maybe<jsg::JsValue> getOnMessage(jsg::Lock& js);
   void setOnMessage(
       jsg::Lock& js, jsg::Optional<kj::OneOf<EventTarget::HandlerFunction, jsg::JsValue>> handler);
+  kj::Maybe<jsg::JsValue> getOnMessageError(jsg::Lock& js);
+  void setOnMessageError(
+      jsg::Lock& js, jsg::Optional<kj::OneOf<EventTarget::HandlerFunction, jsg::JsValue>> handler);
 
   JSG_RESOURCE_TYPE(MessagePort) {
     JSG_INHERIT(EventTarget);
@@ -94,16 +65,24 @@ class MessagePort final: public EventTarget {
     JSG_METHOD(close);
     JSG_METHOD(start);
     JSG_PROTOTYPE_PROPERTY(onmessage, getOnMessage, setOnMessage);
+    JSG_PROTOTYPE_PROPERTY(onmessageerror, getOnMessageError, setOnMessageError);
   }
+
+  void serialize(jsg::Lock& js, jsg::Serializer& serializer);
+  static jsg::Ref<MessagePort> deserialize(
+      jsg::Lock& js, rpc::SerializationTag tag, jsg::Deserializer& deserializer);
+  JSG_SERIALIZABLE(rpc::SerializationTag::MESSAGE_PORT);
 
   jsg::Ref<MessagePort> addRef() {
     return JSG_THIS;
   }
   bool isClosed() const {
-    return state.is<Closed>();
+    return state.is<Closed>() || state.is<Detached>();
   }
 
-  void deliver(jsg::Lock& js, const jsg::JsValue& data);
+  void deliver(jsg::Lock& js,
+      const jsg::JsValue& data,
+      kj::Array<jsg::Ref<MessagePort>> transferredPorts = {});
 
   // Bind two message ports together such that messages posted to
   // one are delivered to the other.
@@ -114,16 +93,31 @@ class MessagePort final: public EventTarget {
   // messages across the rpc boundary.
 
  private:
+  struct QueuedMessage {
+    jsg::JsRef<jsg::JsValue> data;
+    kj::Array<jsg::Ref<MessagePort>> ports;
+
+    void visitForGc(jsg::GcVisitor& visitor) {
+      visitor.visit(data);
+      visitor.visitAll(ports);
+    }
+  };
+
   // When the MessagePort is in the pending state, messages posted to it
   // will be buffered until the port is started. When the port is started,
   // the buffered messages will be delivered immediately.
-  using Pending = kj::Vector<jsg::JsRef<jsg::JsValue>>;
+  using Pending = kj::Vector<QueuedMessage>;
   struct Started {};
   struct Closed {};
+  struct Detached {
+    kj::Maybe<jsg::WeakRef<MessagePort>> replacement;
+  };
 
-  void dispatchMessage(jsg::Lock& js, const jsg::JsValue& value);
+  void dispatchMessage(
+      jsg::Lock& js, const jsg::JsValue& value, kj::Array<jsg::Ref<MessagePort>> transferredPorts);
 
-  kj::OneOf<Pending, Started, Closed> state;
+  kj::OneOf<Pending, Started, Closed, Detached> state;
+  bool standardSemantics;
 
   // Two ports are entangled when they weakly reference each other.
   // Keep in mind that this is a weak reference! So if one of the
@@ -136,7 +130,9 @@ class MessagePort final: public EventTarget {
 
   void visitForGc(jsg::GcVisitor& visitor) {
     KJ_IF_SOME(pending, state.tryGet<Pending>()) {
-      visitor.visitAll(pending);
+      for (auto& message: pending) {
+        message.visitForGc(visitor);
+      }
     }
   }
 };

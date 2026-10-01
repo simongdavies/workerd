@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "bundle": {
+    "name": "wintertc-evidence",
+    "worker_version": "wintertc-evidence-v1",
+    "compatibility_date": "2025-12-31",
+    "compatibility_flags": [
+      "worker_global_scope_event_handlers",
+      "message_port_standard_semantics"
+    ],
+    "main_module": "worker.js"
+  },
+  "executor_expectations": {
+    "timer_adapter": {
+      "version": 1,
+      "host_calls": [
+        "WorkerdTimerV1Start",
+        "WorkerdTimerV1Read",
+        "WorkerdTimerV1Cancel"
+      ]
+    },
+    "fetch_adapter": {
+      "version": 2,
+      "host_calls": [
+        "WorkerdFetchV2Start",
+        "WorkerdFetchV2Write",
+        "WorkerdFetchV2Finish",
+        "WorkerdFetchV2Poll",
+        "WorkerdFetchV2Read",
+        "WorkerdFetchV2Cancel"
+      ]
+    },
+    "core_wasm_fixture": {
+      "initialization": "module-startup",
+      "cached_request_result": 42
+    }
+  },
+  "scenarios": [
+    {
+      "id": "core-aggregate",
+      "method": "GET",
+      "url": "https://evidence.test/evidence/core",
+      "policy": "Each safe subtest reports pass/error independently. Timers, MessagePort, BYOB, and byte-stream tee are isolated to dedicated endpoints so a native failure cannot terminate the aggregate request.",
+      "covers": [
+        "global-error-handler",
+        "global-unhandledrejection-handler",
+        "core-wasm",
+        "component-model-boundary"
+      ]
+    },
+    {
+      "id": "timers",
+      "method": "GET",
+      "url": "https://evidence.test/evidence/timers",
+      "covers": [
+        "timer-start",
+        "timer-immediate-read",
+        "timer-fired-read",
+        "timer-ordering",
+        "timer-cancellation"
+      ]
+    },
+    {
+      "id": "global-handlers",
+      "method": "GET",
+      "url": "https://evidence.test/evidence/global-handlers",
+      "covers": ["global-error-handler", "global-unhandledrejection-handler"],
+      "dependencies": []
+    },
+    {
+      "id": "messageport",
+      "method": "GET",
+      "url": "https://evidence.test/evidence/messageport",
+      "covers": [
+        "messageport-construction",
+        "messageport-listener-registration",
+        "messageport-start",
+        "messageport-post-message",
+        "messageport-queued-delivery",
+        "messageport-close",
+        "messageport-transfer-reentanglement",
+        "messageport-clone-failure"
+      ],
+      "dependencies": []
+    },
+    {
+      "id": "byob",
+      "method": "GET",
+      "url": "https://evidence.test/evidence/byob",
+      "covers": ["byob"]
+    },
+    {
+      "id": "byte-stream-tee",
+      "method": "GET",
+      "url": "https://evidence.test/evidence/byte-stream-tee",
+      "covers": ["byte-stream-tee"]
+    },
+    {
+      "id": "core-wasm",
+      "method": "GET",
+      "url": "https://evidence.test/evidence/core-wasm",
+      "covers": ["core-wasm-startup-fixture"]
+    },
+    {
+      "id": "streaming-fetch",
+      "method": "GET",
+      "url_template": "https://evidence.test/evidence/fetch?upstream={percent_encoded_host_echo_url}",
+      "covers": [
+        "outbound-fetch-upload-streaming",
+        "outbound-fetch-response-streaming",
+        "response-integrity"
+      ],
+      "upload": {
+        "chunks": 16,
+        "chunk_bytes": 32768,
+        "pace_ms": 5,
+        "total_bytes": 524288
+      }
+    },
+    {
+      "id": "state-reuse",
+      "method": "GET",
+      "url_template": "https://evidence.test/evidence/state?token={unique_token}",
+      "covers": ["same-isolate-state-continuity", "cross-isolate-state-leak"]
+    }
+  ],
+  "component_model": {
+    "supported": false,
+    "boundaries": [
+      "The executor bundle parser accepts esModule, text, and json only.",
+      "The main module must be an ES module.",
+      "Workerd exposes core WebAssembly but has no Component Model canonical ABI or WASI Preview 2 host.",
+      "node:wasi is a non-functional stub that throws ERR_METHOD_NOT_IMPLEMENTED."
+    ],
+    "fallback": "Module startup compiles and instantiates a deterministic core Wasm module whose cached answer export returns 42 during the core scenario."
+  },
+  "known_deviations": [
+    {
+      "id": "byob-patched-global-synchronous-then-getter",
+      "status": "expected-deviation",
+      "upstream_test": "streams/readable-byte-streams/patched-global.any.js",
+      "behavior": "A patched Object.prototype.then getter is not invoked synchronously during controller.enqueue().",
+      "reason": "JSG Promise<ReadResult> resolves an opaque C++ value and creates the JavaScript read-result object in the PromiseWrapper conversion microtask. Native settlement cannot synchronously perform JavaScript thenable assimilation without a broader JS-facing read-promise representation refactor.",
+      "evidence_policy": "Report this deviation separately; do not convert it into a passing expectation."
+    }
+  ]
+}

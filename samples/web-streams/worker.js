@@ -3,7 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import {
-  createSyncLoremStream,
+  createSyncFixtureStream,
   createAsyncLoremStream,
   createSyncLoremByteStream,
   createAsyncLoremByteStream,
@@ -31,7 +31,7 @@ export default {
     let loremStream;
     let transform;
     if (url.pathname === "/sync") {
-      loremStream = createSyncLoremStream(20);
+      loremStream = createSyncFixtureStream();
       transform = createSyncUppercaseTransform();
     } else if (url.pathname === "/async") {
       loremStream = createAsyncLoremStream(20);

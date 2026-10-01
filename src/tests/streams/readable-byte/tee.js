@@ -101,11 +101,8 @@ export const teeByteStreamMixedReaders = {
   },
 };
 
-// DIVERGENCE (the readable suite's ledger #11, byte flavor): when both
-// branches cancel, the source cancel hook receives an AggregateError of
-// [r1, r2] under TypeScript but only the pair-completing branch's
-// reason under C++. NOTE: never await a lone branch's cancel under
-// TypeScript — it pends until the other branch cancels.
+// C++ follows the Streams tee algorithm and delivers both cancellation reasons
+// in branch order. The TypeScript implementation currently wraps them.
 export const teeCancelComposite = {
   async test() {
     let cancelReason = 'not-called';
@@ -126,8 +123,119 @@ export const teeCancelComposite = {
       ok(cancelReason instanceof AggregateError);
       deepStrictEqual(cancelReason.errors, ['r1', 'r2']);
     } else {
-      strictEqual(cancelReason, 'r2');
+      deepStrictEqual(cancelReason, ['r1', 'r2']);
     }
+  },
+};
+
+// Switching a branch from a default reader to a BYOB reader switches the
+// source request to the caller's BYOB view. Legacy C++ cells may auto-allocate
+// a separate source BYOB view for the default read.
+export const teeSwitchesSourcePullMode = {
+  async test() {
+    const pullModes = [];
+    let next = 1;
+    const rs = new ReadableStream({
+      type: 'bytes',
+      pull(controller) {
+        const request = controller.byobRequest;
+        pullModes.push(request === null ? null : [...request.view]);
+        if (request === null) {
+          controller.enqueue(new Uint8Array([next++]));
+        } else {
+          request.view[0] = next++;
+          request.respond(1);
+        }
+      },
+    });
+
+    const [a] = rs.tee();
+    const defaultReader = a.getReader();
+    deepStrictEqual([...(await defaultReader.read()).value], [1]);
+    defaultReader.releaseLock();
+
+    const byobReader = a.getReader({ mode: 'byob' });
+    deepStrictEqual(
+      [...(await byobReader.read(new Uint8Array([0x22]))).value],
+      [2]
+    );
+
+    ok(pullModes[0] === null || pullModes[0][0] === 0);
+    if (usingTsImpl) {
+      strictEqual(pullModes[1], null);
+    } else {
+      deepStrictEqual(pullModes[1], [0x22]);
+    }
+  },
+};
+
+// A source BYOB request is selected from one branch only; the sibling's
+// pending request remains isolated and is fulfilled from the cloned chunk.
+export const teeIsolatesBranchByobRequests = {
+  async test() {
+    let sourceView;
+    const rs = new ReadableStream({
+      type: 'bytes',
+      pull(controller) {
+        const request = controller.byobRequest;
+        sourceView = request === null ? null : [...request.view];
+        if (request === null) {
+          controller.enqueue(new Uint8Array([7]));
+        } else {
+          request.view[0] = 7;
+          request.respond(1);
+        }
+      },
+    });
+
+    const [a, b] = rs.tee();
+    const readerA = a.getReader({ mode: 'byob' });
+    const readerB = b.getReader({ mode: 'byob' });
+    const readB = readerB.read(new Uint8Array([0x22]));
+    const readA = readerA.read(new Uint8Array([0x11]));
+    const [resultA, resultB] = await Promise.all([readA, readB]);
+
+    if (usingTsImpl) {
+      strictEqual(sourceView, null);
+    } else {
+      ok(sourceView[0] === 0x11 || sourceView[0] === 0x22);
+    }
+    deepStrictEqual([...resultA.value], [7]);
+    deepStrictEqual([...resultB.value], [7]);
+  },
+};
+
+// The branch that starts a source read determines its mode. A later BYOB
+// request on the sibling is fulfilled from the distributed chunk instead of
+// changing an in-flight default source read into a BYOB read.
+export const teeDefaultDemandWinsSourceMode = {
+  async test() {
+    let controller;
+    const rs = new ReadableStream({
+      type: 'bytes',
+      start(c) {
+        controller = c;
+      },
+    });
+
+    const [a, b] = rs.tee();
+    const readerA = a.getReader();
+    const readerB = b.getReader({ mode: 'byob' });
+    const readA = readerA.read();
+    const readB = readerB.read(new Uint8Array([0x22]));
+    await scheduler.wait(5);
+
+    const request = controller.byobRequest;
+    ok(request === null || request.view[0] === 0);
+    if (request === null) {
+      controller.enqueue(new Uint8Array([7]));
+    } else {
+      request.view[0] = 7;
+      request.respond(1);
+    }
+
+    deepStrictEqual([...(await readA).value], [7]);
+    deepStrictEqual([...(await readB).value], [7]);
   },
 };
 
@@ -174,9 +282,10 @@ export const teeReleasedPendingRead = {
     await rejectionOf(read1);
     const r2 = a.getReader({ mode: 'byob' });
     const read2 = r2.read(new Uint8Array(4));
-    controller.enqueue(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
-    controller.close();
+    controller.enqueue(new Uint8Array([1, 2, 3, 4]));
     deepStrictEqual([...(await read2).value], [1, 2, 3, 4]);
+    controller.enqueue(new Uint8Array([5, 6, 7, 8]));
+    controller.close();
     deepStrictEqual(
       [...(await r2.read(new Uint8Array(8))).value],
       [5, 6, 7, 8]
@@ -299,18 +408,16 @@ export const teeReleasedPartialReadDefault = {
   },
 };
 
-// Buffered before the next reader: one read(view) takes the released bytes
-// and the next chunk together (parity).
+// Buffered before the next reader: the retained prefix remains the first
+// read and the later source chunk remains the second.
 export const teeReleasedPartialReadBuffered = {
   async test() {
     const { a, controller } = await teeWithReleasedPartialRead();
     controller.enqueue(new Uint8Array([3, 4]));
     controller.close();
     const reader = a.getReader({ mode: 'byob' });
-    deepStrictEqual(
-      [...(await reader.read(new Uint8Array(8))).value],
-      [1, 2, 3, 4]
-    );
+    deepStrictEqual([...(await reader.read(new Uint8Array(8))).value], [1, 2]);
+    deepStrictEqual([...(await reader.read(new Uint8Array(8))).value], [3, 4]);
   },
 };
 

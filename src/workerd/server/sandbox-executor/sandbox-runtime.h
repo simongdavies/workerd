@@ -13,6 +13,17 @@
 
 namespace workerd::server::sandbox_executor {
 
+class TimerHostChannel: public kj::Refcounted {
+ public:
+  virtual ~TimerHostChannel() noexcept(false) {}
+  virtual kj::String start(uint64_t delayNs) = 0;
+  virtual kj::String read(uint64_t timerId) = 0;
+  virtual int32_t cancel(uint64_t timerId) = 0;
+};
+
+kj::Rc<TimerHostChannel> newHyperlightTimerHostChannel();
+kj::Own<TimerChannel> newTimerChannel(kj::Rc<TimerHostChannel> host, kj::Timer& pollTimer);
+
 struct Response {
   uint statusCode;
   kj::Array<Header> headers;

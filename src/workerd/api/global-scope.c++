@@ -62,7 +62,110 @@ kj::Exception makeNeuterException(NeuterReason reason) {
   KJ_UNREACHABLE;
 }
 
+jsg::Optional<jsg::Value> callWorkerGlobalScopeOnError(jsg::Lock& js,
+    WorkerGlobalScope::WorkerGlobalScopeOnErrorEventHandler& handler,
+    jsg::Ref<Event> event) {
+  kj::Vector<jsg::Value> args;
+  bool isErrorEvent = false;
+  if (auto* errorEvent = dynamic_cast<ErrorEvent*>(event.get())) {
+    isErrorEvent = true;
+    args.add(js.v8Ref<v8::Value>(js.str(errorEvent->getMessage())));
+    args.add(js.v8Ref<v8::Value>(js.str(errorEvent->getFilename())));
+    args.add(jsg::Value(
+        js.v8Isolate, v8::Integer::NewFromUnsigned(js.v8Isolate, errorEvent->getLineno())));
+    args.add(jsg::Value(
+        js.v8Isolate, v8::Integer::NewFromUnsigned(js.v8Isolate, errorEvent->getColno())));
+    args.add(js.v8Ref<v8::Value>(errorEvent->getError(js)));
+  } else {
+    args.add(jsg::Value(js.v8Isolate,
+        KJ_ASSERT_NONNULL(event.tryGetHandle(js), "dispatched event has no JS wrapper")));
+  }
+
+  auto result = handler(js, jsg::Arguments(args.releaseAsArray()));
+  if (isErrorEvent) {
+    return kj::mv(result);
+  }
+
+  KJ_IF_SOME(value, result) {
+    if (value.getHandle(js)->IsFalse()) {
+      return js.v8Ref<v8::Value>(v8::True(js.v8Isolate));
+    }
+  }
+  return kj::none;
+}
+
 }  // namespace
+
+kj::Maybe<jsg::JsValue> WorkerGlobalScope::getOnError(jsg::Lock& js) {
+  return getEventHandlerAttribute(js, "error"_kj);
+}
+
+void WorkerGlobalScope::setOnError(jsg::Lock& js,
+    jsg::Optional<kj::OneOf<WorkerGlobalScopeOnErrorEventHandler, jsg::JsValue>> handler) {
+  KJ_IF_SOME(value, handler) {
+    KJ_SWITCH_ONEOF(value) {
+      KJ_CASE_ONEOF(fn, WorkerGlobalScopeOnErrorEventHandler) {
+        auto assigned = jsg::JsValue(
+            KJ_ASSERT_NONNULL(fn.tryGetHandle(js.v8Isolate), "handler function has no wrapper"));
+        fn.setReceiver(js.v8Ref<v8::Value>(js.v8Context()->Global()));
+        auto callback = HandlerFunction(JSG_VISITABLE_LAMBDA((fn = kj::mv(fn)), (fn),
+            (jsg::Lock & js, jsg::Ref<Event> event) mutable->jsg::Optional<jsg::Value> {
+              return callWorkerGlobalScopeOnError(js, fn, kj::mv(event));
+            }));
+        setEventHandlerAttribute(
+            js, "error"_kj, assigned, kj::mv(callback), EventHandlerReturnBehavior::CANCEL_ON_TRUE);
+        return;
+      }
+      KJ_CASE_ONEOF(other, jsg::JsValue) {
+        setEventHandlerAttribute(
+            js, "error"_kj, other, kj::none, EventHandlerReturnBehavior::CANCEL_ON_TRUE);
+        return;
+      }
+    }
+  }
+  setEventHandlerAttribute(
+      js, "error"_kj, js.null(), kj::none, EventHandlerReturnBehavior::CANCEL_ON_TRUE);
+}
+
+void WorkerGlobalScope::setPromiseRejectionEventHandler(jsg::Lock& js,
+    kj::StringPtr type,
+    jsg::Optional<kj::OneOf<HandlerFunction, jsg::JsValue>> handler) {
+  KJ_IF_SOME(value, handler) {
+    KJ_SWITCH_ONEOF(value) {
+      KJ_CASE_ONEOF(fn, HandlerFunction) {
+        auto assigned = jsg::JsValue(
+            KJ_ASSERT_NONNULL(fn.tryGetHandle(js.v8Isolate), "handler function has no wrapper"));
+        fn.setReceiver(js.v8Ref<v8::Value>(js.v8Context()->Global()));
+        setEventHandlerAttribute(
+            js, type, assigned, kj::mv(fn), EventHandlerReturnBehavior::IGNORE);
+        return;
+      }
+      KJ_CASE_ONEOF(other, jsg::JsValue) {
+        setEventHandlerAttribute(js, type, other, kj::none, EventHandlerReturnBehavior::IGNORE);
+        return;
+      }
+    }
+  }
+  setEventHandlerAttribute(js, type, js.null(), kj::none, EventHandlerReturnBehavior::IGNORE);
+}
+
+kj::Maybe<jsg::JsValue> WorkerGlobalScope::getOnUnhandledRejection(jsg::Lock& js) {
+  return getEventHandlerAttribute(js, "unhandledrejection"_kj);
+}
+
+void WorkerGlobalScope::setOnUnhandledRejection(
+    jsg::Lock& js, jsg::Optional<kj::OneOf<HandlerFunction, jsg::JsValue>> handler) {
+  setPromiseRejectionEventHandler(js, "unhandledrejection"_kj, kj::mv(handler));
+}
+
+kj::Maybe<jsg::JsValue> WorkerGlobalScope::getOnRejectionHandled(jsg::Lock& js) {
+  return getEventHandlerAttribute(js, "rejectionhandled"_kj);
+}
+
+void WorkerGlobalScope::setOnRejectionHandled(
+    jsg::Lock& js, jsg::Optional<kj::OneOf<HandlerFunction, jsg::JsValue>> handler) {
+  setPromiseRejectionEventHandler(js, "rejectionhandled"_kj, kj::mv(handler));
+}
 
 void ExecutionContext::waitUntil(kj::Promise<void> promise) {
   IoContext::current().addWaitUntil(kj::mv(promise));
@@ -208,8 +311,12 @@ ServiceWorkerGlobalScope::ServiceWorkerGlobalScope()
                               jsg::Value value) {
         // If async context tracking is enabled, then we need to ensure that we enter the frame
         // associated with the promise before we invoke the unhandled rejection callback handling.
-        auto ev = js.alloc<PromiseRejectionEvent>(event, kj::mv(promise), kj::mv(value));
-        dispatchEventImpl(js, kj::mv(ev));
+        const auto reportExceptions = FeatureFlags::get(js).getWorkerGlobalScopeEventHandlers()
+            ? DispatchExceptionPolicy::REPORT
+            : effectiveExceptionPolicy(js, DispatchExceptionPolicy::REPORT);
+        auto ev = js.alloc<PromiseRejectionEvent>(event, kj::mv(promise), kj::mv(value),
+            FeatureFlags::get(js).getWorkerGlobalScopeEventHandlers());
+        dispatchEventImpl(js, kj::mv(ev), reportExceptions);
       }) {}
 
 void ServiceWorkerGlobalScope::clear() {
@@ -1217,13 +1324,15 @@ void ServiceWorkerGlobalScope::reportError(jsg::Lock& js, jsg::JsValue error) {
   // state. Just allow the error to propagate in these cases.
   auto message = v8::Exception::CreateMessage(js.v8Isolate, error);
   auto event = js.alloc<ErrorEvent>(ErrorEvent::ErrorEventInit{.message = kj::str(message->Get()),
-    .filename = kj::str(message->GetScriptResourceName()),
-    .lineno = jsg::check(message->GetLineNumber(js.v8Context())),
-    .colno = jsg::check(message->GetStartColumn(js.v8Context())),
-    .error = jsg::JsRef(js, error)});
-  if (dispatchEventImpl(
-          js, kj::mv(event), effectiveExceptionPolicy(js, DispatchExceptionPolicy::REPORT))
-          .result) {
+                                      .filename = kj::str(message->GetScriptResourceName()),
+                                      .lineno = jsg::check(message->GetLineNumber(js.v8Context())),
+                                      .colno = jsg::check(message->GetStartColumn(js.v8Context())),
+                                      .error = jsg::JsRef(js, error)},
+      FeatureFlags::get(js).getWorkerGlobalScopeEventHandlers());
+  const auto reportExceptions = FeatureFlags::get(js).getWorkerGlobalScopeEventHandlers()
+      ? DispatchExceptionPolicy::REPORT
+      : effectiveExceptionPolicy(js, DispatchExceptionPolicy::REPORT);
+  if (dispatchEventImpl(js, kj::mv(event), reportExceptions).result) {
     logError(error);
   }
 }

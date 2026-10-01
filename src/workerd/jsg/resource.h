@@ -1418,6 +1418,11 @@ struct ResourceTypeBuilder {
   }
 
   template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
+  inline void registerRuntimeInstanceProperty() {
+    registerInstanceProperty<name, Getter, getter, Setter, setter>();
+  }
+
+  template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
   inline void registerPrototypeProperty() {
     auto v8Name = v8StrIntern(isolate, name);
     v8::Local<v8::FunctionTemplate> getterFn;
@@ -1718,6 +1723,9 @@ struct JsSetup {
 
   template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
   inline void registerInstanceProperty() {}
+
+  template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
+  inline void registerRuntimeInstanceProperty() {}
 
   template <const char* name, typename Getter, Getter getter, typename Setter, Setter setter>
   inline void registerPrototypeProperty() {}

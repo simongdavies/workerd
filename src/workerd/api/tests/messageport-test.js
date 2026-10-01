@@ -48,9 +48,10 @@ export const simple3 = {
   async test() {
     const { port1, port2 } = new MessageChannel();
 
-    const closeHandler = mock.fn();
-    port1.onclose = closeHandler;
-    port2.onclose = closeHandler;
+    const localCloseHandler = mock.fn();
+    const remoteCloseHandler = mock.fn();
+    port1.onclose = localCloseHandler;
+    port2.onclose = remoteCloseHandler;
 
     port1.close();
     port2.onmessage = () => {
@@ -58,7 +59,8 @@ export const simple3 = {
     };
     port1.postMessage('nope');
     await scheduler.wait(10);
-    strictEqual(closeHandler.mock.callCount(), 2);
+    strictEqual(localCloseHandler.mock.callCount(), 0);
+    strictEqual(remoteCloseHandler.mock.callCount(), 1);
   },
 };
 
@@ -82,10 +84,12 @@ export const simple5 = {
   async test() {
     const { port1, port2 } = new MessageChannel();
     throws(() => port1.postMessage(1, [1]), {
-      message: 'Transfer list is not supported',
+      code: 25,
+      name: 'DataCloneError',
     });
     throws(() => port1.postMessage(1, { transfer: [1] }), {
-      message: 'Transfer list is not supported',
+      code: 25,
+      name: 'DataCloneError',
     });
     // If the lists are empty it is ok.
     port1.postMessage(1, []);
@@ -100,9 +104,7 @@ export const simple5 = {
   },
 };
 
-// The following are a selected subset of web platform tests for MessageChannel and MessagePort
-// that we know we pass. We don't support the full MessagePort spec so we're not going to run
-// the full WPT's for these yet.
+// The following are focused adaptations of the authoritative webmessaging WPT coverage.
 // Refs: https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_Blob.any.js
 // Refs: https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_DataCloneErr.any.js
 
@@ -133,22 +135,9 @@ export const postMessageRpcTarget = {
   },
 };
 
-// Subset of the Web Platform Tests we know we don't pass, listed for future reference:
-// Most the web messaging WPT's are set up to require a full implementation of MessagePort
-// with web workers and most of the tests are in html files. We'll come back to these
-// later.
-// * https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_clone_port.any.js
-// * https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_clone_port_error.any.js
-// * https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_ports_readonly_array.any.js
-// * https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_transfer_xsite_incoming_messages.window.js
-// * https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_transfer_xsite_incoming_messages.window.js
-// * https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_with_transfer_incoming_messages.any.js
-// * https://github.com/web-platform-tests/wpt/blob/master/webmessaging/Channel_postMessage_with_transfer_outgoing_messages.any.js
-
-// This one is a bit special, per the spec we're supposed to fire off the close event
-// on an entangled port when the other port is garbage collected. We don't do that yet
-// and we might not ever. Need to investigate this further but it's not blocking us
-// right now.
+// Cross-global and cross-site transfer tests still require Worker/Window realms that this
+// same-isolate implementation does not provide. Garbage-collected peers also do not yet emit
+// close events:
 // * https://github.com/web-platform-tests/wpt/blob/master/webmessaging/message-channels/close-event/garbage-collected.tentative.any.js
 
 // The onmessage handler occupies a normal position in the listener list based on when it
@@ -216,57 +205,85 @@ export const onmessageNonCallableStartsPort = {
   },
 };
 
-// Adding a 'message' listener via addEventListener starts the port, the same as assigning
-// onmessage (Node.js behavior; per spec only the onmessage attribute enables the queue).
-export const addEventListenerStartsPort = {
+// addEventListener() alone does not enable the port message queue.
+export const addEventListenerDoesNotStartPort = {
   async test() {
     const { port1, port2 } = new MessageChannel();
-    const { promise, resolve } = Promise.withResolvers();
-    port2.addEventListener('message', (event) => resolve(event.data));
+    const handler = mock.fn();
+    port2.addEventListener('message', handler);
     port1.postMessage('hello');
-    strictEqual(await promise, 'hello');
+    await scheduler.wait(10);
+    strictEqual(handler.mock.callCount(), 0);
+
+    port2.start();
+    await scheduler.wait(10);
+    strictEqual(handler.mock.callCount(), 1);
+    strictEqual(handler.mock.calls[0].arguments[0].data, 'hello');
   },
 };
 
-// Removing the last 'message' listener returns the port to the pending state: messages
-// queue (rather than being dropped) until another listener is attached.
-export const removingLastListenerRequeues = {
+export const nullOnmessageDoesNotStartPort = {
+  async test() {
+    const { port1, port2 } = new MessageChannel();
+    const handler = mock.fn();
+    port2.addEventListener('message', handler);
+    port1.postMessage('queued');
+    port2.onmessage = null;
+    await scheduler.wait(10);
+    strictEqual(handler.mock.callCount(), 0);
+
+    port2.start();
+    await scheduler.wait(10);
+    strictEqual(handler.mock.callCount(), 1);
+  },
+};
+
+// Once enabled, a port remains enabled after its last listener is removed.
+export const removingLastListenerDoesNotDisablePort = {
   async test() {
     const { port1, port2 } = new MessageChannel();
     const first = Promise.withResolvers();
     const handler = (event) => first.resolve(event.data);
     port2.addEventListener('message', handler);
+    port2.start();
     port1.postMessage('one');
     strictEqual(await first.promise, 'one');
 
     port2.removeEventListener('message', handler);
-    port1.postMessage('two');
+    port1.postMessage('discarded');
     await scheduler.wait(10);
 
-    const second = Promise.withResolvers();
-    port2.addEventListener('message', (event) => second.resolve(event.data));
-    strictEqual(await second.promise, 'two');
+    const second = mock.fn();
+    port2.addEventListener('message', second);
+    await scheduler.wait(10);
+    strictEqual(second.mock.callCount(), 0);
+
+    port1.postMessage('two');
+    await scheduler.wait(10);
+    strictEqual(second.mock.callCount(), 1);
+    strictEqual(second.mock.calls[0].arguments[0].data, 'two');
   },
 };
 
-// A once-listener starts the port; its removal after the first message returns the port
-// to pending, so later messages queue until a new listener arrives.
-export const onceListenerReturnsPortToPending = {
+// A once-listener's removal does not disable a port that was explicitly started.
+export const onceListenerLeavesPortStarted = {
   async test() {
     const { port1, port2 } = new MessageChannel();
     const first = Promise.withResolvers();
     port2.addEventListener('message', (event) => first.resolve(event.data), {
       once: true,
     });
+    port2.start();
     port1.postMessage('one');
     strictEqual(await first.promise, 'one');
 
-    port1.postMessage('two');
+    port1.postMessage('discarded');
     await scheduler.wait(10);
 
-    const second = Promise.withResolvers();
-    port2.addEventListener('message', (event) => second.resolve(event.data));
-    strictEqual(await second.promise, 'two');
+    const second = mock.fn();
+    port2.addEventListener('message', second);
+    await scheduler.wait(10);
+    strictEqual(second.mock.callCount(), 0);
   },
 };
 
@@ -288,9 +305,8 @@ export const closedPortIsTerminal = {
   },
 };
 
-// A throwing 'message' listener has its exception reported (and the remaining listeners
-// still run), and the port additionally dispatches a 'messageerror' event carrying the
-// exception. The port itself keeps working.
+// A throwing 'message' listener is reported and remaining listeners still run. messageerror is
+// reserved for failures while deserializing a received message.
 export const throwingMessageListener = {
   async test() {
     const order = [];
@@ -299,8 +315,8 @@ export const throwingMessageListener = {
     const globalHandler = () => {
       order.push('global-error');
       // Injecting a message mid-report cannot jump the queue: delivery is always deferred
-      // to a later microtask, so it arrives after the current event's remaining listeners,
-      // after the synthesized messageerror, and after any messages queued before it.
+      // to a later microtask, so it arrives after the current event's remaining listeners
+      // and after any messages queued before it.
       port1.postMessage('injected');
     };
     globalThis.addEventListener('error', globalHandler);
@@ -316,8 +332,8 @@ export const throwingMessageListener = {
       );
       port2.addEventListener('messageerror', (event) => {
         order.push('messageerror');
-        strictEqual(event.data, boom);
       });
+      port2.start();
 
       port1.postMessage('bad');
       port1.postMessage('after');
@@ -326,7 +342,6 @@ export const throwingMessageListener = {
         'l1:bad',
         'global-error',
         'l2:bad',
-        'messageerror',
         'l1:after',
         'l2:after',
         'l1:injected',
@@ -338,8 +353,272 @@ export const throwingMessageListener = {
   },
 };
 
+export const onmessageerrorAttribute = {
+  test() {
+    const { port1 } = new MessageChannel();
+    const handler = mock.fn();
+    port1.onmessageerror = handler;
+    strictEqual(port1.onmessageerror, handler);
+    port1.dispatchEvent(
+      new MessageEvent('messageerror', { data: 'bad clone' })
+    );
+    strictEqual(handler.mock.callCount(), 1);
+    strictEqual(handler.mock.calls[0].arguments[0].data, 'bad clone');
+  },
+};
+
+export const transferredPortIsClonedAndEntangled = {
+  async test() {
+    const channelA = new MessageChannel();
+    const channelB = new MessageChannel();
+    const original = channelB.port2;
+
+    const received = Promise.withResolvers();
+    channelA.port2.onmessage = (event) => received.resolve(event);
+    channelA.port1.postMessage('ports', [original]);
+
+    const event = await received.promise;
+    strictEqual(event.data, 'ports');
+    strictEqual(event.ports.length, 1);
+    strictEqual(event.ports, event.ports);
+    const clone = event.ports[0];
+    ok(clone instanceof MessagePort);
+    ok(clone !== original);
+    throws(() => event.ports.push(new MessageChannel().port1), TypeError);
+
+    const ping = Promise.withResolvers();
+    clone.onmessage = (message) => ping.resolve(message.data);
+    channelB.port1.postMessage('ping');
+    strictEqual(await ping.promise, 'ping');
+
+    const ignored = mock.fn();
+    original.onmessage = ignored;
+    channelB.port1.postMessage('clone-only');
+    await scheduler.wait(10);
+    strictEqual(ignored.mock.callCount(), 0);
+  },
+};
+
+export const transferredPortInPayloadUsesClone = {
+  async test() {
+    const carrier = new MessageChannel();
+    const transferred = new MessageChannel();
+    const received = Promise.withResolvers();
+    carrier.port2.onmessage = (event) => received.resolve(event);
+
+    carrier.port1.postMessage({ port: transferred.port2 }, [transferred.port2]);
+    const event = await received.promise;
+    strictEqual(event.data.port, event.ports[0]);
+
+    const response = Promise.withResolvers();
+    transferred.port1.onmessage = (message) => response.resolve(message.data);
+    event.data.port.postMessage({ nested: ['ok', 42] });
+    deepStrictEqual(await response.promise, { nested: ['ok', 42] });
+  },
+};
+
+export const transferValidationDataCloneErrors = {
+  test() {
+    const source = new MessageChannel();
+    const transferable = new MessageChannel();
+
+    throws(
+      () =>
+        source.port1.postMessage('duplicate', [
+          transferable.port1,
+          transferable.port1,
+        ]),
+      { code: 25, name: 'DataCloneError' }
+    );
+    throws(() => source.port1.postMessage('source', [source.port1]), {
+      code: 25,
+      name: 'DataCloneError',
+    });
+    throws(() => source.port1.postMessage('view', [new Uint8Array(4)]), {
+      code: 25,
+      name: 'DataCloneError',
+    });
+    throws(() => source.port1.postMessage({ port: transferable.port1 }), {
+      code: 25,
+      name: 'DataCloneError',
+    });
+    throws(() => structuredClone(transferable.port1), {
+      code: 25,
+      name: 'DataCloneError',
+    });
+
+    const closed = new MessageChannel();
+    closed.port1.close();
+    throws(() => source.port1.postMessage('closed', [closed.port1]), {
+      code: 25,
+      name: 'DataCloneError',
+    });
+
+    source.port1.postMessage('first transfer', [transferable.port1]);
+    throws(() => source.port1.postMessage('detached', [transferable.port1]), {
+      code: 25,
+      name: 'DataCloneError',
+    });
+  },
+};
+
+export const arrayBufferTransferAndStructuredClone = {
+  async test() {
+    const { port1, port2 } = new MessageChannel();
+    const buffer = new Uint8Array([1, 2, 3, 4]).buffer;
+    const cyclic = { date: new Date(123456), map: new Map([['key', 7]]) };
+    cyclic.self = cyclic;
+    cyclic.buffer = buffer;
+
+    const received = Promise.withResolvers();
+    port2.onmessage = (event) => received.resolve(event.data);
+    port1.postMessage(cyclic, [buffer]);
+    strictEqual(buffer.byteLength, 0);
+
+    const clone = await received.promise;
+    strictEqual(clone.self, clone);
+    strictEqual(clone.date.getTime(), 123456);
+    strictEqual(clone.map.get('key'), 7);
+    deepStrictEqual([...new Uint8Array(clone.buffer)], [1, 2, 3, 4]);
+  },
+};
+
+export const queuedTransferredPortSurvivesStartAndGc = {
+  async test() {
+    const carrier = new MessageChannel();
+    const payload = new MessageChannel();
+    carrier.port1.postMessage('port', [payload.port2]);
+
+    for (let i = 0; i < 10; ++i) gc();
+
+    const received = Promise.withResolvers();
+    carrier.port2.onmessage = (event) => received.resolve(event.ports[0]);
+    const clone = await received.promise;
+
+    const ping = Promise.withResolvers();
+    clone.onmessage = (event) => ping.resolve(event.data);
+    payload.port1.postMessage('alive');
+    strictEqual(await ping.promise, 'alive');
+  },
+};
+
+export const transferPreservesIncomingMessageOrder = {
+  async test() {
+    const channel1 = new MessageChannel();
+    const channel2 = new MessageChannel();
+    const channel3 = new MessageChannel();
+
+    channel1.port2.postMessage('First');
+    channel2.port1.postMessage('1', [channel1.port1]);
+    const secondTransfer = Promise.withResolvers();
+    channel2.port2.onmessage = (event) => {
+      channel1.port2.postMessage('Second');
+      channel1.port2.postMessage('Third');
+      channel3.port2.postMessage('2', event.ports);
+    };
+    channel3.port1.onmessage = (event) =>
+      secondTransfer.resolve(event.ports[0]);
+
+    const port = await secondTransfer.promise;
+    const messages = [];
+    const done = Promise.withResolvers();
+    port.onmessage = (event) => {
+      messages.push(event.data);
+      if (messages.length === 4) done.resolve();
+    };
+    channel1.port2.postMessage('Fourth');
+    await done.promise;
+    deepStrictEqual(messages, ['First', 'Second', 'Third', 'Fourth']);
+  },
+};
+
+export const transferPreservesOutgoingMessageOrder = {
+  async test() {
+    const channel1 = new MessageChannel();
+    const channel2 = new MessageChannel();
+    const channel3 = new MessageChannel();
+
+    channel2.port2.onmessage = (event) => {
+      event.ports[0].postMessage('Second');
+      event.ports[0].postMessage('Third');
+      channel3.port2.postMessage('2', event.ports);
+    };
+    channel3.port1.onmessage = (event) => event.ports[0].postMessage('Fourth');
+
+    channel1.port1.postMessage('First');
+    channel2.port1.postMessage('1', [channel1.port1]);
+
+    const messages = [];
+    const done = Promise.withResolvers();
+    channel1.port2.onmessage = (event) => {
+      messages.push(event.data);
+      if (messages.length === 4) done.resolve();
+    };
+    await done.promise;
+    deepStrictEqual(messages, ['First', 'Second', 'Third', 'Fourth']);
+  },
+};
+
+export const transferringEntangledPairRewiresBothClones = {
+  async test() {
+    const carrier = new MessageChannel();
+    const pair = new MessageChannel();
+    const received = Promise.withResolvers();
+    carrier.port2.onmessage = (event) => received.resolve(event.ports);
+
+    carrier.port1.postMessage('pair', [pair.port1, pair.port2]);
+    const [port1, port2] = await received.promise;
+
+    const message = Promise.withResolvers();
+    port2.onmessage = (event) => message.resolve(event.data);
+    port1.postMessage('still entangled');
+    strictEqual(await message.promise, 'still entangled');
+  },
+};
+
+export const separatelyTransferredEntangledPortsStayOrdered = {
+  async test() {
+    const pair = new MessageChannel();
+    const carrier = new MessageChannel();
+    pair.port1.postMessage(1);
+    carrier.port1.postMessage('first', [pair.port1]);
+    carrier.port1.postMessage('second', [pair.port2]);
+
+    const transferred = [];
+    const ready = Promise.withResolvers();
+    carrier.port2.onmessage = (event) => {
+      transferred.push(event.ports[0]);
+      if (transferred.length === 2) ready.resolve();
+    };
+    await ready.promise;
+
+    const [sender, receiver] = transferred;
+    sender.postMessage(2);
+    sender.postMessage(3);
+    const messages = [];
+    const done = Promise.withResolvers();
+    receiver.onmessage = (event) => {
+      messages.push(event.data);
+      if (messages.length === 3) done.resolve();
+    };
+    await done.promise;
+    deepStrictEqual(messages, [1, 2, 3]);
+  },
+};
+
+export const closeCancelsScheduledDelivery = {
+  async test() {
+    const { port1, port2 } = new MessageChannel();
+    const handler = mock.fn();
+    port2.onmessage = handler;
+    port1.postMessage('discarded');
+    port2.close();
+    await scheduler.wait(10);
+    strictEqual(handler.mock.callCount(), 0);
+  },
+};
+
 // User-constructed MessageEvents reflect the source and ports passed in their init.
-// (The runtime itself never attaches either: ports are not transferable here.)
 export const messageEventSourceAndPorts = {
   test() {
     const { port1, port2 } = new MessageChannel();
@@ -354,12 +633,12 @@ export const messageEventSourceAndPorts = {
     strictEqual(ports[0], port1);
     strictEqual(ports[1], port2);
 
-    // Runtime-delivered message events carry the entangled port as source and no ports.
+    // Runtime-delivered MessagePort events have a null source and no transferred ports.
     const { promise, resolve } = Promise.withResolvers();
     port2.onmessage = (e) => resolve(e);
     port1.postMessage('hi');
     return promise.then((e) => {
-      strictEqual(e.source, port2);
+      strictEqual(e.source, null);
       strictEqual(e.ports.length, 0);
       strictEqual(e.origin, null);
     });
