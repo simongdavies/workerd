@@ -567,6 +567,7 @@ wd_test(
     src = "io-context-test.wd-test",
     args = ["--experimental"],
     data = ["io-context-test.js"],
+    generate_gc_stress_variant = False,
 )
 
 kj_test(

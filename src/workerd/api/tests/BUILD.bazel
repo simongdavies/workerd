@@ -135,6 +135,7 @@ wd_test(
     src = "connect-neuter-test.wd-test",
     args = ["--experimental"],
     data = ["connect-neuter-test.js"],
+    generate_gc_stress_variant = False,
 )
 
 wd_test(
@@ -185,6 +186,7 @@ wd_test(
         "connect-handler-test-proxy.js",
         "stw-large-log-subject.js",
     ],
+    generate_gc_stress_variant = False,
     tags = SOCKET_TEST_TAGS,
 )
 
@@ -579,6 +581,8 @@ wd_test(
     src = "legacy-dispatch-exceptions-test.wd-test",
     args = ["--experimental"],
     data = ["legacy-dispatch-exceptions-test.js"],
+    generate_all_compat_flags_variant = False,
+    generate_gc_stress_variant = False,
 )
 
 wd_test(
@@ -664,6 +668,7 @@ wd_test(
         "js-rpc-test",
     ],
     data = ["js-rpc-test.js"],
+    generate_gc_stress_variant = False,
     tags = SOCKET_TEST_TAGS,
 )
 
@@ -674,6 +679,7 @@ wd_test(
         "js-rpc-test",
     ],
     data = ["js-rpc-test.js"],
+    generate_gc_stress_variant = False,
     tags = SOCKET_TEST_TAGS,
 )
 
@@ -908,6 +914,7 @@ wd_test(
     data = ["autogate-enabled-test.js"],
     generate_all_compat_flags_variant = False,
     generate_default_variant = False,
+    generate_gc_stress_variant = False,
 )
 
 # Test that verifies autogates are DISABLED - only runs in default variant
@@ -1018,6 +1025,7 @@ wd_test(
         "js-rpc-test",
     ],
     data = ["js-rpc-test.js"],
+    generate_gc_stress_variant = False,
     tags = SOCKET_TEST_TAGS,
 )
 
@@ -1029,6 +1037,7 @@ wd_test(
         "js-rpc-test",
     ],
     data = ["js-rpc-test.js"],
+    generate_gc_stress_variant = False,
     tags = SOCKET_TEST_TAGS,
 )
 
@@ -1117,6 +1126,7 @@ wd_test(
     src = "cross-context-promise-test.wd-test",
     args = ["--experimental"],
     data = ["cross-context-promise-test.js"],
+    generate_gc_stress_variant = False,
 )
 
 wd_test(

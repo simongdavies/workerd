@@ -113,6 +113,7 @@ wpt_test(
     size = "large",
     compat_flags = ["writable_stream_spec_compliant_writer"],
     config = "streams-test.ts",
+    generate_gc_stress_variant = False,
     wpt_directory = "@wpt//:streams@module",
 )
 
