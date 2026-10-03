@@ -126,6 +126,9 @@ struct NormalizedFilePath {
     case workerd::FsError::FILE_SIZE_LIMIT_EXCEEDED: {
       node::THROW_ERR_UV_EPERM(js, syscall, "File size limit exceeded"_kj, path);
     }
+    case workerd::FsError::QUOTA_EXCEEDED: {
+      node::THROW_ERR_UV_EDQUOT(js, syscall, nullptr, path);
+    }
     case workerd::FsError::SYMLINK_DEPTH_EXCEEDED: {
       node::THROW_ERR_UV_ELOOP(js, syscall, "symlink depth exceeded"_kj, path);
     }
@@ -134,6 +137,18 @@ struct NormalizedFilePath {
     }
     default: {
       node::THROW_ERR_UV_EPERM(js, syscall, nullptr, path);
+    }
+  }
+  KJ_UNREACHABLE;
+}
+
+workerd::Stat getFileStat(jsg::Lock& js, workerd::File& file, kj::StringPtr syscall) {
+  KJ_SWITCH_ONEOF(file.tryStat(js)) {
+    KJ_CASE_ONEOF(stat, workerd::Stat) {
+      return stat;
+    }
+    KJ_CASE_ONEOF(error, workerd::FsError) {
+      throwFsError(js, error, syscall);
     }
   }
   KJ_UNREACHABLE;
@@ -159,7 +174,7 @@ kj::Maybe<Stat> FileSystemModule::stat(
               js, normalizedPath, {.followLinks = options.followSymlinks.orDefault(true)})) {
         KJ_SWITCH_ONEOF(node) {
           KJ_CASE_ONEOF(file, kj::Rc<workerd::File>) {
-            return Stat(file->stat(js));
+            return Stat(getFileStat(js, *file, "stat"_kj));
           }
           KJ_CASE_ONEOF(dir, kj::Rc<workerd::Directory>) {
             return Stat(dir->stat(js));
@@ -181,7 +196,7 @@ kj::Maybe<Stat> FileSystemModule::stat(
       KJ_IF_SOME(opened, vfs.tryGetFd(js, fd)) {
         KJ_SWITCH_ONEOF(opened->node) {
           KJ_CASE_ONEOF(file, kj::Rc<workerd::File>) {
-            return Stat(file->stat(js));
+            return Stat(getFileStat(js, *file, "fstat"_kj));
           }
           KJ_CASE_ONEOF(dir, kj::Rc<workerd::Directory>) {
             return Stat(dir->stat(js));
@@ -504,7 +519,7 @@ uint32_t FileSystemModule::write(
       if (opened->append) {
         // If the file descriptor is opened in append mode, we ignore the position
         // option and always append to the end of the file.
-        auto stat = file->stat(js);
+        auto stat = getFileStat(js, *file, "write"_kj);
         return stat.size;
       }
       auto pos = options.position.orDefault(opened->position);
@@ -568,7 +583,11 @@ uint32_t FileSystemModule::read(
         uint32_t total = 0;
         for (auto& buffer: data) {
           auto handle = buffer.getHandle(js);
-          auto read = file->read(js, pos, handle.asArrayPtr());
+          auto readResult = file->tryRead(js, pos, handle.asArrayPtr());
+          KJ_IF_SOME(error, readResult.tryGet<workerd::FsError>()) {
+            throwFsError(js, error, "read"_kj);
+          }
+          auto read = KJ_ASSERT_NONNULL(readResult.tryGet<uint32_t>());
           // if read is less than the size of the buffer, we are at EOF.
           pos += read;
           total += read;
@@ -638,7 +657,7 @@ jsg::JsRef<jsg::JsUint8Array> FileSystemModule::readAll(
         KJ_IF_SOME(file, opened->node.tryGet<kj::Rc<workerd::File>>()) {
           // Move the opened.position to the end of the file.
           KJ_DEFER({
-            auto stat = file->stat(js);
+            auto stat = getFileStat(js, *file, "appendFile"_kj);
             opened->position = stat.size;
           });
 
@@ -684,7 +703,7 @@ uint32_t FileSystemModule::writeAll(jsg::Lock& js,
         KJ_SWITCH_ONEOF(node) {
           KJ_CASE_ONEOF(file, kj::Rc<workerd::File>) {
             // First let's check that the file is writable.
-            auto stat = file->stat(js);
+            auto stat = getFileStat(js, *file, "writeAll"_kj);
             if (!stat.writable) {
               node::THROW_ERR_UV_EPERM(js, "writeAll"_kj);
             }
@@ -781,7 +800,7 @@ uint32_t FileSystemModule::writeAll(jsg::Lock& js,
         }
 
         KJ_IF_SOME(file, opened->node.tryGet<kj::Rc<workerd::File>>()) {
-          auto stat = file->stat(js);
+          auto stat = getFileStat(js, *file, "fwrite"_kj);
 
           if (!stat.writable) {
             node::THROW_ERR_UV_EPERM(js, "fwrite"_kj);
@@ -789,7 +808,7 @@ uint32_t FileSystemModule::writeAll(jsg::Lock& js,
 
           KJ_DEFER({
             // In either case, we need to update the position of the file descriptor.
-            stat = file->stat(js);
+            stat = getFileStat(js, *file, "fwrite"_kj);
             opened->position = stat.size;
           });
 
@@ -1217,7 +1236,7 @@ void readdirImpl(jsg::Lock& js,
     auto name = options.recursive ? path.append(entry.key).toString(false) : kj::str(entry.key);
     KJ_SWITCH_ONEOF(entry.value) {
       KJ_CASE_ONEOF(file, kj::Rc<workerd::File>) {
-        auto stat = file->stat(js);
+        auto stat = getFileStat(js, *file, "readdir"_kj);
         entries.add(FileSystemModule::DirEntHandle{
           .name = kj::mv(name),
           .parentPath = path.toString(true),
@@ -2103,6 +2122,9 @@ jsg::Ref<jsg::DOMException> fsErrorToDomException(jsg::Lock& js, workerd::FsErro
       return js.domException(kj::str("QuotaExceededError"),
           kj::str("File size limit exceeded, please reduce the file size and try again"));
     }
+    case workerd::FsError::QUOTA_EXCEEDED: {
+      return js.domException(kj::str("QuotaExceededError"), kj::str("Storage quota exceeded"));
+    }
     case workerd::FsError::SYMLINK_DEPTH_EXCEEDED: {
       return js.domException(kj::str("InvalidStateError"),
           kj::str("Symbolic link depth exceeded, please check the symbolic links"));
@@ -2647,7 +2669,12 @@ jsg::Promise<jsg::Ref<File>> FileSystemFileHandle::getFile(
             deHandler.wrap(js, fsErrorToDomException(js, err)));
       }
       KJ_CASE_ONEOF(file, kj::Rc<workerd::File>) {
-        auto stat = file->stat(js);
+        auto statResult = file->tryStat(js);
+        KJ_IF_SOME(err, statResult.tryGet<workerd::FsError>()) {
+          return js.rejectedPromise<jsg::Ref<File>>(
+              deHandler.wrap(js, fsErrorToDomException(js, err)));
+        }
+        auto stat = KJ_ASSERT_NONNULL(statResult.tryGet<workerd::Stat>());
         KJ_SWITCH_ONEOF(file->readAllBytes(js)) {
           KJ_CASE_ONEOF(bytes, jsg::JsRef<jsg::JsUint8Array>) {
             return js.resolvedPromise(js.alloc<File>(js, jsg::JsBufferSource(bytes.getHandle(js)),

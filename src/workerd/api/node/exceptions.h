@@ -72,6 +72,7 @@ jsg::JsValue createUVException(jsg::Lock& js,
 #define UV_ERRNO_MAP(V)                                                                            \
   V(EACCES, "permission denied")                                                                   \
   V(EBADF, "bad file descriptor")                                                                  \
+  V(EDQUOT, "disk quota exceeded")                                                                 \
   V(EEXIST, "file already exists")                                                                 \
   V(EFBIG, "file too large")                                                                       \
   V(EINVAL, "invalid argument")                                                                    \

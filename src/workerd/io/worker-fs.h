@@ -198,6 +198,8 @@ enum class FsError {
   INVALID_PATH,
   // Exceeds file size limit
   FILE_SIZE_LIMIT_EXCEEDED,
+  // Exceeds backing filesystem quota
+  QUOTA_EXCEEDED,
   // Symlink depth exceeded
   SYMLINK_DEPTH_EXCEEDED,
   // Path does not exist
@@ -218,6 +220,11 @@ class File: public kj::Refcounted {
   // Returns the metadata for this node.
   virtual Stat stat(jsg::Lock& js) KJ_WARN_UNUSED_RESULT = 0;
 
+  // Returns the metadata for this node, preserving errors from external filesystems.
+  virtual kj::OneOf<FsError, Stat> tryStat(jsg::Lock& js) KJ_WARN_UNUSED_RESULT {
+    return stat(js);
+  }
+
   // Reads all the contents of the file as a string.
   kj::OneOf<FsError, jsg::JsString> readAllText(jsg::Lock& js) KJ_WARN_UNUSED_RESULT;
 
@@ -227,6 +234,12 @@ class File: public kj::Refcounted {
 
   // Reads data from the file at the given offset into the given buffer.
   virtual uint32_t read(jsg::Lock& js, uint32_t offset, kj::ArrayPtr<kj::byte> buffer) const = 0;
+
+  // Reads data while preserving errors from external filesystems.
+  virtual kj::OneOf<FsError, uint32_t> tryRead(
+      jsg::Lock& js, uint32_t offset, kj::ArrayPtr<kj::byte> buffer) const {
+    return read(js, offset, buffer);
+  }
 
   // Replaces the full contents of the file with the given data.
   // Equivalent to resize(js, data.size()) followed by write(js, 0, data).

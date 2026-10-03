@@ -312,7 +312,7 @@ class DirectoryBase final: public Directory {
         KJ_CASE_ONEOF(file, kj::Rc<File>) {
           // We found a file. If the remaining path is empty, yay! Return the stat.
           if (ptr.size() == 1) {
-            return kj::Maybe<kj::OneOf<FsError, Stat>>(file->stat(js));
+            return file->tryStat(js);
           }
           // Otherwise we'll fall through to return kj::none
         }
@@ -332,7 +332,7 @@ class DirectoryBase final: public Directory {
           KJ_IF_SOME(resolved, link->resolve(js)) {
             KJ_SWITCH_ONEOF(resolved) {
               KJ_CASE_ONEOF(file, kj::Rc<File>) {
-                return kj::Maybe<kj::OneOf<FsError, Stat>>(file->stat(js));
+                return file->tryStat(js);
               }
               KJ_CASE_ONEOF(dir, kj::Rc<Directory>) {
                 return dir->stat(js, ptr.slice(1, ptr.size()));
@@ -832,9 +832,19 @@ class FileImpl final: public File {
       return FsError::READ_ONLY;
     }
 
-    auto stat = file->stat(js);
+    auto statResult = file->tryStat(js);
+    KJ_IF_SOME(error, statResult.tryGet<FsError>()) {
+      return error;
+    }
+    auto stat = KJ_ASSERT_NONNULL(statResult.tryGet<Stat>());
     auto buffer = kj::heapArray<kj::byte>(stat.size);
-    file->read(js, 0, buffer.asPtr());
+    auto readResult = file->tryRead(js, 0, buffer.asPtr());
+    KJ_IF_SOME(error, readResult.tryGet<FsError>()) {
+      return error;
+    }
+    if (KJ_ASSERT_NONNULL(readResult.tryGet<uint32_t>()) != stat.size) {
+      return FsError::FAILED;
+    }
     auto& owned = ownedOrView.get<Owned>();
     owned.adjustment.setNow(js, buffer.size());
     owned.data = kj::mv(buffer);
@@ -1021,7 +1031,11 @@ class VirtualFileSystemImpl final: public VirtualFileSystem {
       KJ_SWITCH_ONEOF(node) {
         KJ_CASE_ONEOF(file, kj::Rc<File>) {
           if (opts.write) {
-            auto stat = file->stat(js);
+            auto statResult = file->tryStat(js);
+            KJ_IF_SOME(error, statResult.tryGet<FsError>()) {
+              return error;
+            }
+            auto stat = KJ_ASSERT_NONNULL(statResult.tryGet<Stat>());
             if (!stat.writable) return FsError::NOT_PERMITTED;
             if (opts.truncate && stat.size > 0) {
               KJ_IF_SOME(err, file->resize(js, 0)) {
@@ -1197,12 +1211,20 @@ FdHandle::~FdHandle() noexcept(false) {
 }  // namespace
 
 kj::OneOf<FsError, jsg::JsString> File::readAllText(jsg::Lock& js) {
-  auto info = stat(js);
+  auto statResult = tryStat(js);
+  KJ_IF_SOME(error, statResult.tryGet<FsError>()) {
+    return error;
+  }
+  auto info = KJ_ASSERT_NONNULL(statResult.tryGet<Stat>());
   KJ_DASSERT(info.type == FsType::FILE);
   if (info.size == 0) return js.str();
 
   KJ_STACK_ARRAY(char, data, info.size, 4096, 4096);
-  auto size = read(js, 0, data.asBytes());
+  auto readResult = tryRead(js, 0, data.asBytes());
+  KJ_IF_SOME(error, readResult.tryGet<FsError>()) {
+    return error;
+  }
+  auto size = KJ_ASSERT_NONNULL(readResult.tryGet<uint32_t>());
   if (size != info.size) {
     return FsError::FAILED;
   }
@@ -1210,11 +1232,19 @@ kj::OneOf<FsError, jsg::JsString> File::readAllText(jsg::Lock& js) {
 }
 
 kj::OneOf<FsError, jsg::JsRef<jsg::JsUint8Array>> File::readAllBytes(jsg::Lock& js) {
-  auto info = stat(js);
+  auto statResult = tryStat(js);
+  KJ_IF_SOME(error, statResult.tryGet<FsError>()) {
+    return error;
+  }
+  auto info = KJ_ASSERT_NONNULL(statResult.tryGet<Stat>());
   KJ_DASSERT(info.type == FsType::FILE);
   auto u8 = jsg::JsUint8Array::create(js, info.size);
   if (info.size > 0) {
-    KJ_ASSERT(read(js, 0, u8.asArrayPtr()) == info.size);
+    auto readResult = tryRead(js, 0, u8.asArrayPtr());
+    KJ_IF_SOME(error, readResult.tryGet<FsError>()) {
+      return error;
+    }
+    KJ_ASSERT(KJ_ASSERT_NONNULL(readResult.tryGet<uint32_t>()) == info.size);
   }
   return u8.addRef(js);
 }
