@@ -4,6 +4,7 @@
 
 #include "sandbox-runtime.h"
 
+#include "host-fs.h"
 #include "hyperlight-driver.h"
 #include "sandbox-fetch.h"
 
@@ -34,6 +35,159 @@ constexpr kj::Duration TIMER_POLL_INTERVAL = 1 * kj::MILLISECONDS;
 jsg::V8System v8System({"--single-threaded"_kj, "--max-old-space-size=64"_kj,
   "--max-semi-space-size=4"_kj, "--no-concurrent-marking"_kj, "--no-concurrent-sweeping"_kj,
   "--no-concurrent-recompilation"_kj, "--no-parallel-scavenge"_kj});
+
+const Module* findBundleModule(const WorkerBundle& bundle, kj::StringPtr name) {
+  for (const auto& module: bundle.modules) {
+    if (module.name == name) return &module;
+  }
+  return nullptr;
+}
+
+kj::Maybe<kj::String> resolveBundleFile(const WorkerBundle& bundle, kj::StringPtr path) {
+  auto candidateBuilder = kj::heapArrayBuilder<kj::String>(5);
+  candidateBuilder.add(kj::str(path));
+  candidateBuilder.add(kj::str(path, ".js"));
+  candidateBuilder.add(kj::str(path, ".cjs"));
+  candidateBuilder.add(kj::str(path, "/index.js"));
+  candidateBuilder.add(kj::str(path, "/index.cjs"));
+  auto candidates = candidateBuilder.finish();
+  for (auto& candidate: candidates) {
+    if (findBundleModule(bundle, candidate) != nullptr) return kj::mv(candidate);
+  }
+  return kj::none;
+}
+
+kj::Maybe<kj::String> packageMain(const WorkerBundle& bundle, kj::StringPtr packageRoot) {
+  auto packageJsonName = kj::str(packageRoot, "/package.json");
+  auto packageJson = findBundleModule(bundle, packageJsonName);
+  if (packageJson == nullptr) return kj::none;
+  KJ_REQUIRE(packageJson->type == ModuleType::TEXT || packageJson->type == ModuleType::JSON,
+      "package.json must be text or JSON", packageJsonName);
+
+  capnp::JsonCodec codec;
+  capnp::MallocMessageBuilder message;
+  auto root = message.initRoot<capnp::JsonValue>();
+  codec.decodeRaw(packageJson->source, root);
+  KJ_REQUIRE(root.isObject(), "package.json must contain an object", packageJsonName);
+  for (auto field: root.getObject()) {
+    if (field.getName() == "main"_kj) {
+      KJ_REQUIRE(
+          field.getValue().isString(), "package.json main must be a string", packageJsonName);
+      auto main = field.getValue().getString();
+      KJ_REQUIRE(
+          main.size() > 0 && main[0] != '/', "package.json main must be relative", packageJsonName);
+      KJ_TRY {
+        return kj::Path::parse(packageRoot).eval(main).toString();
+      }
+      KJ_CATCH(exception) {
+        KJ_FAIL_REQUIRE("package.json main escapes its package", packageJsonName, main, exception);
+      }
+    }
+  }
+  return kj::none;
+}
+
+kj::String relativeModuleSpecifier(kj::StringPtr fromModule, kj::StringPtr targetModule) {
+  auto from = kj::Path::parse(fromModule).parent();
+  auto target = kj::Path::parse(targetModule);
+  size_t common = 0;
+  while (common < from.size() && common < target.size() && from[common] == target[common]) {
+    ++common;
+  }
+
+  auto result = kj::str("");
+  for (size_t i = common; i < from.size(); ++i) {
+    result = kj::str(result, "../");
+  }
+  if (result.size() == 0) result = kj::str("./");
+  for (size_t i = common; i < target.size(); ++i) {
+    result = kj::str(result, i == common ? ""_kj : "/"_kj, target[i]);
+  }
+  return result;
+}
+
+kj::Maybe<kj::String> resolveCommonJsSpecifier(
+    const WorkerBundle& bundle, kj::StringPtr fromModule, kj::StringPtr specifier) {
+  if (specifier.startsWith(".")) {
+    kj::String candidate;
+    KJ_TRY {
+      candidate = kj::Path::parse(fromModule).parent().eval(specifier).toString();
+    }
+    KJ_CATCH(exception) {
+      KJ_FAIL_REQUIRE("CommonJS require escapes the bundle", fromModule, specifier, exception);
+    }
+    auto resolved = KJ_REQUIRE_NONNULL(resolveBundleFile(bundle, candidate),
+        "unregistered CommonJS module", fromModule, specifier);
+    return relativeModuleSpecifier(fromModule, resolved);
+  }
+
+  if (specifier.startsWith("node:") || specifier.startsWith("cloudflare:") ||
+      specifier.startsWith("workerd:")) {
+    return kj::none;
+  }
+
+  auto slash = specifier.findFirst('/');
+  size_t packageEnd;
+  if (specifier.startsWith("@")) {
+    KJ_IF_SOME(firstSlash, slash) {
+      packageEnd = KJ_REQUIRE_NONNULL(specifier.slice(firstSlash + 1).findFirst('/'),
+                       "invalid scoped package specifier", specifier) +
+          firstSlash + 1;
+    } else {
+      return kj::none;
+    }
+  } else {
+    packageEnd = slash.orDefault(specifier.size());
+  }
+  auto package = specifier.first(packageEnd);
+  auto packageRoot = kj::str("node_modules/", package);
+  auto packagePrefix = kj::str(packageRoot, "/");
+  bool packaged = false;
+  for (const auto& module: bundle.modules) {
+    if (module.name.startsWith(packagePrefix)) {
+      packaged = true;
+      break;
+    }
+  }
+  if (!packaged) return kj::none;
+
+  kj::String candidate;
+  if (packageEnd < specifier.size()) {
+    candidate = kj::str(packageRoot, "/", specifier.slice(packageEnd + 1));
+  } else {
+    candidate = packageMain(bundle, packageRoot).orDefault(kj::str(packageRoot, "/index"));
+  }
+  auto resolved = KJ_REQUIRE_NONNULL(
+      resolveBundleFile(bundle, candidate), "unregistered CommonJS package", fromModule, specifier);
+  return relativeModuleSpecifier(fromModule, resolved);
+}
+
+kj::String rewriteCommonJsRequires(const WorkerBundle& bundle, const Module& module) {
+  auto source = module.source.asPtr();
+  kj::Vector<char> output;
+  size_t copied = 0;
+  for (size_t i = 0; i + 8 < source.size(); ++i) {
+    if (source.slice(i).startsWith("require("_kj)) {
+      auto quoteIndex = i + 8;
+      if (source[quoteIndex] != '\'' && source[quoteIndex] != '"') continue;
+      auto quote = source[quoteIndex];
+      auto end = quoteIndex + 1;
+      while (end < source.size() && source[end] != quote) ++end;
+      if (end == source.size() || end + 1 >= source.size() || source[end + 1] != ')') continue;
+
+      auto specifier = kj::str(source.slice(quoteIndex + 1, end));
+      KJ_IF_SOME(resolved, resolveCommonJsSpecifier(bundle, module.name, specifier)) {
+        output.addAll(source.slice(copied, quoteIndex + 1));
+        output.addAll(resolved);
+        copied = end;
+      }
+      i = end + 1;
+    }
+  }
+  output.addAll(source.slice(copied));
+  output.add('\0');
+  return kj::String(output.releaseAsArray());
+}
 
 class Cache final: public CacheClient {
  public:
@@ -498,6 +652,9 @@ server::config::Worker::Reader buildConfig(
       case ModuleType::ES_MODULE:
         output.setEsModule(input.source);
         break;
+      case ModuleType::COMMON_JS_MODULE:
+        output.setCommonJsModule(rewriteCommonJsRequires(bundle, input));
+        break;
       case ModuleType::TEXT:
         output.setText(input.source);
         break;
@@ -512,10 +669,38 @@ server::config::Worker::Reader buildConfig(
 CompatibilityFlags::Reader buildCompatibilityFlags(capnp::MallocMessageBuilder& arena,
     const WorkerBundle& bundle,
     Worker::ValidationErrorReporter& errorReporter) {
+  static constexpr kj::StringPtr ALLOWED_EXPERIMENTAL_FLAGS[] = {
+    "enable_web_file_system"_kj,
+  };
   auto flags = arena.initRoot<CompatibilityFlags>();
   compileCompatibilityFlags(bundle.compatibilityDate, bundle.compatibilityFlags, flags,
-      errorReporter, false, CompatibilityDateValidation::CODE_VERSION, nullptr);
+      errorReporter, false, CompatibilityDateValidation::CODE_VERSION,
+      kj::arrayPtr(ALLOWED_EXPERIMENTAL_FLAGS));
   return flags;
+}
+
+kj::Own<VirtualFileSystem> buildFileSystem(const WorkerBundle& bundle) {
+  auto fsMap = kj::heap<FsMap>();
+  Directory::Builder bundleDirectory;
+  kj::Path bundleRoot(nullptr);
+  for (const auto& module: bundle.modules) {
+    auto path = bundleRoot.eval(module.name);
+    bundleDirectory.addPath(
+        path, File::newReadable(kj::heapArray<const byte>(module.source.asBytes())));
+  }
+
+  Directory::Builder root;
+  root.addPath(fsMap->getBundlePath(), bundleDirectory.finish());
+  root.addPath(fsMap->getTempPath(), getTmpDirectoryImpl());
+  root.addPath(fsMap->getDevPath(), getDevDirectory());
+
+  Directory::Builder storage;
+  for (const auto& mount: bundle.storageMounts) {
+    storage.add(
+        mount.name, newHostStorageDirectory(mount.name, mount.mode == StorageMode::READ_WRITE));
+  }
+  root.add("storage"_kj, storage.finish());
+  return newVirtualFileSystem(kj::mv(fsMap), root.finish());
 }
 
 }  // namespace
@@ -566,7 +751,7 @@ struct SandboxRuntime::Impl {
             kj::none,
             kj::none,
             SpanParent(nullptr),
-            newWorkerFileSystem(kj::heap<FsMap>(), getTmpDirectoryImpl()),
+            buildFileSystem(bundle),
             kj::none)),
         worker(kj::atomicRefcounted<Worker>(kj::atomicAddRef(*script),
             kj::atomicRefcounted<WorkerObserver>(),

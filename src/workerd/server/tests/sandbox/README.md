@@ -31,8 +31,8 @@ not a security boundary and has not yet been replaced by Hyperlight.
 
 ## Hyperlight executor bundle protocol
 
-The Hyperlight executor keeps the `init(string)` and `fetch(string)` calls. `init` accepts one
-canonical compact JSON object:
+The Hyperlight executor keeps the `init(string)` and `fetch(string)` calls. Protocol v1 `init`
+accepts one canonical compact JSON object:
 
 ```json
 {"protocol_version":1,"worker_version":"hello-v1","compatibility_date":"2023-02-28","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default { fetch() { return new Response(\"hello\") } }"}]}
@@ -40,8 +40,27 @@ canonical compact JSON object:
 
 The top-level and module field order shown above is required. Compatibility flags are sorted and
 unique. The main module is first; all other modules are sorted by name. Supported module types are
-`esModule`, `text`, and `json`. The envelope is limited to 60 KiB, with at most 32 modules, 32 KiB
-per source, and 48 KiB of aggregate source.
+`esModule`, `commonJsModule`, `text`, and `json`. The envelope is limited to 60 KiB, with at most 32
+modules, 32 KiB per source, and 48 KiB of aggregate source.
+
+Before compiling CommonJS modules, the executor resolves static string-literal `require()` edges
+against this bounded module list. Relative specifiers support explicit files, `.js`, `.cjs`, and
+`index` resolution. Bare packaged specifiers use the registered package's bundled `package.json`
+`main`; they never consult a host path. Resolution rewrites edges to canonical relative module
+names, while traversal and unregistered relative modules reject initialization.
+
+Protocol v2 appends a `storage` field after `modules`. It contains at most eight entries, sorted by
+unique logical name:
+
+```json
+{"protocol_version":2,"worker_version":"storage-v1","compatibility_date":"2025-12-31","compatibility_flags":["enable_nodejs_fs_module","enable_web_file_system","nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"..."}],"storage":[{"name":"readonly","mode":"ro"},{"name":"scratch","mode":"rw"}]}
+```
+
+Names contain only lowercase ASCII letters, digits, and hyphens and are limited to 64 bytes. The
+manifest never contains a host path. For each entry, the executor opens the fixed guest directory
+`/mnt/workerd-storage/<name>` without following symlinks and exposes it at `/storage/<name>`.
+`mode` is `ro` or `rw`; the Hyperlight launcher remains responsible for mounting the corresponding
+guest path with equal or stricter hostfs permissions and quota.
 
 `fetch` emits one compact protocol-v1 response object followed by one LF. The executor validates the
 complete response before emitting any bytes and writes it in chunks of at most 1 KiB because the
@@ -55,7 +74,17 @@ python3 src/workerd/server/tests/sandbox/make-executor-bundle.py web-streams
 python3 src/workerd/server/tests/sandbox/make-executor-bundle.py wintertc-smoke
 python3 src/workerd/server/tests/sandbox/make-executor-bundle.py wintertc-evidence \
   --output /tmp/wintertc-evidence.json
+python3 src/workerd/server/tests/sandbox/make-executor-bundle.py filesystem-evidence \
+  --output /tmp/filesystem-evidence.json
 ```
+
+The filesystem evidence bundle has two deliberately separate routes. `/evidence/workerd-vfs`
+probes Workerd's pinned `/bundle`, request-local `/tmp`, and `/dev/{null,zero,random}` behavior.
+Call it twice on one executor instance; both responses must report `tmp.freshRequest: true`.
+`/evidence/hostfs` probes the Hyperlight-backed `/storage/ro` and `/storage/rw` mounts, including
+allowed read, read-only denial, bounded write, traversal, and unlisted-name errors. Pass
+`?quotaBytes=<host-quota-exceeding-size>` to require the launcher-enforced quota path; the returned
+error code must be `EDQUOT`.
 
 `ecma-429-support-matrix.json` records the representative executor API smoke and the corresponding
 upstream Workerd WPT baseline. The executor probe is a smoke test, not a WinterTC or ECMA-429
@@ -136,10 +165,10 @@ python3 src/workerd/server/tests/sandbox/validate-wintertc-evidence.py
 ### Component Model and WASI boundary
 
 This executor cannot load a WebAssembly Component Model/WASI component. Its bundle parser accepts
-only `esModule`, `text`, and `json`, and requires the main module to be an ES module. Workerd exposes
-V8's core `WebAssembly` API, but `node:wasi` is explicitly a non-functional stub whose constructor
-and lifecycle methods throw `ERR_METHOD_NOT_IMPLEMENTED`. There is no component linker, canonical
-ABI implementation, or WASI Preview 2 host in this path.
+only `esModule`, `commonJsModule`, `text`, and `json`, and requires the main module to be an ES
+module. Workerd exposes V8's core `WebAssembly` API, but `node:wasi` is explicitly a non-functional
+stub whose constructor and lifecycle methods throw `ERR_METHOD_NOT_IMPLEMENTED`. There is no
+component linker, canonical ABI implementation, or WASI Preview 2 host in this path.
 
 The deterministic fallback is the core Wasm module embedded in `wintertc-evidence.js`. It needs no
 WASI imports, is compiled and instantiated during module startup, and its cached instance is used

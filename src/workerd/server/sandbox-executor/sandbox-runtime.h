@@ -32,6 +32,7 @@ struct Response {
 
 enum class ModuleType {
   ES_MODULE,
+  COMMON_JS_MODULE,
   TEXT,
   JSON,
 };
@@ -42,12 +43,24 @@ struct Module {
   kj::String source;
 };
 
+enum class StorageMode {
+  READ_ONLY,
+  READ_WRITE,
+};
+
+struct StorageMount {
+  kj::String name;
+  StorageMode mode;
+};
+
 struct WorkerBundle {
   kj::String workerVersion;
   kj::String compatibilityDate;
   kj::Array<kj::String> compatibilityFlags;
   kj::String mainModule;
   kj::Array<Module> modules;
+  uint protocolVersion = 1;
+  kj::Array<StorageMount> storageMounts;
 };
 
 class SandboxRuntime {

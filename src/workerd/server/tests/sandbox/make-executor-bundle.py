@@ -62,6 +62,24 @@ def bundle(name: str) -> dict[str, object]:
             "main_module": "worker.js",
             "modules": [module("worker.js", source)],
         }
+    if name == "filesystem-evidence":
+        source = ROOT / "src/workerd/server/tests/sandbox/filesystem-evidence.js"
+        return {
+            "protocol_version": 2,
+            "worker_version": "filesystem-evidence-v1",
+            "compatibility_date": "2025-12-31",
+            "compatibility_flags": [
+                "enable_nodejs_fs_module",
+                "enable_web_file_system",
+                "nodejs_compat",
+            ],
+            "main_module": "worker.js",
+            "modules": [module("worker.js", source)],
+            "storage": [
+                {"name": "readonly", "mode": "ro"},
+                {"name": "scratch", "mode": "rw"},
+            ],
+        }
     raise ValueError(f"unknown bundle: {name}")
 
 
@@ -69,7 +87,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "bundle",
-        choices=["helloworld", "web-streams", "wintertc-smoke", "wintertc-evidence"],
+        choices=[
+            "helloworld",
+            "web-streams",
+            "wintertc-smoke",
+            "wintertc-evidence",
+            "filesystem-evidence",
+        ],
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

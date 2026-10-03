@@ -131,6 +131,8 @@ wd_cc_embed(
 wd_cc_binary(
     name = "workerd-sandbox-executor",
     srcs = [
+        "sandbox-executor/host-fs.c++",
+        "sandbox-executor/host-fs.h",
         "sandbox-executor/hyperlight-driver.h",
         "sandbox-executor/sandbox-executor.c++",
         "sandbox-executor/sandbox-fetch.c++",
@@ -150,6 +152,7 @@ wd_cc_binary(
         "//src/workerd/io",
         "//src/workerd/io:compatibility-date",
         "//src/workerd/jsg",
+        "//src/workerd/server/tests:filesystem-evidence-embed",
         "//src/workerd/util:autogate",
         "//src/workerd/util:setup-async-io",
         "@capnp-cpp//src/capnp/compat:json",

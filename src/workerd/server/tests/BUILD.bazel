@@ -1,4 +1,12 @@
 load("@aspect_rules_js//js:defs.bzl", "js_library")
+load("//:build/wd_cc_embed.bzl", "wd_cc_embed")
+
+wd_cc_embed(
+    name = "filesystem-evidence-embed",
+    src = "sandbox/filesystem-evidence.js",
+    base_name = "filesystem_evidence",
+    visibility = ["//src/workerd/server:__pkg__"],
+)
 
 js_library(
     name = "server-harness_js_lib",

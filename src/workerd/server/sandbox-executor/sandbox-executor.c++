@@ -6,6 +6,7 @@
 #include "sandbox-runtime.h"
 #include "src/workerd/server/helloworld_worker.embed.h"
 #include "src/workerd/server/streams_util.embed.h"
+#include "src/workerd/server/tests/filesystem_evidence.embed.h"
 #include "src/workerd/server/web_streams_worker.embed.h"
 #include "src/workerd/server/wintertc_smoke.embed.h"
 
@@ -17,6 +18,8 @@
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
 #include <kj/encoding.h>
+
+#include <cstdio>
 
 namespace workerd::server::sandbox_executor {
 namespace {
@@ -36,6 +39,8 @@ constexpr size_t MAX_MODULES = 32;
 constexpr size_t MAX_MODULE_NAME_BYTES = 256;
 constexpr size_t MAX_MODULE_SOURCE_BYTES = 32 * 1024;
 constexpr size_t MAX_MODULE_SOURCES_BYTES = 48 * 1024;
+constexpr size_t MAX_STORAGE_MOUNTS = 8;
+constexpr size_t MAX_STORAGE_NAME_BYTES = 64;
 constexpr size_t MAX_HOST_CALL_CHUNK_BYTES = 60 * 1024;
 constexpr uint64_t MAX_HOST_OPERATION_ID = 9'007'199'254'740'991;
 constexpr kj::Duration FETCH_POLL_INTERVAL = 1 * kj::MILLISECONDS;
@@ -97,8 +102,33 @@ bool validModuleName(kj::StringPtr value) {
   return true;
 }
 
+bool validStorageName(kj::StringPtr value) {
+  if (value.size() == 0 || value.size() > MAX_STORAGE_NAME_BYTES) return false;
+  for (char c: value) {
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+  }
+  return value != "."_kj && value != ".."_kj;
+}
+
+StorageMode parseStorageMode(kj::StringPtr value) {
+  if (value == "ro"_kj) return StorageMode::READ_ONLY;
+  if (value == "rw"_kj) return StorageMode::READ_WRITE;
+  KJ_FAIL_REQUIRE("unsupported storage mode");
+}
+
+kj::StringPtr storageModeName(StorageMode mode) {
+  switch (mode) {
+    case StorageMode::READ_ONLY:
+      return "ro"_kj;
+    case StorageMode::READ_WRITE:
+      return "rw"_kj;
+  }
+  KJ_UNREACHABLE;
+}
+
 ModuleType parseModuleType(kj::StringPtr value) {
   if (value == "esModule"_kj) return ModuleType::ES_MODULE;
+  if (value == "commonJsModule"_kj) return ModuleType::COMMON_JS_MODULE;
   if (value == "text"_kj) return ModuleType::TEXT;
   if (value == "json"_kj) return ModuleType::JSON;
   KJ_FAIL_REQUIRE("unsupported module type");
@@ -108,6 +138,8 @@ kj::StringPtr moduleTypeName(ModuleType type) {
   switch (type) {
     case ModuleType::ES_MODULE:
       return "esModule"_kj;
+    case ModuleType::COMMON_JS_MODULE:
+      return "commonJsModule"_kj;
     case ModuleType::TEXT:
       return "text"_kj;
     case ModuleType::JSON:
@@ -264,7 +296,14 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
   codec.decodeRaw(input, root);
   KJ_REQUIRE(root.isObject(), "init envelope must be an object");
   auto fields = root.getObject();
-  KJ_REQUIRE(fields.size() == 6, "init envelope must contain exactly six fields");
+  KJ_REQUIRE(fields.size() == 6 || fields.size() == 7, "invalid init field count");
+  KJ_REQUIRE(fields[0].getName() == "protocol_version"_kj && fields[0].getValue().isNumber(),
+      "invalid init protocol version");
+  auto rawProtocolVersion = fields[0].getValue().getNumber();
+  KJ_REQUIRE(rawProtocolVersion == 1 || rawProtocolVersion == 2, "invalid init protocol version");
+  auto protocolVersion = static_cast<uint>(rawProtocolVersion);
+  KJ_REQUIRE(
+      fields.size() == (protocolVersion == 1 ? 6 : 7), "init fields do not match protocol version");
   static constexpr kj::StringPtr FIELD_NAMES[] = {
     "protocol_version"_kj,
     "worker_version"_kj,
@@ -272,13 +311,12 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
     "compatibility_flags"_kj,
     "main_module"_kj,
     "modules"_kj,
+    "storage"_kj,
   };
   for (auto i: kj::indices(fields)) {
     KJ_REQUIRE(fields[i].getName() == FIELD_NAMES[i], "noncanonical init field order");
   }
 
-  KJ_REQUIRE(fields[0].getValue().isNumber() && fields[0].getValue().getNumber() == 1,
-      "invalid init protocol version");
   KJ_REQUIRE(fields[1].getValue().isString(), "invalid Worker version");
   auto workerVersion = kj::str(fields[1].getValue().getString());
   KJ_REQUIRE(validIdentifier(workerVersion, MAX_WORKER_VERSION_BYTES), "invalid Worker version");
@@ -354,12 +392,43 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
     moduleBuilder.add(Module{kj::mv(name), type, kj::mv(source)});
   }
 
+  kj::Array<StorageMount> storageMounts;
+  if (protocolVersion == 2) {
+    KJ_REQUIRE(fields[6].getValue().isArray(), "invalid storage manifest");
+    auto mountValues = fields[6].getValue().getArray();
+    KJ_REQUIRE(mountValues.size() <= MAX_STORAGE_MOUNTS, "too many storage mounts");
+    auto mountBuilder = kj::heapArrayBuilder<StorageMount>(mountValues.size());
+    kj::Maybe<kj::StringPtr> previousName;
+    for (auto value: mountValues) {
+      KJ_REQUIRE(value.isObject(), "invalid storage mount");
+      auto mountFields = value.getObject();
+      KJ_REQUIRE(mountFields.size() == 2 && mountFields[0].getName() == "name"_kj &&
+              mountFields[1].getName() == "mode"_kj && mountFields[0].getValue().isString() &&
+              mountFields[1].getValue().isString(),
+          "invalid storage mount");
+      auto name = kj::str(mountFields[0].getValue().getString());
+      KJ_REQUIRE(validStorageName(name), "invalid storage name");
+      KJ_IF_SOME(previous, previousName) {
+        KJ_REQUIRE(
+            lexicographicallyBefore(previous, name), "storage names must be sorted and unique");
+      }
+      previousName = name;
+      mountBuilder.add(StorageMount{
+        .name = kj::mv(name),
+        .mode = parseStorageMode(mountFields[1].getValue().getString()),
+      });
+    }
+    storageMounts = mountBuilder.finish();
+  }
+
   return WorkerBundle{
-    kj::mv(workerVersion),
-    kj::mv(compatibilityDate),
-    flagBuilder.finish(),
-    kj::mv(mainModule),
-    moduleBuilder.finish(),
+    .workerVersion = kj::mv(workerVersion),
+    .compatibilityDate = kj::mv(compatibilityDate),
+    .compatibilityFlags = flagBuilder.finish(),
+    .mainModule = kj::mv(mainModule),
+    .modules = moduleBuilder.finish(),
+    .protocolVersion = protocolVersion,
+    .storageMounts = kj::mv(storageMounts),
   };
 }
 
@@ -1405,7 +1474,9 @@ class StreamingV2FetchBroker final: public FetchBroker {
 
 kj::String serializeWorkerBundle(const WorkerBundle& bundle) {
   kj::Vector<char> output;
-  output.addAll("{\"protocol_version\":1,\"worker_version\":"_kj);
+  output.addAll("{\"protocol_version\":"_kj);
+  output.addAll(kj::str(bundle.protocolVersion));
+  output.addAll(",\"worker_version\":"_kj);
   appendJsonString(output, bundle.workerVersion);
   output.addAll(",\"compatibility_date\":"_kj);
   appendJsonString(output, bundle.compatibilityDate);
@@ -1431,7 +1502,25 @@ kj::String serializeWorkerBundle(const WorkerBundle& bundle) {
     appendJsonString(output, module.source);
     output.add('}');
   }
-  output.addAll("]}"_kj);
+  output.add(']');
+  if (bundle.protocolVersion == 2) {
+    output.addAll(",\"storage\":["_kj);
+    first = true;
+    for (const auto& mount: bundle.storageMounts) {
+      if (!first) output.add(',');
+      first = false;
+      output.addAll("{\"name\":"_kj);
+      appendJsonString(output, mount.name);
+      output.addAll(",\"mode\":"_kj);
+      appendJsonString(output, storageModeName(mount.mode));
+      output.add('}');
+    }
+    output.add(']');
+  } else {
+    KJ_REQUIRE(bundle.protocolVersion == 1 && bundle.storageMounts.size() == 0,
+        "protocol v1 cannot contain storage mounts");
+  }
+  output.add('}');
   KJ_REQUIRE(output.size() <= MAX_ENVELOPE_BYTES, "init envelope exceeds limit");
   output.add('\0');
   return kj::String(output.releaseAsArray());
@@ -1929,7 +2018,7 @@ class ControlledSelfTestTimer final: public TimerChannel {
   kj::Vector<kj::Own<kj::PromiseFulfiller<void>>> fulfillers;
 };
 
-int selfTest() {
+int selfTest(bool filesystemEvidence) {
   auto expectRejected = [](kj::ArrayPtr<const char> input) {
     Executor executor;
     try {
@@ -1939,6 +2028,29 @@ int selfTest() {
     }
     KJ_FAIL_REQUIRE("invalid init envelope was accepted");
   };
+
+  auto expectCanonicalBundle = [](kj::StringPtr input) {
+    auto bundle = parseWorkerBundle(input);
+    KJ_REQUIRE(
+        serializeWorkerBundle(bundle) == input, "canonical init envelope did not round-trip");
+  };
+
+  expectCanonicalBundle(
+      R"JSON({"protocol_version":1,"worker_version":"v1","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}]})JSON"_kj);
+  expectCanonicalBundle(
+      R"JSON({"protocol_version":2,"worker_version":"v2","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"readonly","mode":"ro"},{"name":"scratch","mode":"rw"}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":1,"worker_version":"v1-storage","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":2,"worker_version":"unsorted-storage","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"scratch","mode":"rw"},{"name":"readonly","mode":"ro"}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":2,"worker_version":"duplicate-storage","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"scratch","mode":"rw"},{"name":"scratch","mode":"ro"}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":2,"worker_version":"storage-host-path","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"scratch","mode":"rw","host_path":"/secret"}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":2,"worker_version":"storage-limit","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"scratch","mode":"rw","max_write_bytes":16}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":2,"worker_version":"storage-mode","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"scratch","mode":"read-write"}]})JSON"_kj);
 
   {
     auto previousCapacity = callBufferCapacity;
@@ -2014,6 +2126,8 @@ int selfTest() {
       R"JSON({"protocol_version":1,"worker_version":"unknown-field","compatibility_date":"2023-02-28","compatibility_flags":[],"main_module":"worker.js","unknown":true,"modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}]})JSON"_kj);
   expectRejected(
       R"JSON({"protocol_version":1,"worker_version":"duplicate-module","compatibility_date":"2023-02-28","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"},{"name":"worker.js","type":"esModule","source":"export default {}"}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":1,"worker_version":"noncanonical-commonjs-type","compatibility_date":"2023-02-28","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"},{"name":"dependency.js","type":"commonjsModule","source":"module.exports = true;"}]})JSON"_kj);
   auto oversized = kj::heapArray<char>(MAX_ENVELOPE_BYTES + 1);
   memset(oversized.begin(), 'x', oversized.size());
   expectRejected(oversized.asPtr());
@@ -2451,11 +2565,7 @@ int selfTest() {
         "protocol writer short-write handling failed");
   }
 
-  auto run = [](WorkerBundle bundle, kj::StringPtr request,
-                 kj::FunctionParam<void(kj::StringPtr)> check) {
-    Executor executor;
-    auto init = serializeWorkerBundle(bundle);
-    executor.initialize(init);
+  auto fetchBody = [](Executor& executor, kj::StringPtr request) {
     auto serializedResponse = executor.fetch(request);
     KJ_REQUIRE(serializedResponse.size() >= 2 &&
             serializedResponse[serializedResponse.size() - 2] == '}' &&
@@ -2472,11 +2582,30 @@ int selfTest() {
         KJ_REQUIRE(field.getValue().isString(), "invalid self-test response body");
         auto decoded = kj::decodeBase64(field.getValue().getString());
         KJ_REQUIRE(!decoded.hadErrors, "invalid self-test response encoding");
-        check(copyBytes(decoded));
-        return;
+        return copyBytes(decoded);
       }
     }
     KJ_FAIL_REQUIRE("self-test response is missing body");
+  };
+
+  auto run = [&fetchBody](WorkerBundle bundle, kj::StringPtr request,
+                 kj::FunctionParam<void(kj::StringPtr)> check) {
+    Executor executor;
+    auto init = serializeWorkerBundle(bundle);
+    executor.initialize(init);
+    check(fetchBody(executor, request));
+  };
+
+  auto expectInitFailure = [](WorkerBundle bundle, kj::StringPtr expectedDescription) {
+    Executor executor;
+    try {
+      executor.initialize(serializeWorkerBundle(bundle));
+    } catch (const kj::Exception& exception) {
+      KJ_REQUIRE(exception.getDescription().contains(expectedDescription),
+          "bundle initialization failed for the wrong reason", exception);
+      return;
+    }
+    KJ_FAIL_REQUIRE("invalid bundle graph initialized successfully");
   };
 
   auto noFlags = []() { return kj::heapArray<kj::String>(0); };
@@ -2485,6 +2614,28 @@ int selfTest() {
     modules.add(Module{kj::str(name), ModuleType::ES_MODULE, kj::str(source)});
     return modules.finish();
   };
+
+  {
+    auto flags = kj::heapArrayBuilder<kj::String>(1);
+    flags.add(kj::str("enable_web_file_system"));
+    run(WorkerBundle{kj::str("web-filesystem-v1"), kj::str("2025-12-31"), flags.finish(),
+          kj::str("worker.js"),
+          oneModule("worker.js"_kj,
+              "export default { fetch() { return new Response(String(navigator.storage instanceof "
+              "StorageManager)); } };"_kj)},
+        R"JSON({"protocol_version":1,"request_id":"web-filesystem","method":"GET","url":"https://example.test/","headers":[],"body_base64":""})JSON"_kj,
+        [](kj::StringPtr body) {
+      KJ_REQUIRE(body == "true"_kj, "allowlisted web filesystem flag self-test failed");
+    });
+  }
+  {
+    auto flags = kj::heapArrayBuilder<kj::String>(1);
+    flags.add(kj::str("experimental"));
+    expectInitFailure(
+        WorkerBundle{kj::str("experimental-denied-v1"), kj::str("2025-12-31"), flags.finish(),
+          kj::str("worker.js"), oneModule("worker.js"_kj, "export default {}"_kj)},
+        "flag experimental"_kj);
+  }
 
   run(WorkerBundle{kj::str("helloworld-v1"), kj::str("2023-02-28"), noFlags(), kj::str("worker.js"),
         oneModule("worker.js"_kj, HELLOWORLD_WORKER)},
@@ -2507,6 +2658,72 @@ int selfTest() {
     }
   });
 
+  auto commonJsFlags = kj::heapArrayBuilder<kj::String>(2);
+  commonJsFlags.add(kj::str("enable_nodejs_fs_module"));
+  commonJsFlags.add(kj::str("nodejs_compat"));
+  auto commonJsModules = kj::heapArrayBuilder<Module>(7);
+  commonJsModules.add(Module{kj::str("worker.js"), ModuleType::ES_MODULE, kj::str(R"JS(
+import { createRequire } from 'node:module';
+const require = createRequire('file:///bundle/');
+export default {
+  fetch() {
+    const graceful = require('./node_modules/graceful-fs/graceful-fs.js');
+    const yazl = require('./node_modules/yazl/index.js');
+    const satisfies = require('./node_modules/semver/functions/satisfies.js');
+    return Response.json({
+      graceful: graceful.packageName,
+      yazl: yazl.packageName,
+      crc32: yazl.crc32,
+      range: satisfies.range,
+      semver: satisfies('7.7.3', '^7.0.0'),
+    });
+  },
+};
+)JS")});
+  commonJsModules.add(Module{kj::str("node_modules/buffer-crc32/dist/index.cjs"),
+    ModuleType::COMMON_JS_MODULE, kj::str("module.exports = { value: 32 };"_kj)});
+  commonJsModules.add(Module{kj::str("node_modules/buffer-crc32/package.json"), ModuleType::TEXT,
+    kj::str(R"JSON({"main":"dist/index.cjs"})JSON"_kj)});
+  commonJsModules.add(Module{kj::str("node_modules/graceful-fs/graceful-fs.js"),
+    ModuleType::COMMON_JS_MODULE, kj::str("module.exports = { packageName: 'graceful-fs' };"_kj)});
+  commonJsModules.add(Module{kj::str("node_modules/semver/classes/range.js"),
+    ModuleType::COMMON_JS_MODULE, kj::str("module.exports = { marker: 'range' };"_kj)});
+  commonJsModules.add(Module{kj::str("node_modules/semver/functions/satisfies.js"),
+    ModuleType::COMMON_JS_MODULE, kj::str(R"JS(
+const Range = require('../classes/range');
+const satisfies = (version, range) => version === '7.7.3' && range === '^7.0.0';
+satisfies.range = Range.marker;
+module.exports = satisfies;
+)JS")});
+  commonJsModules.add(
+      Module{kj::str("node_modules/yazl/index.js"), ModuleType::COMMON_JS_MODULE, kj::str(R"JS(
+const crc32 = require('buffer-crc32');
+module.exports = { packageName: 'yazl', crc32: crc32.value };
+)JS")});
+  run(WorkerBundle{kj::str("commonjs-packages-v1"), kj::str("2025-12-31"), commonJsFlags.finish(),
+        kj::str("worker.js"), commonJsModules.finish()},
+      R"JSON({"protocol_version":1,"request_id":"commonjs","method":"GET","url":"https://example.test/","headers":[],"body_base64":""})JSON"_kj,
+      [](kj::StringPtr body) {
+    KJ_REQUIRE(body ==
+            R"JSON({"graceful":"graceful-fs","yazl":"yazl","crc32":32,"range":"range","semver":true})JSON"_kj,
+        "CommonJS package module self-test failed", body);
+  });
+
+  for (auto invalidRequire: {kj::StringPtr("../../../host-secret"), kj::StringPtr("./missing")}) {
+    auto flags = kj::heapArrayBuilder<kj::String>(2);
+    flags.add(kj::str("enable_nodejs_fs_module"));
+    flags.add(kj::str("nodejs_compat"));
+    auto modules = kj::heapArrayBuilder<Module>(2);
+    modules.add(Module{kj::str("worker.js"), ModuleType::ES_MODULE,
+      kj::str("export default { fetch() { return new Response('unreachable'); } };"_kj)});
+    modules.add(Module{kj::str("node_modules/example/index.js"), ModuleType::COMMON_JS_MODULE,
+      kj::str("module.exports = require('", invalidRequire, "');")});
+    expectInitFailure(WorkerBundle{kj::str("commonjs-invalid-graph-v1"), kj::str("2025-12-31"),
+                        flags.finish(), kj::str("worker.js"), modules.finish()},
+        invalidRequire.startsWith("..") ? "CommonJS require escapes the bundle"_kj
+                                        : "unregistered CommonJS module"_kj);
+  }
+
   run(WorkerBundle{kj::str("wintertc-smoke-v1"), kj::str("2025-12-31"), noFlags(),
         kj::str("worker.js"), oneModule("worker.js"_kj, WINTERTC_SMOKE)},
       R"JSON({"protocol_version":1,"request_id":"wintertc","method":"POST","url":"https://example.test/wintertc-smoke","headers":[{"name":"x-smoke","value":"yes"}],"body_base64":""})JSON"_kj,
@@ -2527,9 +2744,75 @@ int selfTest() {
         "executor error tunneling self-test failed", body);
   });
 
+  if (filesystemEvidence) {
+    auto flags = kj::heapArrayBuilder<kj::String>(3);
+    flags.add(kj::str("enable_nodejs_fs_module"));
+    flags.add(kj::str("enable_web_file_system"));
+    flags.add(kj::str("nodejs_compat"));
+    auto mounts = kj::heapArrayBuilder<StorageMount>(2);
+    mounts.add(StorageMount{kj::str("readonly"), StorageMode::READ_ONLY});
+    mounts.add(StorageMount{kj::str("scratch"), StorageMode::READ_WRITE});
+    WorkerBundle bundle{
+      .workerVersion = kj::str("filesystem-evidence-v1"),
+      .compatibilityDate = kj::str("2025-12-31"),
+      .compatibilityFlags = flags.finish(),
+      .mainModule = kj::str("worker.js"),
+      .modules = oneModule("worker.js"_kj, FILESYSTEM_EVIDENCE),
+      .protocolVersion = 2,
+      .storageMounts = mounts.finish(),
+    };
+
+    Executor executor;
+    executor.initialize(serializeWorkerBundle(bundle));
+    auto vfsRequest =
+        R"JSON({"protocol_version":1,"request_id":"vfs","method":"GET","url":"https://example.test/evidence/workerd-vfs","headers":[],"body_base64":""})JSON"_kj;
+    auto first = fetchBody(executor, vfsRequest);
+    auto second = fetchBody(executor, vfsRequest);
+    KJ_REQUIRE(first.contains(R"JSON("immutable":true)JSON"_kj) &&
+            first.contains(R"JSON("freshRequest":true)JSON"_kj) &&
+            second.contains(R"JSON("freshRequest":true)JSON"_kj) &&
+            first.contains(R"JSON("nullDiscardThenEof":true)JSON"_kj) &&
+            first.contains(R"JSON("zeroOnly":true)JSON"_kj),
+        "pinned VFS filesystem evidence failed", first, second);
+
+    auto hostfs = fetchBody(executor,
+        R"JSON({"protocol_version":1,"request_id":"hostfs","method":"GET","url":"https://example.test/evidence/hostfs","headers":[],"body_base64":""})JSON"_kj);
+    KJ_REQUIRE(hostfs.contains(R"JSON("allowedRead":{"ok":true)JSON"_kj) &&
+            hostfs.contains(R"JSON("readOnlyWrite":{"ok":false,"code":"EPERM")JSON"_kj) &&
+            hostfs.contains(R"JSON("boundedWrite":{"ok":true,"value":"bounded-write"})JSON"_kj) &&
+            hostfs.contains(R"JSON("traversal":{"ok":false,"code":"ENOENT")JSON"_kj) &&
+            hostfs.contains(R"JSON("unlisted":{"ok":false,"code":"ENOENT")JSON"_kj),
+        "host filesystem evidence failed", hostfs);
+  }
+
   return writeProtocolMessage(protocolOutputFd,
-      R"JSON({"protocol_version":1,"self_test":"passed","bundles":["samples/helloworld_esm","samples/web-streams","wintertc-api-smoke"],"wintertc_label":"smoke-not-conformance"})JSON"
-      "\n"_kj);
+      kj::str(
+          R"JSON({"protocol_version":1,"self_test":"passed","bundles":["samples/helloworld_esm","samples/web-streams","wintertc-api-smoke"],"wintertc_label":"smoke-not-conformance","filesystem_evidence":)JSON",
+          filesystemEvidence ? "true"_kj : "false"_kj, "}\n"_kj));
+}
+
+int selfTestBundle(kj::StringPtr path) {
+  auto rawFile = fopen(path.cStr(), "rb");
+  KJ_REQUIRE(rawFile != nullptr, "failed to open bundle", path);
+  KJ_DEFER(fclose(rawFile));
+  KJ_REQUIRE(fseek(rawFile, 0, SEEK_END) == 0, "failed to seek bundle", path);
+  auto size = ftell(rawFile);
+  KJ_REQUIRE(size >= 0 && size <= MAX_ENVELOPE_BYTES, "bundle has invalid size", path, size);
+  KJ_REQUIRE(fseek(rawFile, 0, SEEK_SET) == 0, "failed to rewind bundle", path);
+  auto file = kj::heapArray<char>(size);
+  KJ_REQUIRE(
+      fread(file.begin(), 1, file.size(), rawFile) == file.size(), "failed to read bundle", path);
+  auto input = file.asPtr();
+  if (input.endsWith("\n"_kj)) {
+    input = input.first(input.size() - 1);
+    if (input.endsWith("\r"_kj)) {
+      input = input.first(input.size() - 1);
+    }
+  }
+  Executor executor;
+  executor.initialize(input);
+  return writeProtocolMessage(
+      STDOUT_FILENO, "{\"protocol_version\":1,\"bundle_initialize\":\"passed\"}\n"_kj);
 }
 
 }  // namespace
@@ -2538,7 +2821,13 @@ int selfTest() {
 int main(int argc, char** argv) {
   using namespace workerd::server::sandbox_executor;
   if (argc == 2 && kj::StringPtr(argv[1]) == "--self-test"_kj) {
-    _exit(selfTest());
+    _exit(selfTest(false));
+  }
+  if (argc == 2 && kj::StringPtr(argv[1]) == "--self-test-filesystem"_kj) {
+    _exit(selfTest(true));
+  }
+  if (argc == 3 && kj::StringPtr(argv[1]) == "--self-test-bundle"_kj) {
+    _exit(selfTestBundle(argv[2]));
   }
   if (argc != 1 || isolateProtocolOutput() != 0 || initializeDriver() != 0) return 1;
   runDriver(dispatch);
