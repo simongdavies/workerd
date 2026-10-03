@@ -2361,6 +2361,10 @@ export function newReadableStreamFromStreamReadable(
   const highWaterMark = streamReadable.readableHighWaterMark;
 
   const evaluateStrategyOrFallback = (strategy) => {
+    if (createTypeBytes) {
+      return { highWaterMark: strategy?.highWaterMark ?? highWaterMark };
+    }
+
     // If there is a strategy available, use it
     if (strategy) return strategy;
 
