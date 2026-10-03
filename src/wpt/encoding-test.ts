@@ -25,10 +25,7 @@ export default {
   'api-invalid-label.any.js': {},
   'api-replacement-encodings.any.js': {},
   'api-surrogates-utf8.any.js': {},
-  'encodeInto.any.js': {
-    comment: 'Requires MessageChannel.postMessage transfer list support',
-    expectedFailures: ['encodeInto() and a detached output buffer'],
-  },
+  'encodeInto.any.js': {},
   'idlharness.any.js': {
     comment:
       'Workers expose globals differently than browsers - readable/writable attribute tests still fail',
@@ -109,13 +106,7 @@ export default {
   'streams/decode-incomplete-input.any.js': {},
   'streams/decode-non-utf8.any.js': {},
   'streams/decode-split-character.any.js': {},
-  'streams/decode-utf8.any.js': {
-    comment: 'Enable once MessageChannel is implemented',
-    expectedFailures: [
-      'decoding a transferred Uint8Array chunk should give no output',
-      'decoding a transferred ArrayBuffer chunk should give no output',
-    ],
-  },
+  'streams/decode-utf8.any.js': {},
   'streams/encode-bad-chunks.any.js': {},
   'streams/encode-utf8.any.js': {},
   'streams/invalid-realm.window.js': {
