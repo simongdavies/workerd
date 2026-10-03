@@ -1,0 +1,1 @@
+{"protocol_version":1,"request_id":"req-17","binding":"edge-cache","operation":"cache.put","target":"https://example.test/data","value_base64":"aGVsbG8=","attributes":[{"name":"status","value":"200"},{"name":"content-type","value":"text/plain"}],"limit":null,"cursor":null,"expiration_unix_ms":1735689600000}

@@ -1,0 +1,11 @@
+{
+  "protocol": "workerd.logical-service",
+  "protocol_version": 1,
+  "host_call": "WorkerdLogicalServiceV1Invoke",
+  "request": "request.json",
+  "response": "response.json",
+  "audit": "audit.json",
+  "identity": "host-supplied workload_id, snapshot_id, and attempt; never guest-controlled",
+  "budget": "reserve before adapter dispatch; settle exactly once after dispatch or adapter error",
+  "determinism": "canonical field order; no wall clock, host path, credential, or backing-store fields"
+}

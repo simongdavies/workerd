@@ -1,0 +1,53 @@
+load("//:build/kj_test.bzl", "kj_test")
+load("//:build/wd_cc_embed.bzl", "wd_cc_embed")
+load("//:build/wd_cc_library.bzl", "wd_cc_library")
+
+wd_cc_library(
+    name = "logical-service-broker",
+    srcs = [
+        "logical-service-broker.c++",
+        "logical-service-dispatcher.c++",
+    ],
+    hdrs = [
+        "logical-service-broker.h",
+        "logical-service-dispatcher.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@capnp-cpp//src/capnp",
+        "@capnp-cpp//src/capnp/compat:json",
+        "@capnp-cpp//src/kj",
+    ],
+)
+
+wd_cc_embed(
+    name = "request-fixture",
+    src = "fixtures/request.json",
+    base_name = "request",
+    is_text = True,
+)
+
+wd_cc_embed(
+    name = "response-fixture",
+    src = "fixtures/response.json",
+    base_name = "response",
+    is_text = True,
+)
+
+wd_cc_embed(
+    name = "audit-fixture",
+    src = "fixtures/audit.json",
+    base_name = "audit",
+    is_text = True,
+)
+
+kj_test(
+    src = "logical-service-broker-test.c++",
+    deps = [
+        ":logical-service-broker",
+        ":audit-fixture",
+        ":request-fixture",
+        ":response-fixture",
+        "@capnp-cpp//src/kj",
+    ],
+)
