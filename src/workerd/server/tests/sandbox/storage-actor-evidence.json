@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "shared_identity": {
+    "fields": [
+      "tenant_id",
+      "namespace_id",
+      "resource_id",
+      "worker_version",
+      "snapshot_id"
+    ],
+    "forbidden_fields": [
+      "path",
+      "mount",
+      "credential",
+      "connection_string"
+    ]
+  },
+  "sqlite_broker": {
+    "abi_version": 1,
+    "host_call": "WorkerdSqliteV1Transaction",
+    "transaction_outcomes": [
+      "committed",
+      "rolled_back"
+    ],
+    "audit_outcomes": [
+      "committed",
+      "rolled_back",
+      "denied",
+      "failed"
+    ],
+    "transaction_modes": [
+      "read_only",
+      "read_write"
+    ],
+    "policy_denials": [
+      "attach",
+      "detach",
+      "vacuum",
+      "pragma",
+      "load_extension",
+      "transaction_control"
+    ],
+    "quota_dimensions": [
+      "statements",
+      "sql_bytes",
+      "parameters",
+      "parameter_bytes",
+      "rows",
+      "rows_read",
+      "result_bytes",
+      "rows_written"
+    ],
+    "persistence_owner": "host"
+  },
+  "actor_router": {
+    "abi_version": 1,
+    "host_call": "WorkerdActorV1Route",
+    "route_generation": "monotonic-per-logical-actor",
+    "lifecycle": [
+      "absent",
+      "loading",
+      "active",
+      "persisting",
+      "evicted"
+    ],
+    "bounds": [
+      "active_actors",
+      "event_bytes",
+      "response_bytes",
+      "state_bytes_per_actor",
+      "persisted_actors",
+      "persisted_state_bytes"
+    ],
+    "request_vm_parity": false
+  },
+  "scenarios": [
+    "opaque-identity-rejects-host-path",
+    "snapshot-scoped-routing",
+    "transaction-policy-before-persistence",
+    "transaction-input-output-quotas",
+    "sqlite-host-failure-audit",
+    "actor-state-reuse",
+    "actor-capacity-eviction",
+    "actor-persistence-reload",
+    "actor-generation-upgrade",
+    "actor-stale-generation-rejection",
+    "actor-persistence-failure-lifecycle",
+    "cross-runtime-canonical-fixtures"
+  ]
+}

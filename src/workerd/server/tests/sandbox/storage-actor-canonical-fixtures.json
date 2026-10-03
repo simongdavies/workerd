@@ -1,0 +1,202 @@
+{
+  "schema_version": 1,
+  "identity": {
+    "tenant_id": "tenant-1",
+    "namespace_id": "namespace-1",
+    "resource_id": "resource-1",
+    "worker_version": "worker-v1",
+    "snapshot_id": "snapshot-1",
+    "canonical_key": "tenant-1\nnamespace-1\nresource-1\nworker-v1\nsnapshot-1"
+  },
+  "sqlite": {
+    "host_call": "WorkerdSqliteV1Transaction",
+    "committed": {
+      "request": {
+        "protocol_version": 1,
+        "request_id": "sqlite-commit-1",
+        "mode": "read_write",
+        "statements": [
+          {
+            "sql": "INSERT INTO records(id, value) VALUES (?, ?)",
+            "parameters": [
+              {
+                "type": "integer",
+                "value": 1
+              },
+              {
+                "type": "text",
+                "value": "alpha"
+              }
+            ]
+          },
+          {
+            "sql": "SELECT value FROM records WHERE id = ?",
+            "parameters": [
+              {
+                "type": "integer",
+                "value": 1
+              }
+            ]
+          }
+        ]
+      },
+      "response": {
+        "protocol_version": 1,
+        "request_id": "sqlite-commit-1",
+        "outcome": "committed",
+        "logical_commit": 7,
+        "failed_statement": null,
+        "error_code": "",
+        "result_count": 2
+      },
+      "audit": {
+        "outcome": "committed",
+        "statement_count": 2,
+        "logical_commit": 7,
+        "failed_statement": null
+      }
+    },
+    "rolled_back": {
+      "request_id": "sqlite-rollback-1",
+      "outcome": "rolled_back",
+      "logical_commit": null,
+      "failed_statement": 1,
+      "error_code": "constraint",
+      "result_count": 0,
+      "audit_outcome": "rolled_back"
+    },
+    "host_failure": {
+      "request_id": "sqlite-host-failure-1",
+      "audit_outcome": "failed",
+      "detail": "host persistence failed"
+    },
+    "forbidden": [
+      {
+        "id": "attach-host-path",
+        "sql": "ATTACH DATABASE '/host/db' AS escaped",
+        "audit_outcome": "denied"
+      },
+      {
+        "id": "pragma",
+        "sql": "PRAGMA database_list",
+        "audit_outcome": "denied"
+      },
+      {
+        "id": "transaction-control",
+        "sql": "BEGIN IMMEDIATE",
+        "audit_outcome": "denied"
+      },
+      {
+        "id": "multiple-statements",
+        "sql": "SELECT 1; SELECT 2",
+        "audit_outcome": "denied"
+      },
+      {
+        "id": "comment-obfuscation",
+        "sql": "SELECT 1 /* host policy bypass */",
+        "audit_outcome": "denied"
+      },
+      {
+        "id": "unparsed-common-table-expression",
+        "sql": "WITH hidden AS (SELECT 1) SELECT * FROM hidden",
+        "audit_outcome": "denied"
+      }
+    ]
+  },
+  "actors": {
+    "host_call": "WorkerdActorV1Route",
+    "routes": [
+      {
+        "request_id": "actor-route-1",
+        "route_generation": 1,
+        "input": 2,
+        "response": 2,
+        "persisted_version": 1
+      },
+      {
+        "request_id": "actor-route-2",
+        "route_generation": 2,
+        "input": 3,
+        "response": 5,
+        "persisted_version": 2
+      }
+    ],
+    "lifecycle": [
+      {
+        "from": "absent",
+        "to": "loading",
+        "route_generation": 1,
+        "persisted_version": 0
+      },
+      {
+        "from": "loading",
+        "to": "active",
+        "route_generation": 1,
+        "persisted_version": 0
+      },
+      {
+        "from": "active",
+        "to": "persisting",
+        "route_generation": 1,
+        "persisted_version": 0
+      },
+      {
+        "from": "persisting",
+        "to": "active",
+        "route_generation": 1,
+        "persisted_version": 1
+      },
+      {
+        "from": "active",
+        "to": "evicted",
+        "route_generation": 1,
+        "persisted_version": 1,
+        "reason": "generation"
+      },
+      {
+        "from": "absent",
+        "to": "loading",
+        "route_generation": 2,
+        "persisted_version": 0
+      },
+      {
+        "from": "loading",
+        "to": "active",
+        "route_generation": 2,
+        "persisted_version": 1
+      },
+      {
+        "from": "active",
+        "to": "persisting",
+        "route_generation": 2,
+        "persisted_version": 1
+      },
+      {
+        "from": "persisting",
+        "to": "active",
+        "route_generation": 2,
+        "persisted_version": 2
+      }
+    ],
+    "stale_route": {
+      "persisted_generation": 2,
+      "rejected_generation": 1,
+      "outcome": "denied"
+    },
+    "persistence_failure": {
+      "route_generation": 1,
+      "persisted_version": 0,
+      "transitions": [
+        [
+          "active",
+          "persisting"
+        ],
+        [
+          "persisting",
+          "active"
+        ]
+      ],
+      "reason": "persistence-failed"
+    }
+  }
+}

@@ -490,6 +490,24 @@ wd_cc_library(
     ],
 )
 
+wd_cc_library(
+    name = "sandbox-state",
+    srcs = [
+        "sandbox-executor/sandbox-actors.c++",
+        "sandbox-executor/sandbox-state.c++",
+        "sandbox-executor/sandbox-storage.c++",
+    ],
+    hdrs = [
+        "sandbox-executor/sandbox-actors.h",
+        "sandbox-executor/sandbox-state.h",
+        "sandbox-executor/sandbox-storage.h",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "@capnp-cpp//src/kj",
+    ],
+)
+
 wd_capnp_library(
     src = "workerd.capnp",
     # Limit visibility to avoid accidental usage – there should be no need to use this outside of
@@ -569,6 +587,14 @@ kj_test(
         "@capnp-cpp//src/capnp/compat:json",
         "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj/compat:kj-http",
+    ],
+)
+
+kj_test(
+    src = "sandbox-executor/sandbox-state-test.c++",
+    deps = [
+        ":sandbox-state",
+        "@capnp-cpp//src/kj",
     ],
 )
 
