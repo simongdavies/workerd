@@ -106,6 +106,12 @@ export const openCloseTest = {
       unlinkSync('/tmp/test.txt');
     }
 
+    writeFileSync('/tmp/test.txt', 'truncate me');
+    const truncatedFd = openSync('/tmp/test.txt', 'w');
+    strictEqual(fstatSync(truncatedFd).size, 0);
+    closeSync(truncatedFd);
+    unlinkSync('/tmp/test.txt');
+
     ok(!existsSync('/tmp/test.txt'));
     const fd = openSync('/tmp/test.txt', 'w+');
     ok(existsSync('/tmp/test.txt'));
@@ -1453,6 +1459,39 @@ export const readBadEncoding = {
       () => mkdtemp('/tmp/test.txt', 'bad-encoding', mustNotCall),
       kErrorObj
     );
+  },
+};
+
+export const readFileFlagsTest = {
+  async test() {
+    const path = '/tmp/read-file-flags.txt';
+    writeFileSync(path, 'Hello');
+
+    throws(() => readFileSync(path, { flag: 'w' }), {
+      code: 'EBADF',
+    });
+    strictEqual(readFileSync(path, 'utf8'), '');
+
+    writeFileSync(path, 'Hello');
+    throws(() => readFileSync(path, { flag: 'wx' }), {
+      code: 'EEXIST',
+    });
+
+    const fd = openSync(path, 'r');
+    strictEqual(readFileSync(fd, { flag: 'w' }).toString(), 'Hello');
+    closeSync(fd);
+
+    const invalidFlagFd = openSync(path, 'r');
+    strictEqual(
+      readFileSync(invalidFlagFd, { flag: 'not-a-real-flag' }).toString(),
+      'Hello'
+    );
+    closeSync(invalidFlagFd);
+
+    writeFileSync(path, 'Hello');
+    await rejects(promises.readFile(path, { flag: 'w' }), {
+      code: 'EBADF',
+    });
   },
 };
 

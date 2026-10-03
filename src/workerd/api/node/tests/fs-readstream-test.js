@@ -13,7 +13,7 @@ import {
   promises,
 } from 'node:fs';
 
-import { ok, strictEqual, throws } from 'node:assert';
+import { ok, rejects, strictEqual, throws } from 'node:assert';
 import { mock } from 'node:test';
 
 strictEqual(typeof ReadStream, 'function');
@@ -693,7 +693,7 @@ export const readStreamTest26 = {
     stream.on('end', () => resolve());
     await Promise.all([promise, closePromise]);
     strictEqual(data, 'hello world');
-    strictEqual(fh.fd, undefined);
+    strictEqual(fh.fd, -1);
   },
 };
 
@@ -824,6 +824,7 @@ export const readStreamTest32 = {
 
     handle.on('close', closeResolve);
     stream.on('close', () => handle.close());
+    if (handle.fd === -1) closeResolve();
 
     await Promise.all([errorPromise, closePromise]);
   },
@@ -914,7 +915,9 @@ export const fileHandleReadableWebStreamTest = {
       data += new TextDecoder().decode(chunk);
     }
     strictEqual(data, 'abcde'.repeat(1000));
-    strictEqual(fh.fd, undefined);
+    ok(fh.fd >= 0);
+    ok((await fh.stat()).isFile());
+    await fh.close();
 
     // Should throw if the stream is closed.
     throws(() => fh.readableWebStream(), {
@@ -922,9 +925,17 @@ export const fileHandleReadableWebStreamTest = {
     });
 
     const fh2 = await promises.open('/tmp/stream.txt', 'r');
-    const stream2 = fh2.readableWebStream({ autoClose: false });
-    await fh2.close();
-    const res = await stream2.getReader().read();
+    const stream2 = fh2.readableWebStream({ autoClose: true });
+    for await (const _chunk of stream2) {
+      // Consume the stream so auto-close runs.
+    }
+    strictEqual(fh2.fd, -1);
+    await rejects(fh2.stat(), { code: 'EBADF' });
+
+    const fh3 = await promises.open('/tmp/stream.txt', 'r');
+    const stream3 = fh3.readableWebStream({ autoClose: false });
+    await fh3.close();
+    const res = await stream3.getReader().read();
     strictEqual(res.done, true);
     strictEqual(res.value, undefined);
   },

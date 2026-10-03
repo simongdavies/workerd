@@ -594,15 +594,16 @@ export function readFileSync(
   ) {
     throw new ERR_INVALID_ARG_VALUE('options.encoding', encoding);
   }
-  stringToFlags(flag);
-
-  // TODO(node:fs): We are currently ignoring flags on readFileSync.
-
   const u8 = ((): Uint8Array => {
     if (typeof pathOrFd === 'number') {
       return cffs.readAll(getValidatedFd(pathOrFd));
     }
-    return cffs.readAll(normalizePath(pathOrFd));
+    const fd = openSync(pathOrFd, flag);
+    try {
+      return cffs.readAll(fd);
+    } finally {
+      closeSync(fd);
+    }
   })();
 
   const buf = Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength);
@@ -747,12 +748,15 @@ export function statfsSync(
   path: FilePath,
   options: { bigint?: boolean | undefined } = {}
 ): StatsFs | BigIntStatsFs {
-  normalizePath(path);
+  const normalizedPath = normalizePath(path);
   validateObject(options, 'options');
   const { bigint = false } = options;
   validateBoolean(bigint, 'options.bigint');
-  // We don't implement statfs in any meaningful way. Nor will we actually
-  // validate that the path exists. We just return a non-op dummy object.
+  if (cffs.stat(normalizedPath, { followSymlinks: true }) == null) {
+    throw new ERR_ENOENT(normalizedPath.pathname, { syscall: 'statfs' });
+  }
+  // We don't implement statfs capacity accounting in a meaningful way.
+  // Return deterministic zero values for existing paths.
   if (bigint) {
     return {
       type: 0n,

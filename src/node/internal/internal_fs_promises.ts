@@ -105,9 +105,8 @@ export class FileHandle extends EventEmitter {
     this.#handle = cffs.getFdHandle(fd);
   }
 
-  get fd(): number | undefined {
-    // The fd property will be undefined if the handle has been closed.
-    return this.#fd;
+  get fd(): number {
+    return this.#fd ?? -1;
   }
 
   async appendFile(
@@ -266,18 +265,29 @@ export class FileHandle extends EventEmitter {
   }
 
   write(
+    buffer: NodeJS.ArrayBufferView,
+    offsetPositionOrOptions?: WriteSyncOptions | Position,
+    lengthOrEncoding?: number,
+    position?: Position
+  ): Promise<{ bytesWritten: number; buffer: NodeJS.ArrayBufferView }>;
+  write(
+    buffer: string,
+    offsetPositionOrOptions?: WriteSyncOptions | Position,
+    lengthOrEncoding?: ValidEncoding,
+    position?: Position
+  ): Promise<{ bytesWritten: number; buffer: string }>;
+  write(
     buffer: NodeJS.ArrayBufferView | string,
     offsetPositionOrOptions: WriteSyncOptions | Position = null,
     lengthOrEncoding?: number | ValidEncoding,
     position: Position = null
-  ): Promise<{ bytesWritten: number; buffer: NodeJS.ArrayBufferView }> {
+  ): Promise<{
+    bytesWritten: number;
+    buffer: NodeJS.ArrayBufferView | string;
+  }> {
     try {
       if (this.#fd === undefined) {
         throw new ERR_EBADF({ syscall: 'stat' });
-      }
-
-      if (typeof buffer === 'string') {
-        buffer = Buffer.from(buffer, lengthOrEncoding as string);
       }
 
       const bytesWritten = fssync.writeSync(
@@ -318,18 +328,13 @@ export class FileHandle extends EventEmitter {
   writeFile(
     data: string | Buffer,
     options: ValidEncoding | WriteFileOptions = {}
-  ): Promise<{ bytesWritten: number; buffer: Buffer }> {
+  ): Promise<void> {
     try {
       if (this.#fd === undefined) {
         throw new ERR_EBADF({ syscall: 'stat' });
       }
-      const bytesWritten = fssync.writeFileSync(this.#fd, data, options);
-      return Promise.resolve({
-        bytesWritten,
-        buffer: isArrayBufferView(data)
-          ? data
-          : Buffer.from(data, options as BufferEncoding),
-      });
+      fssync.writeFileSync(this.#fd, data, options);
+      return Promise.resolve();
     } catch (err) {
       return Promise.reject(err as Error);
     }
@@ -337,7 +342,10 @@ export class FileHandle extends EventEmitter {
 
   close(): Promise<void> {
     try {
-      this.#handle?.close();
+      if (this.#handle === undefined) {
+        return Promise.resolve();
+      }
+      this.#handle.close();
       this.#fd = undefined;
       this.#handle = undefined;
       (this as unknown as EventEmitter).emit('close');
@@ -358,10 +366,7 @@ export class FileHandle extends EventEmitter {
       throw new ERR_EBADF({ syscall: 'stat' });
     }
     validateObject(options, 'options');
-    // Node.js actually defaults autoClose to false here because of backwards
-    // compatibility issues but will change to autoClose = true in a semver-major
-    // soon.
-    const { autoClose = true } = options;
+    const { autoClose = false } = options;
     validateBoolean(autoClose, 'options.autoClose');
     return getReadableWebStream(this, { autoClose });
   }
@@ -680,6 +685,7 @@ function getReadableWebStream(
   const readFn = fh.read.bind(fh);
   const { autoClose } = options;
   let controller: ReadableByteStreamController;
+  let closed = false;
   const ondone = async (): Promise<void> => {
     if (autoClose) await fh.close();
   };
@@ -701,6 +707,7 @@ function getReadableWebStream(
       );
 
       if (bytesRead === 0) {
+        closed = true;
         controller.close();
         await ondone();
       }
@@ -709,12 +716,16 @@ function getReadableWebStream(
     },
 
     async cancel(): Promise<void> {
+      closed = true;
       await ondone();
     },
   });
 
   fh.once('close', () => {
-    controller.close();
+    if (!closed) {
+      closed = true;
+      controller.close();
+    }
   });
 
   return readable;

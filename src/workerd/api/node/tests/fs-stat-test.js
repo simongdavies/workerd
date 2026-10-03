@@ -413,6 +413,11 @@ export const statfsTest = {
 
     deepStrictEqual(statfsSync('/'), check);
     deepStrictEqual(statfsSync('/bundle', { bigint: true }), checkBn);
+    throws(() => statfsSync('/does/not/exist'), {
+      code: 'ENOENT',
+      syscall: 'statfs',
+      path: '/does/not/exist',
+    });
 
     async function callStatfs(path, fn, bigint = false) {
       const { promise, resolve, reject } = Promise.withResolvers();
@@ -438,6 +443,32 @@ export const statfsTest = {
       },
       true /* bigint */
     );
+    await rejects(promises.statfs('/does/not/exist'), {
+      code: 'ENOENT',
+      syscall: 'statfs',
+      path: '/does/not/exist',
+    });
+    await new Promise((resolve, reject) => {
+      statfs('/does/not/exist', (err) => {
+        try {
+          deepStrictEqual(
+            {
+              code: err?.code,
+              syscall: err?.syscall,
+              path: err?.path,
+            },
+            {
+              code: 'ENOENT',
+              syscall: 'statfs',
+              path: '/does/not/exist',
+            }
+          );
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
 
     // Throws if the path is invalid / wrong type
     throws(() => statfs(123), {

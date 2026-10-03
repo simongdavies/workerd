@@ -12,6 +12,10 @@ export const openCloseTest = {
   async test() {
     const fileHandle = await promises.open('/tmp/test.txt', 'w+');
     strictEqual(fileHandle.constructor.name, 'FileHandle');
+    const fd = fileHandle.fd;
+    ok(fd >= 0);
+    let closeEvents = 0;
+    fileHandle.on('close', () => closeEvents++);
 
     // If the FileHandle is opened successfully, stat should work.
     const stat = await fileHandle.stat();
@@ -19,6 +23,10 @@ export const openCloseTest = {
 
     // Close the file handle
     await fileHandle.close();
+    strictEqual(fileHandle.fd, -1);
+    strictEqual(closeEvents, 1);
+    await fileHandle.close();
+    strictEqual(closeEvents, 1);
 
     // Verify that the file handle is closed
     await rejects(fileHandle.stat(), {
@@ -71,7 +79,7 @@ export const writeAppendReadFileTest = {
     await using fileHandle = await promises.open('/tmp/test.txt', 'a+');
     strictEqual(fileHandle.constructor.name, 'FileHandle');
 
-    await fileHandle.writeFile('Hello, World');
+    strictEqual(await fileHandle.writeFile('Hello, World'), undefined);
 
     // Append some data to the file
     await fileHandle.appendFile('!!!!\n');
@@ -89,7 +97,10 @@ export const writeReadTest = {
     strictEqual(fileHandle.constructor.name, 'FileHandle');
 
     // Write some data to the file
-    await fileHandle.write('Hello, World');
+    const text = 'Hello, World';
+    const firstWrite = await fileHandle.write(text);
+    strictEqual(firstWrite.buffer, text);
+    strictEqual(firstWrite.bytesWritten, Buffer.byteLength(text));
 
     // Append some data to the file
     await fileHandle.write('!!!!\n');
@@ -99,6 +110,14 @@ export const writeReadTest = {
     const { bytesRead } = await fileHandle.read(buffer, 0, buffer.length, 0);
     strictEqual(bytesRead, 17);
     strictEqual(buffer.toString('utf8', 0, bytesRead), 'Hello, World!!!!\n');
+
+    const backing = Buffer.alloc(8, '.');
+    const view = backing.subarray(3, 6);
+    const slicedRead = await fileHandle.read({ buffer: view, position: 0 });
+    strictEqual(slicedRead.buffer, view);
+    strictEqual(slicedRead.bytesRead, 3);
+    strictEqual(view.toString(), 'Hel');
+    strictEqual(backing.toString(), '...Hel..');
 
     // Use readv
     const buffer2 = Buffer.alloc(10);
