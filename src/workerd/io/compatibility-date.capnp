@@ -1675,7 +1675,7 @@ struct CompatibilityFlags @0x8f8c1b68151b6cef {
   workerGlobalScopeEventHandlers @190 :Bool
       $compatEnableFlag("worker_global_scope_event_handlers")
       $compatDisableFlag("no_worker_global_scope_event_handlers")
-      $compatEnableDate("2026-09-28");
+      $compatEnableDate("2026-09-29");
   # Exposes the standard onerror, onunhandledrejection, and onrejectionhandled event handler
   # attributes on WorkerGlobalScope.
 
