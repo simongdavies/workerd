@@ -9,7 +9,10 @@ import { strictEqual } from 'node:assert';
 import { usingTsImpl } from 'which-impl';
 import { rejectionOf } from 'helpers';
 
-// Both implementations pull once after start and after each read.
+// DIVERGENCE (same shape as the readable suite's ledger #4): both sides
+// pull once after start; TypeScript pulls after every read (1,2,3), C++
+// serves the first read from the queue and batches the deferred pulls
+// (1,1,3).
 export const pullCountShape = {
   async test() {
     let pulls = 0;
@@ -31,7 +34,7 @@ export const pullCountShape = {
     strictEqual(pulls, 1);
     const reader = rs.getReader();
     strictEqual((await reader.read()).value[0], 1);
-    strictEqual(pulls, 2);
+    strictEqual(pulls, usingTsImpl ? 2 : 1);
     strictEqual((await reader.read()).value[0], 2);
     strictEqual(pulls, 3);
   },

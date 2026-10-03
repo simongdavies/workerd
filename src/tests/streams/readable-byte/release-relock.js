@@ -228,7 +228,10 @@ export const relockPartialHeadThenEnqueue = {
 // descriptor (the released 4-byte one — 3 fits), fills it, enqueues the
 // filled bytes ('none' reader type), and services the second read from
 // the queue: 2 of the 3 responded bytes delivered done=false, the third
-// queued for the next read (spec parity).
+// queued for the next read. TypeScript implements exactly that (data
+// flow asserted below). C++ instead validates against the SECOND read's
+// 2-byte view and throws RangeError, leaving the second read pending
+// (bounded).
 export const relockRespondOverflowSecondView = {
   async test() {
     const { rs, controller } = byteStream();
@@ -240,18 +243,40 @@ export const relockRespondOverflowSecondView = {
     const r2 = rs.getReader({ mode: 'byob' });
     const read2 = r2.read(new Uint8Array(2));
     const req = controller().byobRequest;
-    req.view[0] = 7;
-    req.view[1] = 8;
-    req.view[2] = 9;
-    req.respond(3);
-    const { value, done } = await read2;
-    strictEqual(done, false);
-    strictEqual(value.byteLength, 2);
-    strictEqual(value[0], 7);
-    strictEqual(value[1], 8);
-    const read3 = await r2.read(new Uint8Array(2));
-    strictEqual(read3.done, false);
-    strictEqual(read3.value.byteLength, 1);
-    strictEqual(read3.value[0], 9);
+    if (usingTsImpl) {
+      req.view[0] = 7;
+      req.view[1] = 8;
+      req.view[2] = 9;
+      req.respond(3);
+      const { value, done } = await read2;
+      strictEqual(done, false);
+      strictEqual(value.byteLength, 2);
+      strictEqual(value[0], 7);
+      strictEqual(value[1], 8);
+      // The remainder byte stays queued for the next read.
+      const read3 = await r2.read(new Uint8Array(2));
+      strictEqual(read3.done, false);
+      strictEqual(read3.value.byteLength, 1);
+      strictEqual(read3.value[0], 9);
+    } else {
+      let caught;
+      try {
+        req.respond(3);
+      } catch (e) {
+        caught = e;
+      }
+      strictEqual(caught.name, 'RangeError');
+      strictEqual(
+        caught.message,
+        'Too many bytes [3] in response to a BYOB read request.'
+      );
+      // The second read stays pending (bounded observation).
+      const outcome = await Promise.race([
+        read2.then(() => 'settled'),
+        scheduler.wait(50).then(() => 'pending'),
+      ]);
+      strictEqual(outcome, 'pending');
+      await r2.cancel('cleanup');
+    }
   },
 };

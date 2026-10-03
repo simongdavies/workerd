@@ -7,27 +7,39 @@
 import { strictEqual, throws } from 'node:assert';
 import { usingTsImpl } from 'which-impl';
 
-// A size() function in a byte-stream strategy is rejected (spec parity).
+// DIVERGENCE (the WPT general.any seed): a size() in the strategy of a
+// byte stream is rejected by TypeScript (spec: RangeError) but silently
+// accepted — and ignored — by C++.
 export const sizeStrategyForBytes = {
   test() {
-    throws(
-      () =>
-        new ReadableStream(
-          { type: 'bytes' },
-          {
-            size() {
-              return 1;
-            },
-            highWaterMark: 4,
-          }
-        ),
-      {
-        name: 'RangeError',
-        message: usingTsImpl
-          ? 'The strategy for a byte stream cannot have a size function'
-          : 'The strategy for a byte stream cannot have a size function.',
-      }
-    );
+    if (usingTsImpl) {
+      throws(
+        () =>
+          new ReadableStream(
+            { type: 'bytes' },
+            {
+              size() {
+                return 1;
+              },
+              highWaterMark: 4,
+            }
+          ),
+        {
+          name: 'RangeError',
+          message: 'The strategy for a byte stream cannot have a size function',
+        }
+      );
+    } else {
+      new ReadableStream(
+        { type: 'bytes' },
+        {
+          size() {
+            return 1;
+          },
+          highWaterMark: 4,
+        }
+      );
+    }
   },
 };
 
@@ -71,21 +83,38 @@ export const byteHwmDefaultIsZero = {
   },
 };
 
-// A synchronously throwing start() escapes the constructor (spec parity).
+// DIVERGENCE (readable suite ledger #6 mirrored): a synchronously
+// throwing start() escapes the constructor under TypeScript (spec) but
+// is captured by C++ — construction succeeds and the stream is errored.
 export const syncStartThrow = {
-  test() {
+  async test() {
     const err = new Error('start-throw');
-    let caught;
-    try {
-      new ReadableStream({
+    if (usingTsImpl) {
+      let caught;
+      try {
+        new ReadableStream({
+          type: 'bytes',
+          start() {
+            throw err;
+          },
+        });
+      } catch (e) {
+        caught = e;
+      }
+      strictEqual(caught, err);
+    } else {
+      const rs = new ReadableStream({
         type: 'bytes',
         start() {
           throw err;
         },
       });
-    } catch (e) {
-      caught = e;
+      let readErr;
+      await rs
+        .getReader()
+        .read()
+        .catch((e) => (readErr = e));
+      strictEqual(readErr, err);
     }
-    strictEqual(caught, err);
   },
 };

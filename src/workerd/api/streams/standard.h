@@ -456,7 +456,7 @@ class ReadableStreamDefaultController: public jsg::Object {
 
   void enqueue(jsg::Lock& js, jsg::Optional<jsg::JsValue> chunk);
 
-  void error(jsg::Lock& js, jsg::Optional<jsg::JsValue> reason);
+  void error(jsg::Lock& js, jsg::JsValue reason);
 
   void pull(jsg::Lock& js);
 
@@ -525,8 +525,6 @@ class ReadableStreamBYOBRequest: public jsg::Object {
 
   void invalidate(jsg::Lock& js);
 
-  void invalidateForEnqueue(jsg::Lock& js);
-
   void respond(jsg::Lock& js, int bytesWritten);
 
   void respondWithNewView(jsg::Lock& js, jsg::JsBufferSource view);
@@ -542,10 +540,6 @@ class ReadableStreamBYOBRequest: public jsg::Object {
   }
 
   bool isPartiallyFulfilled();
-  bool isValid();
-  bool respondForTee(jsg::Lock& js, jsg::JsBufferSource view);
-
-  bool isInvalidated() const;
 
   void visitForMemoryInfo(jsg::MemoryTracker& tracker) const;
 
@@ -594,15 +588,13 @@ class ReadableByteStreamController: public jsg::Object {
 
   void enqueue(jsg::Lock& js, jsg::JsBufferSource chunk);
 
-  void error(jsg::Lock& js, jsg::Optional<jsg::JsValue> reason);
+  void error(jsg::Lock& js, jsg::JsValue reason);
 
   bool canCloseOrEnqueue();
   bool hasBackpressure();
   kj::Maybe<int> getDesiredSize();
 
   kj::Maybe<jsg::Ref<ReadableStreamBYOBRequest>> getByobRequest(jsg::Lock& js);
-
-  void requeueByobRequest(kj::Own<ByteQueue::ByobRequest> request);
 
   void pull(jsg::Lock& js);
 

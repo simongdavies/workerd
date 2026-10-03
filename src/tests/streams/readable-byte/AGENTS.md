@@ -11,32 +11,32 @@ pump divergences plus the close-with-partial and read-min shapes below;
 the releaseLock→second-reader cluster and the buffer-hazard families are
 behavior-parity (messages aside).
 
-## Behavior ledger (C++ vs TypeScript)
+## Divergence ledger (C++ vs TypeScript)
 
 | # | Area | C++ | TypeScript | Pinned in |
 | --- | --- | --- | --- | --- |
-| 1 | size() in a byte stream's strategy | RangeError (spec parity) | RangeError (spec) — root of the WPT ctor seed | `sizeStrategyForBytes` |
+| 1 | size() in a byte stream's strategy | silently accepted and ignored | RangeError (spec) — root of the WPT ctor seed | `sizeStrategyForBytes` |
 | 2 | autoAllocateChunkSize 0/-1/NaN | TypeError 'cannot be zero.' (all three) | TypeError 'must be a positive integer' | `autoAllocateChunkSizeValidated` |
-| 3 | pull counts (hwm 1, enqueue-in-pull) | 1,2,3 (spec parity) | 1,2,3 (spec) | `pullCountShape` |
-| 4 | sync start() throw | escapes constructor (spec parity) | escapes constructor (spec) | `syncStartThrow`, `jsSourceError` |
+| 3 | pull counts (hwm 1, enqueue-in-pull) | 1,1,3 (readable ledger #4 mirror) | 1,2,3 (spec) | `pullCountShape` |
+| 4 | sync start() throw | captured; stream errored (readable #6 mirror) | escapes constructor (spec) | `syncStartThrow`, `jsSourceError` |
 | 5 | byobRequest on DEFAULT read, no autoAllocate | auto-allocates anyway: view(4096), or view(16384) under the UPDATED_AUTO_ALLOCATE_CHUNK_SIZE autogate (@all-autogates) | null (spec) — the subject of the streams_no_default_auto_allocate_chunk_size flag cell | `byobRequestOnDefaultRead` |
 | 6 | Body-pump reads | pump fills byobRequest (BYOB reads) | WITH autoAllocateChunkSize: same — the draining conduit's wait-read synthesizes the auto-allocate descriptor, so pump pulls carry a byobRequest (parity, pinned). WITHOUT it: pump pulls present byobRequest null (ledger #5's spec side) while C++ auto-allocates anyway — sources without autoAllocateChunkSize stay dual-path | `bodyPumpByobRequestPresence` |
-| 7 | close() with partially-filled read(view) | TypeError 'This ReadableStream was closed with a partial read pending.' from close(), read, and closed | TypeError 'Insufficient bytes to fill elements in the given view' from close(), read, and closed (spec) | `closeWithPartiallyFilledView` |
+| 7 | close() with partially-filled read(view) | close succeeds; read resolves EMPTY view done=FALSE; closed fulfills | TypeError 'Insufficient bytes to fill elements in the given view' from close(), read, and closed (spec) | `closeWithPartiallyFilledView` |
 | 8 | enqueue of detached/zero-length chunk | TypeError 'Cannot enqueue a zero-length ArrayBuffer.' | TypeError 'chunk must have a non-zero byteLength' | `enqueueDetachedBuffer`, `enqueueChunkMultipleTimesBytes` |
 | 9 | released pending read's rejection | 'This ReadableStream reader has been released.' | 'This reader has been released' | `relockRespondRoutesToSecondReader` |
-| 10 | respond(N) with a released descriptor at the head and a smaller second-reader view | head-descriptor bounds and queued remainder (spec parity) | head-descriptor bounds and queued remainder (spec) | `relockRespondOverflowSecondView` |
-| 11 | read min validation | min=0 TypeError; min>view RangeError | min=0 TypeError (other msg); min>view RangeError | `readMinValidation` |
-| 12 | close() below min with partial bytes (element-aligned) | partial value with done=true (spec parity) | partial value with done=true (spec) | `closeBelowMin` |
+| 10 | respond(N) exceeding the second reader's smaller view (released 4-byte descriptor at head) | RangeError 'Too many bytes [N]...' validated against the SECOND read's view (a C++ deviation); second read stays pending | spec: the bounds check is against the HEAD descriptor — the respond is accepted, the released descriptor's bytes are enqueued, and the second read is served from the queue (2 of 3 bytes delivered, the third queued) | `relockRespondOverflowSecondView` |
+| 11 | read min validation | min=0 TypeError; min>view TypeError | min=0 TypeError (other msg); min>view RANGEError | `readMinValidation` |
+| 12 | close() below min with partial bytes (element-aligned) | read fulfills the partial bytes done=false; a subsequent read resolves done + empty view (the readAtLeast tail contract; the spec instead leaves the read pending until respond(0) commits { done: true, value: partial } — only a fractional fill makes close() throw, see #7) | same — the parked read settles one microtask after close(), handing its buffer back (transferred, not copied); its descriptor remains available for a later closed-state response | `closeBelowMin` |
 | 13 | readAtLeast/min at native end-of-stream | below-min tail delivered done=false, then an extra read resolves done + empty view | same (the conduit's under-delivery commit; decided contract) | `readAtLeastByobReader` |
-| 14 | tee cancel composite | ordered reason pair `[r1, r2]` | AggregateError[r1, r2]; lone-branch cancel PENDS — never await it | `teeCancelComposite` |
-| 15 | respondWithNewView with a different element size | keeps the ORIGINAL read view's element size and queues the remainder (spec parity) | same (spec) | `readableStreamByteRespondWithNewViewUsesNewElementSize` |
+| 14 | tee cancel composite | pair-completing branch's reason only (readable #11 mirror) | AggregateError[r1, r2]; lone-branch cancel PENDS — never await it | `teeCancelComposite` |
+| 15 | respondWithNewView with a different element size | adopts the NEW view's element size (6 bytes at once) | keeps the ORIGINAL read view's element size (4-byte multiple), queues the remainder | `readableStreamByteRespondWithNewViewUsesNewElementSize` |
 | 16 | invalidated byobRequest message | 'This ReadableStreamBYOBRequest has been invalidated.' | 'This BYOB request has been invalidated' | `readableStreamByteRespond` |
 | 17 | default-read delivery of a multi-chunk queue | COALESCES all queued chunks into one read | chunk-by-chunk (spec) | `byteDesiredSizeAccounting` |
 | 18 | buffer-hazard messages (read detached view, respond after view detach, respondWithNewView foreign buffer, WASM Memory) | own texts | own texts (behavior parity everywhere) | `buffer-lifecycle.js` |
 | 19 | close() with a pending UNFILLED BYOB read | read resolves done with an empty view | read PENDS FOREVER while close() succeeds (bounded; the #12 defect family without any min) — drain loops must close WITH the last enqueue, never against a parked empty read | `closeWithPendingUnfilledByobRead` |
 | 20 | remainder after a partial BYOB read, delivered to a DEFAULT read | copied into a fresh auto-allocated buffer (4096, or 16384 under the ledger #5 autogate), byteOffset 0 | view into the original enqueued buffer with its offset preserved (spec) | `partialViewThenDefaultRead` |
-| 21 | byobRequest after a PARTIAL enqueue into a pending BYOB read | original request invalidated; a fresh request exposes a view shrunk to the remaining byte count (spec parity) | same (spec) | `cancelWithPartiallyFilledPull` |
-| 22 | cancel() after a partial enqueue into a pending BYOB read | read resolves done with value undefined (spec parity) | same (spec) | `cancelWithPartiallyFilledPull` |
+| 21 | byobRequest after a PARTIAL enqueue into a pending BYOB read | original request invalidated; no replacement exposed (null) | original request invalidated; a fresh request exposes a view shrunk to the remaining byte count (spec) | `cancelWithPartiallyFilledPull` |
+| 22 | cancel() after a partial enqueue into a pending BYOB read | read resolves done with an empty view | read resolves done with value undefined (spec) | `cancelWithPartiallyFilledPull` |
 | 23 | error() while a close() is still pending (bytes queued) — readable #18 mirror | ignored: desiredSize already 0, the bytes drain to a clean close for default and BYOB readers | desiredSize is hwm minus the queued bytes (-2) until the error, then the stream errors: bytes discarded, default/BYOB reads and closed reject | `errorAfterCloseWithQueuedBytes` |
 | 24 | pipeTo() from an autoAllocate tee branch, aborted (preventCancel) with its read pending | pipe stays pending until a chunk arrives, which the aborted pipe's read consumes and drops (bounded) | pipe rejects at once; the branch's next reader receives the next chunk | `teePipeAbortReleasesPendingRead` |
 | 25 | byobRequest held by the source across tee() (reader released first) | stays exposed and working (spec): the responded byte reaches both branches, and fills a sole remaining branch's read | invalidated at tee(): byobRequest null while two branches exist, respond() throws TypeError 'This BYOB request has been invalidated'; a sole remaining branch's read gets a fresh request | `teeInvalidatesHeldByobRequest`, `teeSoleBranchMintsFreshByobRequest` |
@@ -80,13 +80,13 @@ named suite test pins directly, differing only in incidental asserts.
 
 | WPT test (abbreviated) | Root | Suite pin |
 | --- | --- | --- |
-| start() throws an exception | constructor propagates sync start throws (ledger #4) | `syncStartThrow` |
-| Automatic pull() after start() / after read() / after read(view) | spec pull schedule (ledger #3) | `pullCountShape` |
+| start() throws an exception | ctor captures sync start throws (ledger #4) | `syncStartThrow` |
+| Automatic pull() after start() / after read() / after read(view) | proactive pull (ledger #3) | `pullCountShape` |
 | autoAllocateChunkSize | auto-allocated byobRequest on default reads (ledger #5) | `byobRequestOnDefaultRead` |
 | Respond to pull() by enqueue() asynchronously / multiple pull() by separate enqueue() / read() twice then enqueue() twice / Push source without pull signal / enqueue()+getReader()+read() | pull-count and coalescing family (ledger #3, #17) | `pullCountShape`, `byteDesiredSizeAccounting` |
 | constructor rejects size with type "bytes" | ledger #1 | `sizeStrategyForBytes` |
 | cancel() with partially filled pending pull() | partial-enqueue replacement request (ledger #21) and cancel-result shape (ledger #22) | `cancelWithPartiallyFilledPull` (direct) |
-| getReader(), read(view), then cancel() | cancel wins before pull | `readViewThenCancelOrdering` (direct) |
+| getReader(), read(view), then cancel() | pull runs before cancel under C++ | `readViewThenCancelOrdering` (direct) |
 | enqueue() with Uint16Array then read() / 3 byte + 2-element Uint16Array | mismatched view/enqueue granularity | `readableStreamBytesMismatchedSizes`, `byobUint16Array` |
 | read(view) Uint32Array filled by multiple enqueue() | partial fills across enqueues | `byobUint32Array`, `byobPartialRespondMisalignsFillOffset` |
 | enqueue(), read(view) partially, then read() | remainder copied vs viewed (ledger #20) | `partialViewThenDefaultRead` (direct) |

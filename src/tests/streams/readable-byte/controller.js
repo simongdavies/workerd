@@ -63,8 +63,11 @@ export const enqueueDiscardsByobRequest = {
   },
 };
 
-// Closing with a partially-filled pending read(view) errors the stream.
-// The implementations retain different TypeError messages.
+// DIVERGENCE (the WPT general.any close-with-partial seed): closing with
+// a partially-filled pending read(view) must error the stream under the
+// spec — TypeScript throws from close() and rejects the read and closed
+// with the same TypeError. C++ lets close() succeed, resolves the read
+// with an EMPTY view and done=false, and fulfills closed.
 export const closeWithPartiallyFilledView = {
   async test() {
     let controller;
@@ -77,17 +80,24 @@ export const closeWithPartiallyFilledView = {
     const reader = rs.getReader({ mode: 'byob' });
     const readP = reader.read(new Uint16Array(1));
     controller.enqueue(new Uint8Array([1])); // 1 of 2 bytes: partial
-    const expected = {
-      name: 'TypeError',
-      message: usingTsImpl
-        ? 'Insufficient bytes to fill elements in the given view'
-        : 'This ReadableStream was closed with a partial read pending.',
-    };
-    throws(() => controller.close(), expected);
-    const readErr = await rejectionOf(readP);
-    strictEqual(readErr.message, expected.message);
-    const closedErr = await rejectionOf(reader.closed);
-    strictEqual(closedErr.message, expected.message);
+    if (usingTsImpl) {
+      const expected = {
+        name: 'TypeError',
+        message: 'Insufficient bytes to fill elements in the given view',
+      };
+      throws(() => controller.close(), expected);
+      const readErr = await rejectionOf(readP);
+      strictEqual(readErr.message, expected.message);
+      const closedErr = await rejectionOf(reader.closed);
+      strictEqual(closedErr.message, expected.message);
+    } else {
+      controller.close();
+      const r = await readP;
+      strictEqual(r.done, false);
+      ok(r.value instanceof Uint16Array);
+      strictEqual(r.value.byteLength, 0);
+      strictEqual(await reader.closed, undefined);
+    }
   },
 };
 
@@ -226,9 +236,11 @@ export const controllerType = {
 };
 
 // cancel() while a partially filled pull-into is pending (WPT
-// 'cancel() with partially filled pending pull() request'). A partial
-// enqueue invalidates the original request and exposes a fresh request
-// over the remaining byte count (spec parity).
+// 'cancel() with partially filled pending pull() request'). DIVERGENCE
+// (ledger #21): a partial enqueue invalidates the original request on
+// both sides; TypeScript exposes a fresh request with a view shrunk to
+// the remaining byte count (spec), while C++ exposes null. Cancellation
+// discards the partial bytes, with the result shape diverging (#22).
 export const cancelWithPartiallyFilledPull = {
   async test() {
     const events = [];
@@ -248,9 +260,13 @@ export const cancelWithPartiallyFilledPull = {
     strictEqual(initialRequest.view.byteLength, 2);
     controller.enqueue(new Uint8Array([0x11])); // partial: 1 byte
     strictEqual(initialRequest.view, null);
-    const remainingRequest = controller.byobRequest;
-    ok(remainingRequest !== initialRequest);
-    strictEqual(remainingRequest.view.byteLength, 1);
+    if (usingTsImpl) {
+      const remainingRequest = controller.byobRequest;
+      ok(remainingRequest !== initialRequest);
+      strictEqual(remainingRequest.view.byteLength, 1);
+    } else {
+      strictEqual(controller.byobRequest, null);
+    }
     await scheduler.wait(1);
     const cancelP = reader.cancel('why');
     const read = await Promise.race([
@@ -268,13 +284,19 @@ export const cancelWithPartiallyFilledPull = {
       ),
       scheduler.wait(200).then(() => 'cancel:pending'),
     ]);
-    strictEqual(read, 'read:done=true,len=undef');
+    strictEqual(
+      read,
+      usingTsImpl ? 'read:done=true,len=undef' : 'read:done=true,len=0'
+    );
     strictEqual(cancel, 'cancel:fulfilled');
     strictEqual(events.join(','), 'cancel:why');
   },
 };
 
-// read(view) then immediate cancel(): cancel wins before pull (spec parity).
+// read(view) then immediate cancel() (WPT 'getReader(), read(view),
+// then cancel()'): DIVERGENCE — C++ pulls proactively on the read, so
+// pull runs BEFORE the cancel hook; TypeScript never pulls (spec: the
+// cancel wins). The read resolves done on both.
 export const readViewThenCancelOrdering = {
   async test() {
     const events = [];
@@ -294,6 +316,11 @@ export const readViewThenCancelOrdering = {
       readP.then((r) => events.push(`read:done=${r.done}`)),
       cancelP,
     ]);
-    strictEqual(events.join(','), 'cancel:stop,read:done=true');
+    strictEqual(
+      events.join(','),
+      usingTsImpl
+        ? 'cancel:stop,read:done=true'
+        : 'pull,cancel:stop,read:done=true'
+    );
   },
 };

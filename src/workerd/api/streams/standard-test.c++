@@ -812,22 +812,43 @@ KJ_TEST("ReadableStream read all bytes (byte readable, failed start)") {
 
 KJ_TEST("ReadableStream read all bytes (byte readable, failed start 2)") {
   preamble([](jsg::Lock& js) {
+    uint checked = 0;
     auto rs = js.alloc<ReadableStream>(newReadableStreamJsController());
-    JSG_TRY(js) {
-      // clang-format off
-      rs->getController().setup(js, UnderlyingSource{
-        .type = kj::str("bytes"),
-        .start = [](jsg::Lock& js, UnderlyingSource::Controller controller)
-            -> jsg::Promise<void> {
-          JSG_FAIL_REQUIRE(Error, "boom");
-        },
-      }, StreamQueuingStrategy{.highWaterMark = 0});
-      // clang-format on
-      KJ_FAIL_ASSERT("A synchronous start() exception should escape setup.");
-    }
-    JSG_CATCH(exception) {
+    // clang-format off
+    rs->getController().setup(js, UnderlyingSource{
+      .type = kj::str("bytes"),
+      .start = [&](jsg::Lock& js, UnderlyingSource::Controller controller) -> jsg::Promise<void> {
+        checked++;
+        JSG_FAIL_REQUIRE(Error, "boom");
+      }
+      // Setting a highWaterMark of 0 means the pull function above will not be called
+      // immediately on creation of the stream, but only when the first read in the
+      // readall call below happens.
+    }, StreamQueuingStrategy{.highWaterMark = 0});
+    // clang-format on
+
+    // Starts a read loop of javascript promises.
+    auto promise = rs->getController().readAllBytes(js, 20).then(js,
+        [](jsg::Lock& js, jsg::JsRef<jsg::JsArrayBuffer> text) { KJ_UNREACHABLE; },
+        [&](jsg::Lock& js, jsg::Value&& exception) {
       KJ_ASSERT(kj::str(exception.getHandle(js)) == "Error: boom");
-    }
+      checked++;
+    });
+
+    // Reading left the stream locked and disturbed
+    KJ_ASSERT(rs->isLocked());
+    KJ_ASSERT(rs->isDisturbed());
+
+    // Run the microtasks to completion. This should resolve the promise and
+    // run it to completion. The test is buggy if it fails to do so.
+    js.runMicrotasks();
+    KJ_ASSERT(checked == 2);
+
+    KJ_ASSERT(rs->getController().isClosedOrErrored());
+
+    // Add we should still be locked and disturbed.
+    KJ_ASSERT(rs->isLocked());
+    KJ_ASSERT(rs->isDisturbed());
   });
 }
 
