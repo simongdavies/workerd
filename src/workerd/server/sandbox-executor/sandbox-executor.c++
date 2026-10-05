@@ -42,7 +42,7 @@ constexpr size_t MAX_COMPATIBILITY_FLAG_BYTES = 64;
 constexpr size_t MAX_COMPATIBILITY_FLAGS_BYTES = 2 * 1024;
 constexpr size_t MAX_MODULES = 32;
 constexpr size_t MAX_MODULE_NAME_BYTES = 256;
-constexpr size_t MAX_MODULE_SOURCE_BYTES = 32 * 1024;
+constexpr size_t MAX_MODULE_SOURCE_BYTES = 48 * 1024;
 constexpr size_t MAX_MODULE_SOURCES_BYTES = 48 * 1024;
 constexpr size_t MAX_STORAGE_MOUNTS = 8;
 constexpr size_t MAX_STORAGE_NAME_BYTES = 64;
@@ -3339,6 +3339,24 @@ int selfTest(bool filesystemEvidence) {
     modules.add(Module{kj::str(name), ModuleType::ES_MODULE, copyModuleBytes(source)});
     return modules.finish();
   };
+
+  {
+    constexpr size_t COMPONENT_ADAPTER_BYTES = 45194;
+    auto prefix = "export default {};"_kj;
+    auto source = kj::str(prefix, kj::repeat(' ', COMPONENT_ADAPTER_BYTES - prefix.size()));
+    KJ_REQUIRE(source.size() == COMPONENT_ADAPTER_BYTES);
+
+    Executor executor;
+    executor.initialize(serializeWorkerBundle(WorkerBundle{
+      .workerVersion = kj::str("component-adapter-size-v1"),
+      .compatibilityDate = kj::str("2025-12-31"),
+      .compatibilityFlags = noFlags(),
+      .mainModule = kj::str("worker.js"),
+      .modules = oneModule("worker.js"_kj, source),
+      .protocolVersion = 2,
+      .storageMounts = kj::heapArray<StorageMount>(0),
+    }));
+  }
 
   {
     auto flags = kj::heapArrayBuilder<kj::String>(1);

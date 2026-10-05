@@ -23,7 +23,7 @@ const MAX_COMPATIBILITY_FLAG_BYTES: usize = 64;
 const MAX_COMPATIBILITY_FLAGS_BYTES: usize = 2 * 1024;
 const MAX_MODULES: usize = 32;
 const MAX_MODULE_NAME_BYTES: usize = 256;
-const MAX_MODULE_SOURCE_BYTES: usize = 32 * 1024;
+const MAX_MODULE_SOURCE_BYTES: usize = 48 * 1024;
 const MAX_WASM_MODULE_BYTES: usize = 48 * 1024;
 const MAX_MODULE_SOURCES_BYTES: usize = 48 * 1024;
 
@@ -751,6 +751,42 @@ mod tests {
         assert!(
             decode_base64_limited(&encoded, MAX_WASM_MODULE_BYTES, "invalid", "oversized").is_err()
         );
+    }
+
+    #[test]
+    fn accepts_component_adapter_sized_module() {
+        const COMPONENT_ADAPTER_BYTES: usize = 45_194;
+        let bundle = ffi::InitBundle {
+            worker_version: "worker-v1".to_owned(),
+            compatibility_date: "2025-12-31".to_owned(),
+            compatibility_flags: Vec::new(),
+            main_module: "worker.js".to_owned(),
+            modules: vec![ffi::Module {
+                name: "worker.js".to_owned(),
+                module_type: ffi::ModuleType::EsModule,
+                source: vec![b' '; COMPONENT_ADAPTER_BYTES],
+            }],
+        };
+
+        assert!(serialize_init(bundle).is_ok());
+    }
+
+    #[test]
+    fn accepts_maximum_text_module_and_rejects_one_byte_more() {
+        let bundle = |source_size| ffi::InitBundle {
+            worker_version: "worker-v1".to_owned(),
+            compatibility_date: "2025-12-31".to_owned(),
+            compatibility_flags: Vec::new(),
+            main_module: "worker.js".to_owned(),
+            modules: vec![ffi::Module {
+                name: "worker.js".to_owned(),
+                module_type: ffi::ModuleType::EsModule,
+                source: vec![b' '; source_size],
+            }],
+        };
+
+        assert!(serialize_init(bundle(MAX_MODULE_SOURCE_BYTES)).is_ok());
+        assert!(serialize_init(bundle(MAX_MODULE_SOURCE_BYTES + 1)).is_err());
     }
 
     #[test]
