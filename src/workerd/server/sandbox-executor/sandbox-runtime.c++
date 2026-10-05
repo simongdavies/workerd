@@ -7,9 +7,11 @@
 #include "host-fs.h"
 #include "hyperlight-driver.h"
 #include "sandbox-fetch.h"
+#include "sandbox-logical-service.h"
 
 #include <workerd/api/global-scope.h>
 #include <workerd/api/memory-cache.h>
+#include <workerd/api/queue.h>
 #include <workerd/io/actor-cache.h>
 #include <workerd/io/compatibility-date.h>
 #include <workerd/io/io-channels.h>
@@ -67,7 +69,8 @@ kj::Maybe<kj::String> packageMain(const WorkerBundle& bundle, kj::StringPtr pack
   capnp::JsonCodec codec;
   capnp::MallocMessageBuilder message;
   auto root = message.initRoot<capnp::JsonValue>();
-  codec.decodeRaw(packageJson->source, root);
+  auto packageJsonText = kj::str(packageJson->source.asPtr().asChars());
+  codec.decodeRaw(packageJsonText, root);
   KJ_REQUIRE(root.isObject(), "package.json must contain an object", packageJsonName);
   for (auto field: root.getObject()) {
     if (field.getName() == "main"_kj) {
@@ -163,7 +166,7 @@ kj::Maybe<kj::String> resolveCommonJsSpecifier(
 }
 
 kj::String rewriteCommonJsRequires(const WorkerBundle& bundle, const Module& module) {
-  auto source = module.source.asPtr();
+  auto source = module.source.asPtr().asChars();
   kj::Vector<char> output;
   size_t copied = 0;
   for (size_t i = 0; i + 8 < source.size(); ++i) {
@@ -523,27 +526,52 @@ class ErrorReporter final: public Worker::ValidationErrorReporter {
 
 class ChannelFactory final: public IoChannelFactory {
  public:
-  ChannelFactory(TimerChannel& timer, kj::Rc<FetchBroker> fetchBroker)
+  ChannelFactory(TimerChannel& timer,
+      kj::Rc<FetchBroker> fetchBroker,
+      kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
+      kj::HttpHeaderTable& headerTable,
+      kj::ArrayPtr<const Binding> bindings)
       : timer(timer),
         fetchBroker(kj::mv(fetchBroker)),
+        logicalServiceHost(kj::mv(logicalServiceHost)),
+        headerTable(headerTable),
+        bindings(KJ_MAP(binding, bindings) {
+          return Binding{
+            .name = kj::str(binding.name),
+            .kind = binding.kind,
+          };
+        }),
         nextRequestId(kj::rc<uint64_t>(1)) {}
 
   void abortIsolate(kj::StringPtr reason) override {
     KJ_FAIL_REQUIRE("isolate aborted", reason);
   }
   kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) override {
-    KJ_REQUIRE(channel == 0, "only global outbound fetch is available");
-    KJ_REQUIRE(*nextRequestId != kj::maxValue, "outbound fetch request ID space exhausted");
-    return newOutboundFetchWorker(fetchBroker.addRef(), timer, kj::str((*nextRequestId)++));
+    if (channel == 0) {
+      KJ_REQUIRE(*nextRequestId != kj::maxValue, "outbound fetch request ID space exhausted");
+      return newOutboundFetchWorker(fetchBroker.addRef(), timer, kj::str((*nextRequestId)++));
+    }
+    auto bindingIndex = channel - 1;
+    KJ_REQUIRE(bindingIndex < bindings.size(), "invalid logical service channel");
+    const auto& binding = bindings[bindingIndex];
+    auto serviceChannel = newCompositeServiceChannel(
+        logicalServiceHost.addRef(), headerTable, kj::str(binding.name), binding.kind);
+    return serviceChannel->startRequest(kj::mv(metadata));
   }
   kj::Own<SubrequestChannel> getSubrequestChannelResolved(uint channel,
       kj::Maybe<Frankenvalue> props,
       kj::Maybe<VersionRequest> versionRequest,
       Persistent persistent) override {
-    KJ_REQUIRE(channel == 0 && props == kj::none && versionRequest == kj::none &&
-            persistent == Persistent::NO,
-        "only the global outbound fetch channel is available");
-    return newOutboundFetchChannel(fetchBroker.addRef(), timer, nextRequestId.addRef());
+    KJ_REQUIRE(props == kj::none && versionRequest == kj::none && persistent == Persistent::NO,
+        "sandbox executor channels do not support properties, versions, or persistence");
+    if (channel == 0) {
+      return newOutboundFetchChannel(fetchBroker.addRef(), timer, nextRequestId.addRef());
+    }
+    auto bindingIndex = channel - 1;
+    KJ_REQUIRE(bindingIndex < bindings.size(), "invalid logical service channel");
+    const auto& binding = bindings[bindingIndex];
+    return newCompositeServiceChannel(
+        logicalServiceHost.addRef(), headerTable, kj::str(binding.name), binding.kind);
   }
   kj::Own<ActorClassChannel> getActorClassResolved(
       uint, kj::Maybe<Frankenvalue>, Persistent) override {
@@ -580,6 +608,9 @@ class ChannelFactory final: public IoChannelFactory {
  private:
   TimerChannel& timer;
   kj::Rc<FetchBroker> fetchBroker;
+  kj::Rc<LogicalServiceHostChannel> logicalServiceHost;
+  kj::HttpHeaderTable& headerTable;
+  kj::Array<Binding> bindings;
   kj::Rc<uint64_t> nextRequestId;
 };
 
@@ -648,18 +679,23 @@ server::config::Worker::Reader buildConfig(
     const auto& input = bundle.modules[i];
     auto output = modules[i];
     output.setName(input.name);
+    auto sourceChars = input.source.asChars();
+    auto sourceText = kj::str(sourceChars);
     switch (input.type) {
       case ModuleType::ES_MODULE:
-        output.setEsModule(input.source);
+        output.setEsModule(sourceText);
         break;
       case ModuleType::COMMON_JS_MODULE:
         output.setCommonJsModule(rewriteCommonJsRequires(bundle, input));
         break;
       case ModuleType::TEXT:
-        output.setText(input.source);
+        output.setText(sourceText);
         break;
       case ModuleType::JSON:
-        output.setJson(input.source);
+        output.setJson(sourceText);
+        break;
+      case ModuleType::WASM:
+        output.setWasm(input.source);
         break;
     }
   }
@@ -703,10 +739,26 @@ kj::Own<VirtualFileSystem> buildFileSystem(const WorkerBundle& bundle) {
   return newVirtualFileSystem(kj::mv(fsMap), root.finish());
 }
 
+kj::Array<server::WorkerdApi::Global> buildGlobals(const WorkerBundle& bundle) {
+  return KJ_MAP(index, kj::indices(bundle.bindings)) {
+    return server::WorkerdApi::Global{
+      .name = kj::str(bundle.bindings[index].name),
+      .value =
+          server::WorkerdApi::Global::Fetcher{
+            .channel = static_cast<uint>(index + 1),
+            .requiresHost = false,
+            .isInHouse = true,
+          },
+    };
+  };
+}
+
 }  // namespace
 
 struct SandboxRuntime::Impl {
-  Impl(const WorkerBundle& bundle, kj::Rc<FetchBroker> fetchBroker)
+  Impl(const WorkerBundle& bundle,
+      kj::Rc<FetchBroker> fetchBroker,
+      kj::Rc<LogicalServiceHostChannel> logicalServiceHost)
       : errorReporter(kj::heap<ErrorReporter>()),
         config(buildConfig(configArena, bundle)),
         compatibilityFlags(buildCompatibilityFlags(compatibilityArena, bundle, *errorReporter)),
@@ -755,14 +807,23 @@ struct SandboxRuntime::Impl {
             kj::none)),
         worker(kj::atomicRefcounted<Worker>(kj::atomicAddRef(*script),
             kj::atomicRefcounted<WorkerObserver>(),
-            [](jsg::Lock&, const Worker::Api&, v8::Local<v8::Object>, v8::Local<v8::Object>) {},
+            [globals = buildGlobals(bundle)](jsg::Lock& lock,
+                const Worker::Api& api,
+                v8::Local<v8::Object> target,
+                v8::Local<v8::Object>) {
+              server::WorkerdApi::from(api).compileGlobals(lock, globals, target, 1);
+            },
             IsolateObserver::StartType::COLD,
             SpanParent(nullptr),
             Worker::LockType(Worker::Lock::TakeSynchronously(kj::none)))),
         errorHandler(kj::heap<TaskErrorHandler>()),
         waitUntilTasks(*errorHandler),
         headerTable(headerTableBuilder.build()),
-        channelFactory(kj::rc<ChannelFactory>(*timerChannel, kj::mv(fetchBroker))) {}
+        channelFactory(kj::rc<ChannelFactory>(*timerChannel,
+            kj::mv(fetchBroker),
+            kj::mv(logicalServiceHost),
+            *headerTable,
+            bundle.bindings)) {}
 
   Response runRequest(kj::HttpMethod method,
       kj::StringPtr url,
@@ -792,6 +853,71 @@ struct SandboxRuntime::Impl {
     };
   }
 
+  ScheduledResponse runScheduled(kj::Date scheduledTime, kj::StringPtr cron) {
+    auto context = kj::refcounted<IoContext>(
+        threadContext, kj::atomicAddRef(*worker), kj::none, kj::heap<LimitEnforcerImpl>());
+    auto incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::addRef(*context),
+        channelFactory.addRef(), kj::refcounted<RequestObserver>(), kj::none, kj::none);
+    incomingRequest->delivered();
+    auto& requestContext = incomingRequest->getContext();
+    requestContext.addWaitUntil(requestContext.run([scheduledTime, cron](Worker::Lock& lock) {
+      lock.getGlobalScope().startScheduled(
+          scheduledTime, cron, lock, lock.getExportedHandler(kj::none, kj::none, {}, kj::none));
+    }));
+    auto result = incomingRequest->finishScheduled(kj::mv(incomingRequest)).wait(io.waitScope);
+    return {
+      .retry = result.retry,
+      .outcome = result.outcome,
+    };
+  }
+
+  QueueResponse runQueue(QueueRequest request) {
+    auto messages = KJ_MAP(message, request.messages) {
+      return api::IncomingQueueMessage{
+        .id = kj::mv(message.id),
+        .timestamp = message.timestamp,
+        .body = kj::mv(message.body),
+        .contentType = kj::mv(message.contentType),
+        .attempts = message.attempts,
+      };
+    };
+    auto event = kj::refcounted<api::QueueCustomEvent>(api::QueueEvent::Params{
+      .queueName = kj::mv(request.queueName),
+      .messages = kj::mv(messages),
+      .metadata =
+          api::MessageBatchMetadata{
+            .metrics =
+                api::MessageBatchMetrics{
+                  .backlogCount = request.backlogCount,
+                  .backlogBytes = request.backlogBytes,
+                  .oldestMessageTimestamp = request.oldestMessageTimestamp,
+                },
+          },
+    });
+    auto eventResult = kj::addRef(*event);
+    auto context = kj::refcounted<IoContext>(
+        threadContext, kj::atomicAddRef(*worker), kj::none, kj::heap<LimitEnforcerImpl>());
+    auto incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::addRef(*context),
+        channelFactory.addRef(), kj::refcounted<RequestObserver>(), kj::none, kj::none);
+    auto result = event->run(kj::mv(incomingRequest), kj::none, kj::none, {}, waitUntilTasks, false)
+                      .wait(io.waitScope);
+    auto retryBatch = eventResult->getRetryBatch();
+    return {
+      .outcome = result.outcome,
+      .ackAll = eventResult->getAckAll(),
+      .retryBatch = retryBatch.retry,
+      .retryBatchDelaySeconds = retryBatch.delaySeconds,
+      .explicitAcks = eventResult->getExplicitAcks(),
+      .retryMessages =
+          KJ_MAP(retry, eventResult->getRetryMessages()) {
+      return QueueRetry{
+        .messageId = kj::mv(retry.msgId),
+        .delaySeconds = retry.delaySeconds,
+      };
+    },
+    };
+  }
+
   kj::Own<Worker::ValidationErrorReporter> errorReporter;
   capnp::MallocMessageBuilder configArena;
   server::config::Worker::Reader config;
@@ -818,7 +944,11 @@ struct SandboxRuntime::Impl {
 };
 
 SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle, kj::Rc<FetchBroker> fetchBroker)
-    : impl(kj::heap<Impl>(bundle, kj::mv(fetchBroker))) {}
+    : SandboxRuntime(bundle, kj::mv(fetchBroker), newHyperlightLogicalServiceHostChannel()) {}
+SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle,
+    kj::Rc<FetchBroker> fetchBroker,
+    kj::Rc<LogicalServiceHostChannel> logicalServiceHost)
+    : impl(kj::heap<Impl>(bundle, kj::mv(fetchBroker), kj::mv(logicalServiceHost))) {}
 SandboxRuntime::~SandboxRuntime() noexcept(false) {}
 
 Response SandboxRuntime::runRequest(kj::HttpMethod method,
@@ -826,6 +956,14 @@ Response SandboxRuntime::runRequest(kj::HttpMethod method,
     kj::ArrayPtr<const Header> headers,
     kj::StringPtr body) {
   return impl->runRequest(method, url, headers, body);
+}
+
+ScheduledResponse SandboxRuntime::runScheduled(kj::Date scheduledTime, kj::StringPtr cron) {
+  return impl->runScheduled(scheduledTime, cron);
+}
+
+QueueResponse SandboxRuntime::runQueue(QueueRequest request) {
+  return impl->runQueue(kj::mv(request));
 }
 
 kj::Rc<TimerHostChannel> newHyperlightTimerHostChannel() {

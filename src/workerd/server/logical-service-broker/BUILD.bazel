@@ -5,10 +5,12 @@ load("//:build/wd_cc_library.bzl", "wd_cc_library")
 wd_cc_library(
     name = "logical-service-broker",
     srcs = [
+        "composite-data-router.c++",
         "logical-service-broker.c++",
         "logical-service-dispatcher.c++",
     ],
     hdrs = [
+        "composite-data-router.h",
         "logical-service-broker.h",
         "logical-service-dispatcher.h",
     ],

@@ -32,6 +32,7 @@ syn = { version = "2", features = ["full"] }
 ada-url = { version = "4", default-features = false, features = ["std"] }
 anyhow = "1"
 async-trait = { version = "0", default-features = false }
+base64 = "0.22"
 bytes = { version = "1", default-features = false }
 capnp = "0.27"
 capnpc = "0.27"

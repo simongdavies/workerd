@@ -2,6 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
+#include "composite-data-router.h"
 #include "logical-service-broker.h"
 #include "logical-service-dispatcher.h"
 #include "src/workerd/server/logical-service-broker/audit.embed.h"
@@ -14,6 +15,8 @@
 
 namespace workerd::server::logical_service_broker {
 namespace {
+
+namespace composite_v2 = composite;
 
 kj::String fixtureContent(kj::StringPtr fixture) {
   if (fixture.endsWith("\r\n"_kj)) return kj::str(fixture.slice(0, fixture.size() - 2));
@@ -222,6 +225,37 @@ KJ_TEST("logical service parser rejects operation payload confusion") {
               "\"operation\":\"identity.get\",\"target\":\"claims\",\"value_base64\":null,"
               "\"attributes\":[],\"limit\":null,\"cursor\":null,\"expiration_unix_ms\":null}");
   KJ_EXPECT_THROW_MESSAGE("invalid logical identity request shape", parseRequest(input));
+}
+
+KJ_TEST("composite router v2 parses the canonical envelope discriminator") {
+  auto input =
+      R"JSON({"version":2,"request_id":"req-1","binding":"example","operation":{"kind":"kv_get"}})JSON"_kj;
+  auto request = composite_v2::parseRequestEnvelope(input);
+  KJ_EXPECT(request.requestId == "req-1"_kj);
+  KJ_EXPECT(request.binding == "example"_kj);
+  KJ_EXPECT(request.operation == composite_v2::OperationKind::KV_GET);
+  KJ_EXPECT(composite_v2::bindingKindFor(request.operation) == composite_v2::BindingKind::KV);
+}
+
+KJ_TEST("composite router v2 rejects unknown operations before adapter dispatch") {
+  auto input =
+      R"JSON({"version":2,"request_id":"req-1","binding":"example","operation":{"kind":"kv_read"}})JSON"_kj;
+  KJ_EXPECT_THROW_MESSAGE(
+      "unknown composite operation kind", composite_v2::parseRequestEnvelope(input));
+}
+
+KJ_TEST("composite router v2 enforces canonical envelope field order") {
+  auto input =
+      R"JSON({"request_id":"req-1","version":2,"binding":"example","operation":{"kind":"kv_get"}})JSON"_kj;
+  KJ_EXPECT_THROW_MESSAGE("noncanonical composite router request field order",
+      composite_v2::parseRequestEnvelope(input));
+}
+
+KJ_TEST("composite router v2 serializes the canonical common rejection") {
+  auto rejection = composite_v2::serializeRejection(
+      "req-1"_kj, composite_v2::ResponseStatus::INVALID_REQUEST, "invalid_operation"_kj);
+  KJ_EXPECT(rejection ==
+      R"JSON({"version":2,"request_id":"req-1","status":"invalid_request","code":"invalid_operation"})JSON"_kj);
 }
 
 KJ_TEST("failed logical service responses cannot expose host details") {

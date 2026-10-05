@@ -3,6 +3,7 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 #include "hyperlight-driver.h"
+#include "sandbox-logical-service.h"
 #include "sandbox-runtime.h"
 #include "src/workerd/server/helloworld_worker.embed.h"
 #include "src/workerd/server/streams_util.embed.h"
@@ -11,6 +12,7 @@
 #include "src/workerd/server/wintertc_smoke.embed.h"
 
 #include <workerd/io/compatibility-date.h>
+#include <workerd/rust/sandbox-executor/lib.rs.h>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -19,10 +21,13 @@
 #include <capnp/message.h>
 #include <kj/encoding.h>
 
+#include <cmath>
 #include <cstdio>
 
 namespace workerd::server::sandbox_executor {
 namespace {
+
+namespace composite = logical_service_broker::composite;
 
 constexpr size_t MAX_ENVELOPE_BYTES = 60 * 1024;
 constexpr size_t MAX_BODY_BYTES = 32 * 1024;
@@ -41,9 +46,15 @@ constexpr size_t MAX_MODULE_SOURCE_BYTES = 32 * 1024;
 constexpr size_t MAX_MODULE_SOURCES_BYTES = 48 * 1024;
 constexpr size_t MAX_STORAGE_MOUNTS = 8;
 constexpr size_t MAX_STORAGE_NAME_BYTES = 64;
+constexpr size_t MAX_BINDINGS = 64;
+constexpr size_t MAX_CRON_BYTES = 256;
+constexpr size_t MAX_QUEUE_NAME_BYTES = 128;
+constexpr size_t MAX_QUEUE_MESSAGES = 100;
 constexpr size_t MAX_HOST_CALL_CHUNK_BYTES = 60 * 1024;
 constexpr uint64_t MAX_HOST_OPERATION_ID = 9'007'199'254'740'991;
 constexpr kj::Duration FETCH_POLL_INTERVAL = 1 * kj::MILLISECONDS;
+
+namespace rust_protocol = workerd::rust::sandbox_executor;
 
 struct Request {
   kj::String requestId;
@@ -51,6 +62,17 @@ struct Request {
   kj::String url;
   kj::Array<Header> headers;
   kj::String body;
+};
+
+struct ScheduledRequest {
+  kj::String requestId;
+  kj::Date scheduledTime;
+  kj::String cron;
+};
+
+struct ParsedQueueRequest {
+  kj::String requestId;
+  QueueRequest request;
 };
 
 bool validIdentifier(kj::StringPtr value, size_t limit) {
@@ -102,38 +124,6 @@ bool validModuleName(kj::StringPtr value) {
   return true;
 }
 
-bool validStorageName(kj::StringPtr value) {
-  if (value.size() == 0 || value.size() > MAX_STORAGE_NAME_BYTES) return false;
-  for (char c: value) {
-    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
-  }
-  return value != "."_kj && value != ".."_kj;
-}
-
-StorageMode parseStorageMode(kj::StringPtr value) {
-  if (value == "ro"_kj) return StorageMode::READ_ONLY;
-  if (value == "rw"_kj) return StorageMode::READ_WRITE;
-  KJ_FAIL_REQUIRE("unsupported storage mode");
-}
-
-kj::StringPtr storageModeName(StorageMode mode) {
-  switch (mode) {
-    case StorageMode::READ_ONLY:
-      return "ro"_kj;
-    case StorageMode::READ_WRITE:
-      return "rw"_kj;
-  }
-  KJ_UNREACHABLE;
-}
-
-ModuleType parseModuleType(kj::StringPtr value) {
-  if (value == "esModule"_kj) return ModuleType::ES_MODULE;
-  if (value == "commonJsModule"_kj) return ModuleType::COMMON_JS_MODULE;
-  if (value == "text"_kj) return ModuleType::TEXT;
-  if (value == "json"_kj) return ModuleType::JSON;
-  KJ_FAIL_REQUIRE("unsupported module type");
-}
-
 kj::StringPtr moduleTypeName(ModuleType type) {
   switch (type) {
     case ModuleType::ES_MODULE:
@@ -144,6 +134,8 @@ kj::StringPtr moduleTypeName(ModuleType type) {
       return "text"_kj;
     case ModuleType::JSON:
       return "json"_kj;
+    case ModuleType::WASM:
+      KJ_FAIL_REQUIRE("module type is not supported by the legacy protocol");
   }
   KJ_UNREACHABLE;
 }
@@ -194,7 +186,7 @@ kj::String copyBytes(kj::ArrayPtr<const byte> bytes) {
   return kj::String(kj::mv(result));
 }
 
-Request parseRequest(kj::ArrayPtr<const char> input) {
+Request parseRequestLegacy(kj::ArrayPtr<const char> input) {
   KJ_REQUIRE(input.size() <= MAX_ENVELOPE_BYTES, "request envelope exceeds limit");
   capnp::JsonCodec codec;
   capnp::MallocMessageBuilder message;
@@ -288,7 +280,340 @@ Request parseRequest(kj::ArrayPtr<const char> input) {
   };
 }
 
-WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
+ScheduledRequest parseScheduledRequest(kj::ArrayPtr<const char> input) {
+  KJ_REQUIRE(input.size() <= MAX_ENVELOPE_BYTES, "scheduled envelope exceeds limit");
+  capnp::JsonCodec codec;
+  capnp::MallocMessageBuilder message;
+  auto root = message.initRoot<capnp::JsonValue>();
+  codec.decodeRaw(input, root);
+  KJ_REQUIRE(root.isObject(), "scheduled envelope must be an object");
+  auto fields = root.getObject();
+  KJ_REQUIRE(fields.size() == 4, "invalid scheduled field count");
+  KJ_REQUIRE(fields[0].getName() == "protocol_version"_kj && fields[0].getValue().isNumber() &&
+          fields[0].getValue().getNumber() == 1,
+      "invalid scheduled protocol version");
+  KJ_REQUIRE(fields[1].getName() == "request_id"_kj && fields[1].getValue().isString(),
+      "invalid scheduled request ID");
+  KJ_REQUIRE(fields[2].getName() == "scheduled_time_unix_ms"_kj && fields[2].getValue().isNumber(),
+      "invalid scheduled time");
+  KJ_REQUIRE(fields[3].getName() == "cron"_kj && fields[3].getValue().isString(),
+      "invalid scheduled cron");
+
+  auto requestId = kj::str(fields[1].getValue().getString());
+  KJ_REQUIRE(validIdentifier(requestId, MAX_REQUEST_ID_BYTES), "invalid scheduled request ID");
+  auto rawTime = fields[2].getValue().getNumber();
+  KJ_REQUIRE(rawTime >= 0 && rawTime <= static_cast<double>(MAX_HOST_OPERATION_ID) &&
+          std::floor(rawTime) == rawTime,
+      "invalid scheduled time");
+  auto cron = kj::str(fields[3].getValue().getString());
+  KJ_REQUIRE(cron.size() > 0 && cron.size() <= MAX_CRON_BYTES, "invalid scheduled cron");
+  for (char c: cron) {
+    KJ_REQUIRE(static_cast<unsigned char>(c) >= 0x20 && c != 0x7f, "invalid scheduled cron");
+  }
+
+  return ScheduledRequest{
+    .requestId = kj::mv(requestId),
+    .scheduledTime = kj::UNIX_EPOCH + static_cast<int64_t>(rawTime) * kj::MILLISECONDS,
+    .cron = kj::mv(cron),
+  };
+}
+
+ParsedQueueRequest parseQueueRequest(kj::ArrayPtr<const char> input) {
+  KJ_REQUIRE(input.size() <= MAX_ENVELOPE_BYTES, "queue envelope exceeds limit");
+  capnp::JsonCodec codec;
+  capnp::MallocMessageBuilder message;
+  auto root = message.initRoot<capnp::JsonValue>();
+  codec.decodeRaw(input, root);
+  KJ_REQUIRE(root.isObject(), "queue envelope must be an object");
+  auto fields = root.getObject();
+  KJ_REQUIRE(fields.size() == 5, "invalid queue field count");
+  KJ_REQUIRE(fields[0].getName() == "protocol_version"_kj && fields[0].getValue().isNumber() &&
+          fields[0].getValue().getNumber() == 1,
+      "invalid queue protocol version");
+  KJ_REQUIRE(fields[1].getName() == "request_id"_kj && fields[1].getValue().isString(),
+      "invalid queue request ID");
+  KJ_REQUIRE(
+      fields[2].getName() == "queue"_kj && fields[2].getValue().isString(), "invalid queue name");
+  KJ_REQUIRE(fields[3].getName() == "messages"_kj && fields[3].getValue().isArray(),
+      "invalid queue messages");
+  KJ_REQUIRE(fields[4].getName() == "metadata"_kj && fields[4].getValue().isObject(),
+      "invalid queue metadata");
+
+  auto requestId = kj::str(fields[1].getValue().getString());
+  KJ_REQUIRE(validIdentifier(requestId, MAX_REQUEST_ID_BYTES), "invalid queue request ID");
+  auto queueName = kj::str(fields[2].getValue().getString());
+  KJ_REQUIRE(validIdentifier(queueName, MAX_QUEUE_NAME_BYTES), "invalid queue name");
+
+  auto messageValues = fields[3].getValue().getArray();
+  KJ_REQUIRE(messageValues.size() > 0 && messageValues.size() <= MAX_QUEUE_MESSAGES,
+      "invalid queue batch");
+  auto messages = kj::heapArrayBuilder<QueueMessage>(messageValues.size());
+  size_t aggregateBodyBytes = 0;
+  kj::Maybe<kj::StringPtr> previousMessageId;
+  for (auto value: messageValues) {
+    KJ_REQUIRE(value.isObject(), "invalid queue message");
+    auto messageFields = value.getObject();
+    KJ_REQUIRE(messageFields.size() == 5 && messageFields[0].getName() == "id"_kj &&
+            messageFields[1].getName() == "timestamp_unix_ms"_kj &&
+            messageFields[2].getName() == "body_base64"_kj &&
+            messageFields[3].getName() == "content_type"_kj &&
+            messageFields[4].getName() == "attempts"_kj,
+        "noncanonical queue message");
+    KJ_REQUIRE(messageFields[0].getValue().isString() && messageFields[1].getValue().isNumber() &&
+            messageFields[2].getValue().isString() &&
+            (messageFields[3].getValue().isNull() || messageFields[3].getValue().isString()) &&
+            messageFields[4].getValue().isNumber(),
+        "invalid queue message field type");
+
+    auto id = kj::str(messageFields[0].getValue().getString());
+    KJ_REQUIRE(validIdentifier(id, MAX_REQUEST_ID_BYTES), "invalid queue message ID");
+    KJ_IF_SOME(previous, previousMessageId) {
+      KJ_REQUIRE(
+          lexicographicallyBefore(previous, id), "queue message IDs must be sorted and unique");
+    }
+    previousMessageId = id;
+    auto rawTimestamp = messageFields[1].getValue().getNumber();
+    KJ_REQUIRE(rawTimestamp >= 0 && rawTimestamp <= static_cast<double>(MAX_HOST_OPERATION_ID) &&
+            std::floor(rawTimestamp) == rawTimestamp,
+        "invalid queue message timestamp");
+    auto encodedBody = kj::str(messageFields[2].getValue().getString());
+    auto decodedBody = kj::decodeBase64(encodedBody);
+    KJ_REQUIRE(!decodedBody.hadErrors, "invalid queue message body");
+    aggregateBodyBytes += decodedBody.size();
+    KJ_REQUIRE(aggregateBodyBytes <= MAX_BODY_BYTES, "queue batch body exceeds limit");
+    kj::Maybe<kj::String> contentType;
+    if (messageFields[3].getValue().isString()) {
+      auto value = kj::str(messageFields[3].getValue().getString());
+      KJ_REQUIRE(
+          value == "text"_kj || value == "bytes"_kj || value == "json"_kj || value == "v8"_kj,
+          "invalid queue message content type");
+      contentType = kj::mv(value);
+    }
+    auto rawAttempts = messageFields[4].getValue().getNumber();
+    KJ_REQUIRE(rawAttempts >= 0 && rawAttempts <= static_cast<uint16_t>(kj::maxValue) &&
+            std::floor(rawAttempts) == rawAttempts,
+        "invalid queue message attempts");
+    messages.add(QueueMessage{
+      .id = kj::mv(id),
+      .timestamp = kj::UNIX_EPOCH + static_cast<int64_t>(rawTimestamp) * kj::MILLISECONDS,
+      .body = kj::heapArray<kj::byte>(decodedBody.asBytes()),
+      .contentType = kj::mv(contentType),
+      .attempts = static_cast<uint16_t>(rawAttempts),
+    });
+  }
+
+  auto metadataFields = fields[4].getValue().getObject();
+  KJ_REQUIRE(metadataFields.size() == 3 && metadataFields[0].getName() == "backlog_count"_kj &&
+          metadataFields[1].getName() == "backlog_bytes"_kj &&
+          metadataFields[2].getName() == "oldest_message_timestamp_unix_ms"_kj &&
+          metadataFields[0].getValue().isNumber() && metadataFields[1].getValue().isNumber() &&
+          (metadataFields[2].getValue().isNull() || metadataFields[2].getValue().isNumber()),
+      "invalid queue metadata");
+  auto backlogCount = metadataFields[0].getValue().getNumber();
+  auto backlogBytes = metadataFields[1].getValue().getNumber();
+  KJ_REQUIRE(std::isfinite(backlogCount) && backlogCount >= 0, "invalid queue backlog count");
+  KJ_REQUIRE(std::isfinite(backlogBytes) && backlogBytes >= 0, "invalid queue backlog bytes");
+  kj::Maybe<kj::Date> oldestMessageTimestamp;
+  if (metadataFields[2].getValue().isNumber()) {
+    auto rawTimestamp = metadataFields[2].getValue().getNumber();
+    KJ_REQUIRE(rawTimestamp >= 0 && rawTimestamp <= static_cast<double>(MAX_HOST_OPERATION_ID) &&
+            std::floor(rawTimestamp) == rawTimestamp,
+        "invalid oldest queue message timestamp");
+    oldestMessageTimestamp = kj::UNIX_EPOCH + static_cast<int64_t>(rawTimestamp) * kj::MILLISECONDS;
+  }
+
+  return {
+    .requestId = kj::mv(requestId),
+    .request =
+        QueueRequest{
+          .queueName = kj::mv(queueName),
+          .messages = messages.finish(),
+          .backlogCount = backlogCount,
+          .backlogBytes = backlogBytes,
+          .oldestMessageTimestamp = oldestMessageTimestamp,
+        },
+  };
+}
+
+kj::String copyRustString(const ::rust::String& value) {
+  auto result = kj::heapArray<char>(value.size() + 1);
+  memcpy(result.begin(), value.data(), value.size());
+  result[value.size()] = '\0';
+  return kj::String(kj::mv(result));
+}
+
+kj::Array<byte> copyRustBytes(const ::rust::Vec<uint8_t>& value) {
+  auto result = kj::heapArray<byte>(value.size());
+  memcpy(result.begin(), value.data(), value.size());
+  return result;
+}
+
+kj::Array<byte> copyModuleBytes(kj::StringPtr value) {
+  auto result = kj::heapArray<byte>(value.size());
+  memcpy(result.begin(), value.begin(), value.size());
+  return result;
+}
+
+::rust::Vec<uint8_t> copyToRustBytes(kj::ArrayPtr<const byte> value) {
+  ::rust::Vec<uint8_t> result;
+  result.reserve(value.size());
+  for (auto byte: value) {
+    result.push_back(byte);
+  }
+  return result;
+}
+
+kj::HttpMethod convertMethod(rust_protocol::Method method) {
+  switch (method) {
+    case rust_protocol::Method::Get:
+      return kj::HttpMethod::GET;
+    case rust_protocol::Method::Head:
+      return kj::HttpMethod::HEAD;
+    case rust_protocol::Method::Post:
+      return kj::HttpMethod::POST;
+    case rust_protocol::Method::Put:
+      return kj::HttpMethod::PUT;
+    case rust_protocol::Method::Delete:
+      return kj::HttpMethod::DELETE;
+    case rust_protocol::Method::Patch:
+      return kj::HttpMethod::PATCH;
+    case rust_protocol::Method::Options:
+      return kj::HttpMethod::OPTIONS;
+    case rust_protocol::Method::Trace:
+      return kj::HttpMethod::TRACE;
+    case rust_protocol::Method::Purge:
+      return kj::HttpMethod::PURGE;
+    default:
+      KJ_FAIL_REQUIRE("invalid Rust request method");
+  }
+}
+
+bool validStorageName(kj::StringPtr value) {
+  if (value.size() == 0 || value.size() > MAX_STORAGE_NAME_BYTES) return false;
+  for (char c: value) {
+    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return false;
+  }
+  return value != "."_kj && value != ".."_kj;
+}
+
+StorageMode parseStorageMode(kj::StringPtr value) {
+  if (value == "ro"_kj) return StorageMode::READ_ONLY;
+  if (value == "rw"_kj) return StorageMode::READ_WRITE;
+  KJ_FAIL_REQUIRE("unsupported storage mode");
+}
+
+kj::StringPtr storageModeName(StorageMode mode) {
+  switch (mode) {
+    case StorageMode::READ_ONLY:
+      return "ro"_kj;
+    case StorageMode::READ_WRITE:
+      return "rw"_kj;
+  }
+  KJ_UNREACHABLE;
+}
+
+ModuleType parseModuleType(kj::StringPtr value) {
+  if (value == "esModule"_kj) return ModuleType::ES_MODULE;
+  if (value == "commonJsModule"_kj) return ModuleType::COMMON_JS_MODULE;
+  if (value == "text"_kj) return ModuleType::TEXT;
+  if (value == "json"_kj) return ModuleType::JSON;
+  KJ_FAIL_REQUIRE("unsupported module type");
+}
+
+ModuleType convertModuleType(rust_protocol::ModuleType type) {
+  switch (type) {
+    case rust_protocol::ModuleType::EsModule:
+      return ModuleType::ES_MODULE;
+    case rust_protocol::ModuleType::Text:
+      return ModuleType::TEXT;
+    case rust_protocol::ModuleType::Json:
+      return ModuleType::JSON;
+    case rust_protocol::ModuleType::Wasm:
+      return ModuleType::WASM;
+    default:
+      KJ_FAIL_REQUIRE("invalid Rust module type");
+  }
+}
+
+rust_protocol::ModuleType convertModuleType(ModuleType type) {
+  switch (type) {
+    case ModuleType::COMMON_JS_MODULE:
+      KJ_FAIL_REQUIRE("module type is not supported by the Rust protocol");
+    case ModuleType::ES_MODULE:
+      return rust_protocol::ModuleType::EsModule;
+    case ModuleType::TEXT:
+      return rust_protocol::ModuleType::Text;
+    case ModuleType::JSON:
+      return rust_protocol::ModuleType::Json;
+    case ModuleType::WASM:
+      return rust_protocol::ModuleType::Wasm;
+  }
+  KJ_UNREACHABLE;
+}
+
+WorkerBundle convertBundle(rust_protocol::InitBundle input) {
+  auto flags = kj::heapArrayBuilder<kj::String>(input.compatibility_flags.size());
+  for (const auto& flag: input.compatibility_flags) {
+    flags.add(copyRustString(flag));
+  }
+  auto modules = kj::heapArrayBuilder<Module>(input.modules.size());
+  for (const auto& module: input.modules) {
+    modules.add(Module{copyRustString(module.name), convertModuleType(module.module_type),
+      copyRustBytes(module.source)});
+  }
+  return WorkerBundle{copyRustString(input.worker_version),
+    copyRustString(input.compatibility_date), flags.finish(), copyRustString(input.main_module),
+    modules.finish()};
+}
+
+rust_protocol::InitBundle convertBundle(const WorkerBundle& input) {
+  rust_protocol::InitBundle result;
+  result.worker_version = ::rust::String(input.workerVersion.begin(), input.workerVersion.size());
+  result.compatibility_date =
+      ::rust::String(input.compatibilityDate.begin(), input.compatibilityDate.size());
+  for (const auto& flag: input.compatibilityFlags) {
+    result.compatibility_flags.push_back(::rust::String(flag.begin(), flag.size()));
+  }
+  result.main_module = ::rust::String(input.mainModule.begin(), input.mainModule.size());
+  for (const auto& module: input.modules) {
+    result.modules.push_back(rust_protocol::Module{
+      ::rust::String(module.name.begin(), module.name.size()),
+      convertModuleType(module.type),
+      copyToRustBytes(module.source),
+    });
+  }
+  return result;
+}
+
+Request convertRequest(rust_protocol::Request input) {
+  auto headers = kj::heapArrayBuilder<Header>(input.headers.size());
+  for (const auto& header: input.headers) {
+    headers.add(Header{copyRustString(header.name), copyRustString(header.value)});
+  }
+  return Request{copyRustString(input.request_id), convertMethod(input.method),
+    copyRustString(input.url), headers.finish(), copyBytes(copyRustBytes(input.body))};
+}
+
+rust_protocol::Response convertResponse(Response input) {
+  rust_protocol::Response result;
+  KJ_REQUIRE(input.statusCode <= kj::maxValueForBits<16>(), "invalid response status");
+  result.status_code = static_cast<uint16_t>(input.statusCode);
+  for (const auto& header: input.headers) {
+    result.headers.push_back(rust_protocol::Header{
+      ::rust::String(header.name.begin(), header.name.size()),
+      ::rust::String(header.value.begin(), header.value.size()),
+    });
+  }
+  result.body = copyToRustBytes(input.body.asBytes());
+  return result;
+}
+
+::rust::Slice<const uint8_t> asRustBytes(kj::ArrayPtr<const char> value) {
+  return ::rust::Slice<const uint8_t>(
+      reinterpret_cast<const uint8_t*>(value.begin()), value.size());
+}
+
+WorkerBundle parseWorkerBundleLegacy(kj::ArrayPtr<const char> input) {
   KJ_REQUIRE(input.size() <= MAX_ENVELOPE_BYTES, "init envelope exceeds limit");
   capnp::JsonCodec codec;
   capnp::MallocMessageBuilder message;
@@ -296,14 +621,15 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
   codec.decodeRaw(input, root);
   KJ_REQUIRE(root.isObject(), "init envelope must be an object");
   auto fields = root.getObject();
-  KJ_REQUIRE(fields.size() == 6 || fields.size() == 7, "invalid init field count");
+  KJ_REQUIRE(
+      fields.size() == 6 || fields.size() == 7 || fields.size() == 8, "invalid init field count");
   KJ_REQUIRE(fields[0].getName() == "protocol_version"_kj && fields[0].getValue().isNumber(),
       "invalid init protocol version");
   auto rawProtocolVersion = fields[0].getValue().getNumber();
-  KJ_REQUIRE(rawProtocolVersion == 1 || rawProtocolVersion == 2, "invalid init protocol version");
+  KJ_REQUIRE(rawProtocolVersion == 1 || rawProtocolVersion == 2 || rawProtocolVersion == 3,
+      "invalid init protocol version");
   auto protocolVersion = static_cast<uint>(rawProtocolVersion);
-  KJ_REQUIRE(
-      fields.size() == (protocolVersion == 1 ? 6 : 7), "init fields do not match protocol version");
+  KJ_REQUIRE(fields.size() == protocolVersion + 5, "init fields do not match protocol version");
   static constexpr kj::StringPtr FIELD_NAMES[] = {
     "protocol_version"_kj,
     "worker_version"_kj,
@@ -312,6 +638,7 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
     "main_module"_kj,
     "modules"_kj,
     "storage"_kj,
+    "bindings"_kj,
   };
   for (auto i: kj::indices(fields)) {
     KJ_REQUIRE(fields[i].getName() == FIELD_NAMES[i], "noncanonical init field order");
@@ -389,11 +716,11 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
       }
       previousModule = name;
     }
-    moduleBuilder.add(Module{kj::mv(name), type, kj::mv(source)});
+    moduleBuilder.add(Module{kj::mv(name), type, copyModuleBytes(source)});
   }
 
   kj::Array<StorageMount> storageMounts;
-  if (protocolVersion == 2) {
+  if (protocolVersion >= 2) {
     KJ_REQUIRE(fields[6].getValue().isArray(), "invalid storage manifest");
     auto mountValues = fields[6].getValue().getArray();
     KJ_REQUIRE(mountValues.size() <= MAX_STORAGE_MOUNTS, "too many storage mounts");
@@ -421,6 +748,35 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
     storageMounts = mountBuilder.finish();
   }
 
+  kj::Array<Binding> bindings;
+  if (protocolVersion == 3) {
+    KJ_REQUIRE(fields[7].getValue().isArray(), "invalid binding manifest");
+    auto bindingValues = fields[7].getValue().getArray();
+    KJ_REQUIRE(bindingValues.size() <= MAX_BINDINGS, "too many bindings");
+    auto bindingBuilder = kj::heapArrayBuilder<Binding>(bindingValues.size());
+    kj::Maybe<kj::StringPtr> previousName;
+    for (auto value: bindingValues) {
+      KJ_REQUIRE(value.isObject(), "invalid binding manifest entry");
+      auto bindingFields = value.getObject();
+      KJ_REQUIRE(bindingFields.size() == 2 && bindingFields[0].getName() == "name"_kj &&
+              bindingFields[1].getName() == "kind"_kj && bindingFields[0].getValue().isString() &&
+              bindingFields[1].getValue().isString(),
+          "invalid binding manifest entry");
+      auto name = kj::str(bindingFields[0].getValue().getString());
+      KJ_REQUIRE(composite::isBindingName(name), "invalid binding name");
+      KJ_IF_SOME(previous, previousName) {
+        KJ_REQUIRE(lexicographicallyBefore(previous, name),
+            "binding names must be globally sorted and unique");
+      }
+      previousName = name;
+      bindingBuilder.add(Binding{
+        .name = kj::mv(name),
+        .kind = composite::parseBindingKind(bindingFields[1].getValue().getString()),
+      });
+    }
+    bindings = bindingBuilder.finish();
+  }
+
   return WorkerBundle{
     .workerVersion = kj::mv(workerVersion),
     .compatibilityDate = kj::mv(compatibilityDate),
@@ -429,7 +785,49 @@ WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
     .modules = moduleBuilder.finish(),
     .protocolVersion = protocolVersion,
     .storageMounts = kj::mv(storageMounts),
+    .bindings = kj::mv(bindings),
   };
+}
+
+kj::String copyProtocolOutput(::rust::Vec<uint8_t> value) {
+  return copyBytes(kj::arrayPtr(value.data(), value.size()));
+}
+
+bool usesRustProtocol(kj::ArrayPtr<const char> input) {
+  capnp::JsonCodec codec;
+  capnp::MallocMessageBuilder message;
+  auto root = message.initRoot<capnp::JsonValue>();
+  codec.decodeRaw(input, root);
+  if (!root.isObject()) return true;
+  for (auto field: root.getObject()) {
+    if (field.getName() == "protocol_version" && field.getValue().isNumber() &&
+        field.getValue().getNumber() != 1) {
+      return false;
+    }
+    if (field.getName() != "modules" || !field.getValue().isArray()) continue;
+    for (auto module: field.getValue().getArray()) {
+      if (!module.isObject()) continue;
+      for (auto moduleField: module.getObject()) {
+        if (moduleField.getName() == "type" && moduleField.getValue().isString() &&
+            moduleField.getValue().getString() == "commonJsModule"_kj) {
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+bool usesRustProtocol(const WorkerBundle& bundle) {
+  if (bundle.protocolVersion != 1 || bundle.storageMounts.size() != 0) return false;
+  for (const auto& module: bundle.modules) {
+    if (module.type == ModuleType::COMMON_JS_MODULE) return false;
+  }
+  return true;
+}
+
+WorkerBundle parseWorkerBundle(kj::ArrayPtr<const char> input) {
+  return parseWorkerBundleLegacy(input);
 }
 
 void appendJsonString(kj::Vector<char>& output, kj::StringPtr value) {
@@ -1472,7 +1870,7 @@ class StreamingV2FetchBroker final: public FetchBroker {
   size_t activeOperations = 0;
 };
 
-kj::String serializeWorkerBundle(const WorkerBundle& bundle) {
+kj::String serializeWorkerBundleLegacy(const WorkerBundle& bundle) {
   kj::Vector<char> output;
   output.addAll("{\"protocol_version\":"_kj);
   output.addAll(kj::str(bundle.protocolVersion));
@@ -1499,11 +1897,12 @@ kj::String serializeWorkerBundle(const WorkerBundle& bundle) {
     output.addAll(",\"type\":"_kj);
     appendJsonString(output, moduleTypeName(module.type));
     output.addAll(",\"source\":"_kj);
-    appendJsonString(output, module.source);
+    auto moduleSourceText = kj::str(module.source.asPtr().asChars());
+    appendJsonString(output, moduleSourceText);
     output.add('}');
   }
   output.add(']');
-  if (bundle.protocolVersion == 2) {
+  if (bundle.protocolVersion >= 2) {
     output.addAll(",\"storage\":["_kj);
     first = true;
     for (const auto& mount: bundle.storageMounts) {
@@ -1517,8 +1916,26 @@ kj::String serializeWorkerBundle(const WorkerBundle& bundle) {
     }
     output.add(']');
   } else {
-    KJ_REQUIRE(bundle.protocolVersion == 1 && bundle.storageMounts.size() == 0,
+    KJ_REQUIRE(bundle.protocolVersion == 1 && bundle.storageMounts.size() == 0 &&
+            bundle.bindings.size() == 0,
         "protocol v1 cannot contain storage mounts");
+  }
+  if (bundle.protocolVersion == 3) {
+    output.addAll(",\"bindings\":["_kj);
+    first = true;
+    for (const auto& binding: bundle.bindings) {
+      if (!first) output.add(',');
+      first = false;
+      output.addAll("{\"name\":"_kj);
+      appendJsonString(output, binding.name);
+      output.addAll(",\"kind\":"_kj);
+      appendJsonString(output, composite::bindingKindName(binding.kind));
+      output.add('}');
+    }
+    output.add(']');
+  } else {
+    KJ_REQUIRE(bundle.protocolVersion <= 2 && bundle.bindings.size() == 0,
+        "bindings require init protocol v3");
   }
   output.add('}');
   KJ_REQUIRE(output.size() <= MAX_ENVELOPE_BYTES, "init envelope exceeds limit");
@@ -1526,7 +1943,16 @@ kj::String serializeWorkerBundle(const WorkerBundle& bundle) {
   return kj::String(output.releaseAsArray());
 }
 
-kj::String serializeResponse(kj::StringPtr requestId, const Response& response) {
+kj::String serializeWorkerBundleRust(const WorkerBundle& bundle) {
+  return copyProtocolOutput(rust_protocol::serialize_init(convertBundle(bundle)));
+}
+
+kj::String serializeWorkerBundle(const WorkerBundle& bundle) {
+  if (usesRustProtocol(bundle)) return serializeWorkerBundleRust(bundle);
+  return serializeWorkerBundleLegacy(bundle);
+}
+
+kj::String serializeResponseLegacy(kj::StringPtr requestId, const Response& response) {
   KJ_REQUIRE(response.statusCode >= 100 && response.statusCode <= 599, "invalid response status");
   KJ_REQUIRE(response.headers.size() <= MAX_HEADERS, "too many response headers");
   KJ_REQUIRE(response.body.size() <= MAX_BODY_BYTES, "response body exceeds size limit");
@@ -1561,6 +1987,87 @@ kj::String serializeResponse(kj::StringPtr requestId, const Response& response) 
   return kj::String(output.releaseAsArray());
 }
 
+kj::String serializeResponse(kj::StringPtr requestId, Response response) {
+  return copyProtocolOutput(rust_protocol::serialize_response(
+      ::rust::Str(requestId.begin(), requestId.size()), convertResponse(kj::mv(response))));
+}
+
+kj::String serializeScheduledResponse(kj::StringPtr requestId, const ScheduledResponse& response) {
+  kj::Vector<char> output;
+  output.addAll("{\"protocol_version\":1,\"request_id\":"_kj);
+  appendJsonString(output, requestId);
+  output.addAll(",\"outcome\":"_kj);
+  appendJsonString(output, kj::str(response.outcome));
+  output.addAll(",\"retry\":"_kj);
+  output.addAll(response.retry ? "true}\n"_kj : "false}\n"_kj);
+  output.add('\0');
+  return kj::String(output.releaseAsArray());
+}
+
+void appendNullableDelay(kj::Vector<char>& output, const kj::Maybe<int>& delay) {
+  KJ_IF_SOME(value, delay) {
+    output.addAll(kj::str(value));
+  } else {
+    output.addAll("null"_kj);
+  }
+}
+
+kj::String serializeQueueResponse(kj::StringPtr requestId, QueueResponse response) {
+  for (size_t i = 0; i < response.explicitAcks.size(); ++i) {
+    for (size_t j = i + 1; j < response.explicitAcks.size(); ++j) {
+      if (lexicographicallyBefore(response.explicitAcks[j], response.explicitAcks[i])) {
+        auto temporary = kj::mv(response.explicitAcks[i]);
+        response.explicitAcks[i] = kj::mv(response.explicitAcks[j]);
+        response.explicitAcks[j] = kj::mv(temporary);
+      }
+    }
+  }
+  for (size_t i = 0; i < response.retryMessages.size(); ++i) {
+    for (size_t j = i + 1; j < response.retryMessages.size(); ++j) {
+      if (lexicographicallyBefore(
+              response.retryMessages[j].messageId, response.retryMessages[i].messageId)) {
+        auto temporary = kj::mv(response.retryMessages[i]);
+        response.retryMessages[i] = kj::mv(response.retryMessages[j]);
+        response.retryMessages[j] = kj::mv(temporary);
+      }
+    }
+  }
+
+  kj::Vector<char> output;
+  output.addAll("{\"protocol_version\":1,\"request_id\":"_kj);
+  appendJsonString(output, requestId);
+  output.addAll(",\"outcome\":"_kj);
+  appendJsonString(output, kj::str(response.outcome));
+  output.addAll(",\"ack_all\":"_kj);
+  output.addAll(response.ackAll ? "true"_kj : "false"_kj);
+  output.addAll(",\"retry_batch\":{\"retry\":"_kj);
+  output.addAll(response.retryBatch ? "true"_kj : "false"_kj);
+  output.addAll(",\"delay_seconds\":"_kj);
+  appendNullableDelay(output, response.retryBatchDelaySeconds);
+  output.addAll("},\"explicit_acks\":["_kj);
+  bool first = true;
+  for (const auto& messageId: response.explicitAcks) {
+    if (!first) output.add(',');
+    first = false;
+    appendJsonString(output, messageId);
+  }
+  output.addAll("],\"retry_messages\":["_kj);
+  first = true;
+  for (const auto& retry: response.retryMessages) {
+    if (!first) output.add(',');
+    first = false;
+    output.addAll("{\"id\":"_kj);
+    appendJsonString(output, retry.messageId);
+    output.addAll(",\"delay_seconds\":"_kj);
+    appendNullableDelay(output, retry.delaySeconds);
+    output.add('}');
+  }
+  output.addAll("]}\n"_kj);
+  KJ_REQUIRE(output.size() <= MAX_ENVELOPE_BYTES, "queue response exceeds limit");
+  output.add('\0');
+  return kj::String(output.releaseAsArray());
+}
+
 template <typename Write>
 int writeProtocolMessageWith(int fd, kj::ArrayPtr<const char> message, Write&& writeFunction) {
   if (message.size() < 2 || message.size() > MAX_ENVELOPE_BYTES + 1 ||
@@ -1580,37 +2087,81 @@ int writeProtocolMessage(int fd, kj::ArrayPtr<const char> message) {
 
 class Executor {
  public:
+  Executor(): logicalServiceHost(newHyperlightLogicalServiceHostChannel()) {}
+  explicit Executor(kj::Rc<LogicalServiceHostChannel> logicalServiceHost)
+      : logicalServiceHost(kj::mv(logicalServiceHost)) {}
+
   void initialize(kj::ArrayPtr<const char> initJson) {
     KJ_REQUIRE(runtime == kj::none, "executor already initialized");
-    auto bundle = parseWorkerBundle(initJson);
-    KJ_REQUIRE(serializeWorkerBundle(bundle) == initJson, "init envelope is not canonical JSON");
-    runtime = kj::heap<SandboxRuntime>(bundle, kj::rc<StreamingV2FetchBroker>());
-    workerVersion = kj::mv(bundle.workerVersion);
+    auto bundle = [&]() {
+      if (usesRustProtocol(initJson)) {
+        rustProtocol = true;
+        return convertBundle(protocol->initialize(asRustBytes(initJson)));
+      }
+      auto legacyBundle = parseWorkerBundleLegacy(initJson);
+      KJ_REQUIRE(serializeWorkerBundleLegacy(legacyBundle) == initJson,
+          "init envelope is not canonical JSON");
+      return legacyBundle;
+    }();
+    runtime = kj::heap<SandboxRuntime>(
+        bundle, kj::rc<StreamingV2FetchBroker>(), logicalServiceHost.addRef());
   }
 
   kj::String fetch(kj::ArrayPtr<const char> requestJson) {
     auto& worker = KJ_REQUIRE_NONNULL(runtime, "executor is not initialized");
-    auto request = parseRequest(requestJson);
+    if (!rustProtocol) {
+      auto request = parseRequestLegacy(requestJson);
+      try {
+        auto response =
+            worker->runRequest(request.method, request.url, request.headers, request.body);
+        return serializeResponseLegacy(request.requestId, response);
+      } catch (const kj::Exception& exception) {
+        kj::Vector<char> body;
+        body.addAll("{\"error\":\"worker_execution_failed\",\"exception\":"_kj);
+        appendJsonString(body, exception.getDescription());
+        body.add('}');
+        body.add('\0');
+        auto headers = kj::heapArray<Header>(1);
+        headers[0] = Header{kj::str("content-type"), kj::str("application/json")};
+        return serializeResponseLegacy(
+            request.requestId, Response{502, kj::mv(headers), kj::String(body.releaseAsArray())});
+      }
+    }
+
+    auto request = convertRequest(protocol->begin_request(asRustBytes(requestJson)));
     try {
       auto response =
           worker->runRequest(request.method, request.url, request.headers, request.body);
-      return serializeResponse(request.requestId, response);
+      return copyProtocolOutput(protocol->complete_response(
+          ::rust::Str(request.requestId.begin(), request.requestId.size()),
+          convertResponse(kj::mv(response))));
     } catch (const kj::Exception& exception) {
-      kj::Vector<char> body;
-      body.addAll("{\"error\":\"worker_execution_failed\",\"exception\":"_kj);
-      appendJsonString(body, exception.getDescription());
-      body.add('}');
-      body.add('\0');
-      auto headers = kj::heapArray<Header>(1);
-      headers[0] = Header{kj::str("content-type"), kj::str("application/json")};
-      return serializeResponse(
-          request.requestId, Response{502, kj::mv(headers), kj::String(body.releaseAsArray())});
+      auto description = exception.getDescription();
+      return copyProtocolOutput(protocol->complete_failure(
+          ::rust::Str(request.requestId.begin(), request.requestId.size()),
+          ::rust::Str(description.begin(), description.size())));
     }
   }
 
+  kj::String scheduled(kj::ArrayPtr<const char> requestJson) {
+    auto& worker = KJ_REQUIRE_NONNULL(runtime, "executor is not initialized");
+    auto request = parseScheduledRequest(requestJson);
+    auto response = worker->runScheduled(request.scheduledTime, request.cron);
+    return serializeScheduledResponse(request.requestId, response);
+  }
+
+  kj::String queue(kj::ArrayPtr<const char> requestJson) {
+    auto& worker = KJ_REQUIRE_NONNULL(runtime, "executor is not initialized");
+    auto request = parseQueueRequest(requestJson);
+    auto response = worker->runQueue(kj::mv(request.request));
+    return serializeQueueResponse(request.requestId, kj::mv(response));
+  }
+
  private:
+  ::rust::Box<rust_protocol::ProtocolState> protocol = rust_protocol::new_protocol_state();
+  kj::Rc<LogicalServiceHostChannel> logicalServiceHost;
   kj::Maybe<kj::Own<SandboxRuntime>> runtime;
-  kj::Maybe<kj::String> workerVersion;
+  bool rustProtocol = false;
 };
 
 Executor executor;
@@ -1624,6 +2175,14 @@ int dispatch(const uint8_t* call, size_t callLength) {
     }
     if (nameEquals(call, callLength, "fetch"_kj)) {
       auto response = executor.fetch(argument);
+      return writeProtocolMessage(protocolOutputFd, response.slice(0, response.size()));
+    }
+    if (nameEquals(call, callLength, "scheduled"_kj)) {
+      auto response = executor.scheduled(argument);
+      return writeProtocolMessage(protocolOutputFd, response.slice(0, response.size()));
+    }
+    if (nameEquals(call, callLength, "queue"_kj)) {
+      auto response = executor.queue(argument);
       return writeProtocolMessage(protocolOutputFd, response.slice(0, response.size()));
     }
     return -1;
@@ -2018,6 +2577,23 @@ class ControlledSelfTestTimer final: public TimerChannel {
   kj::Vector<kj::Own<kj::PromiseFulfiller<void>>> fulfillers;
 };
 
+class SelfTestLogicalServiceHost final: public LogicalServiceHostChannel {
+ public:
+  explicit SelfTestLogicalServiceHost(kj::String response): response(kj::mv(response)) {}
+
+  kj::String invoke(kj::ArrayPtr<const char> canonicalEnvelope) override {
+    ++invokeCount;
+    request = kj::str(canonicalEnvelope);
+    return kj::str(response);
+  }
+
+  size_t invokeCount = 0;
+  kj::Maybe<kj::String> request;
+
+ private:
+  kj::String response;
+};
+
 int selfTest(bool filesystemEvidence) {
   auto expectRejected = [](kj::ArrayPtr<const char> input) {
     Executor executor;
@@ -2039,6 +2615,8 @@ int selfTest(bool filesystemEvidence) {
       R"JSON({"protocol_version":1,"worker_version":"v1","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}]})JSON"_kj);
   expectCanonicalBundle(
       R"JSON({"protocol_version":2,"worker_version":"v2","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"readonly","mode":"ro"},{"name":"scratch","mode":"rw"}]})JSON"_kj);
+  expectCanonicalBundle(
+      R"JSON({"protocol_version":3,"worker_version":"v3","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[{"name":"cache","kind":"cache"},{"name":"database","kind":"d1"},{"name":"objects","kind":"durable_object"},{"name":"settings","kind":"kv"}]})JSON"_kj);
   expectRejected(
       R"JSON({"protocol_version":1,"worker_version":"v1-storage","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[]})JSON"_kj);
   expectRejected(
@@ -2051,6 +2629,61 @@ int selfTest(bool filesystemEvidence) {
       R"JSON({"protocol_version":2,"worker_version":"storage-limit","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"scratch","mode":"rw","max_write_bytes":16}]})JSON"_kj);
   expectRejected(
       R"JSON({"protocol_version":2,"worker_version":"storage-mode","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"scratch","mode":"read-write"}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":2,"worker_version":"v2-bindings","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":3,"worker_version":"duplicate-bindings","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[{"name":"settings","kind":"kv"},{"name":"settings","kind":"cache"}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":3,"worker_version":"unknown-binding-kind","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[{"name":"settings","kind":"identity"}]})JSON"_kj);
+  expectRejected(
+      R"JSON({"protocol_version":3,"worker_version":"binding-host-path","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[{"name":"settings","kind":"kv","host_path":"/secret"}]})JSON"_kj);
+
+  auto expectScheduledRejected = [](kj::StringPtr input) {
+    try {
+      parseScheduledRequest(input);
+    } catch (const kj::Exception&) {
+      return;
+    }
+    KJ_FAIL_REQUIRE("invalid scheduled envelope was accepted");
+  };
+  {
+    auto request = parseScheduledRequest(
+        R"JSON({"protocol_version":1,"request_id":"scheduled-1","scheduled_time_unix_ms":1767225600000,"cron":"0 0 * * *"})JSON"_kj);
+    KJ_REQUIRE(request.requestId == "scheduled-1"_kj &&
+            request.scheduledTime == kj::UNIX_EPOCH + 1767225600000 * kj::MILLISECONDS &&
+            request.cron == "0 0 * * *"_kj,
+        "canonical scheduled envelope parsed incorrectly");
+  }
+  expectScheduledRejected(
+      R"JSON({"protocol_version":1,"request_id":"scheduled-1","cron":"0 0 * * *","scheduled_time_unix_ms":1767225600000})JSON"_kj);
+  expectScheduledRejected(
+      R"JSON({"protocol_version":1,"request_id":"scheduled-1","scheduled_time_unix_ms":1767225600000.5,"cron":"0 0 * * *"})JSON"_kj);
+  expectScheduledRejected(
+      R"JSON({"protocol_version":1,"request_id":"scheduled-1","scheduled_time_unix_ms":1767225600000,"cron":""})JSON"_kj);
+
+  auto expectQueueRejected = [](kj::StringPtr input) {
+    try {
+      parseQueueRequest(input);
+    } catch (const kj::Exception&) {
+      return;
+    }
+    KJ_FAIL_REQUIRE("invalid queue envelope was accepted");
+  };
+  {
+    auto request = parseQueueRequest(
+        R"JSON({"protocol_version":1,"request_id":"queue-1","queue":"jobs","messages":[{"id":"message-1","timestamp_unix_ms":1767225600000,"body_base64":"aGVsbG8=","content_type":"text","attempts":2}],"metadata":{"backlog_count":3,"backlog_bytes":5,"oldest_message_timestamp_unix_ms":1767225500000}})JSON"_kj);
+    KJ_REQUIRE(request.requestId == "queue-1"_kj && request.request.queueName == "jobs"_kj &&
+            request.request.messages.size() == 1 &&
+            request.request.messages[0].id == "message-1"_kj &&
+            kj::str(request.request.messages[0].body.asChars()) == "hello"_kj &&
+            request.request.messages[0].attempts == 2 && request.request.backlogCount == 3 &&
+            request.request.backlogBytes == 5,
+        "canonical queue envelope parsed incorrectly");
+  }
+  expectQueueRejected(
+      R"JSON({"protocol_version":1,"request_id":"queue-1","queue":"jobs","messages":[{"id":"message-2","timestamp_unix_ms":1767225600000,"body_base64":"dHdv","content_type":"text","attempts":1},{"id":"message-1","timestamp_unix_ms":1767225600000,"body_base64":"b25l","content_type":"text","attempts":1}],"metadata":{"backlog_count":2,"backlog_bytes":6,"oldest_message_timestamp_unix_ms":null}})JSON"_kj);
+  expectQueueRejected(
+      R"JSON({"protocol_version":1,"request_id":"queue-1","queue":"jobs","messages":[{"id":"message-1","timestamp_unix_ms":1767225600000,"body_base64":"***","content_type":"text","attempts":1}],"metadata":{"backlog_count":1,"backlog_bytes":3,"oldest_message_timestamp_unix_ms":null}})JSON"_kj);
 
   {
     auto previousCapacity = callBufferCapacity;
@@ -2608,10 +3241,102 @@ int selfTest(bool filesystemEvidence) {
     KJ_FAIL_REQUIRE("invalid bundle graph initialized successfully");
   };
 
+  {
+    Executor executor;
+    auto modules = kj::heapArray<Module>(1);
+    modules[0] = Module{kj::str("worker.js"), ModuleType::ES_MODULE,
+      copyModuleBytes(
+          kj::str("export default { scheduled(controller) { controller.noRetry(); } }"))};
+    WorkerBundle bundle{
+      .workerVersion = kj::str("scheduled-v1"),
+      .compatibilityDate = kj::str("2025-12-31"),
+      .compatibilityFlags = kj::heapArray<kj::String>(0),
+      .mainModule = kj::str("worker.js"),
+      .modules = kj::mv(modules),
+    };
+    executor.initialize(serializeWorkerBundle(bundle));
+    auto response = executor.scheduled(
+        R"JSON({"protocol_version":1,"request_id":"scheduled-e2e","scheduled_time_unix_ms":1767225600000,"cron":"0 0 * * *"})JSON"_kj);
+    capnp::JsonCodec codec;
+    capnp::MallocMessageBuilder message;
+    auto root = message.initRoot<capnp::JsonValue>();
+    codec.decodeRaw(response, root);
+    auto fields = root.getObject();
+    KJ_REQUIRE(fields.size() == 4 && fields[0].getName() == "protocol_version"_kj &&
+            fields[0].getValue().getNumber() == 1 && fields[1].getName() == "request_id"_kj &&
+            fields[1].getValue().getString() == "scheduled-e2e"_kj &&
+            fields[2].getName() == "outcome"_kj &&
+            fields[2].getValue().getString() == kj::str(EventOutcome::OK) &&
+            fields[3].getName() == "retry"_kj && fields[3].getValue().isBoolean() &&
+            !fields[3].getValue().getBoolean(),
+        "scheduled ingress self-test failed");
+  }
+
+  {
+    Executor executor;
+    auto modules = kj::heapArray<Module>(1);
+    modules[0] = Module{kj::str("worker.js"), ModuleType::ES_MODULE,
+      copyModuleBytes(kj::str("export default { queue(batch) { batch.messages[0].ack(); "
+                              "batch.messages[1].retry({ delaySeconds: 7 }); } }"))};
+    WorkerBundle bundle{
+      .workerVersion = kj::str("queue-v1"),
+      .compatibilityDate = kj::str("2025-12-31"),
+      .compatibilityFlags = kj::heapArray<kj::String>(0),
+      .mainModule = kj::str("worker.js"),
+      .modules = kj::mv(modules),
+    };
+    executor.initialize(serializeWorkerBundle(bundle));
+    auto response = executor.queue(
+        R"JSON({"protocol_version":1,"request_id":"queue-e2e","queue":"jobs","messages":[{"id":"message-1","timestamp_unix_ms":1767225600000,"body_base64":"b25l","content_type":"text","attempts":1},{"id":"message-2","timestamp_unix_ms":1767225601000,"body_base64":"dHdv","content_type":"text","attempts":2}],"metadata":{"backlog_count":2,"backlog_bytes":6,"oldest_message_timestamp_unix_ms":1767225600000}})JSON"_kj);
+    auto expected = kj::str(R"JSON({"protocol_version":1,"request_id":"queue-e2e","outcome":")JSON",
+        EventOutcome::OK,
+        R"JSON(","ack_all":false,"retry_batch":{"retry":false,"delay_seconds":null},"explicit_acks":["message-1"],"retry_messages":[{"id":"message-2","delay_seconds":7}]}
+)JSON");
+    KJ_REQUIRE(response == expected, "queue ingress self-test failed", response);
+  }
+
+  {
+    auto host = kj::rc<SelfTestLogicalServiceHost>(
+        kj::str(R"JSON({"version":2,"request_id":"req-1","status":"ok","code":"ok"})JSON"));
+    auto& hostRef = *host;
+    Executor executor(host.addRef());
+    auto modules = kj::heapArray<Module>(1);
+    modules[0] = Module{kj::str("worker.js"), ModuleType::ES_MODULE,
+      copyModuleBytes(
+          kj::str("export default { async fetch(request, env) { "
+                  "return env.settings.fetch('https://logical.invalid/', { method: 'POST', "
+                  "body: '{\"version\":2,\"request_id\":\"req-1\",\"binding\":\"settings\","
+                  "\"operation\":{\"kind\":\"kv_get\"}}' }); } }"))};
+    auto bindings = kj::heapArray<Binding>(1);
+    bindings[0] = Binding{
+      .name = kj::str("settings"),
+      .kind = composite::BindingKind::KV,
+    };
+    WorkerBundle bundle{
+      .workerVersion = kj::str("logical-service-v2"),
+      .compatibilityDate = kj::str("2025-12-31"),
+      .compatibilityFlags = kj::heapArray<kj::String>(0),
+      .mainModule = kj::str("worker.js"),
+      .modules = kj::mv(modules),
+      .protocolVersion = 3,
+      .storageMounts = kj::heapArray<StorageMount>(0),
+      .bindings = kj::mv(bindings),
+    };
+    executor.initialize(serializeWorkerBundle(bundle));
+    auto body = fetchBody(executor,
+        R"JSON({"protocol_version":1,"request_id":"binding-e2e","method":"GET","url":"https://example.test/","headers":[],"body_base64":""})JSON"_kj);
+    KJ_REQUIRE(
+        body == R"JSON({"version":2,"request_id":"req-1","status":"ok","code":"ok"})JSON"_kj &&
+            hostRef.invokeCount == 1 &&
+            KJ_REQUIRE_NONNULL(hostRef.request) ==
+                R"JSON({"version":2,"request_id":"req-1","binding":"settings","operation":{"kind":"kv_get"}})JSON"_kj,
+        "logical service binding self-test failed");
+  }
+
   auto noFlags = []() { return kj::heapArray<kj::String>(0); };
   auto oneModule = [](kj::StringPtr name, kj::StringPtr source) {
     auto modules = kj::heapArrayBuilder<Module>(1);
-    modules.add(Module{kj::str(name), ModuleType::ES_MODULE, kj::str(source)});
+    modules.add(Module{kj::str(name), ModuleType::ES_MODULE, copyModuleBytes(source)});
     return modules.finish();
   };
 
@@ -2646,8 +3371,9 @@ int selfTest(bool filesystemEvidence) {
 
   auto streamModules = kj::heapArrayBuilder<Module>(2);
   streamModules.add(
-      Module{kj::str("worker.js"), ModuleType::ES_MODULE, kj::str(WEB_STREAMS_WORKER)});
-  streamModules.add(Module{kj::str("streams-util"), ModuleType::ES_MODULE, kj::str(STREAMS_UTIL)});
+      Module{kj::str("worker.js"), ModuleType::ES_MODULE, copyModuleBytes(WEB_STREAMS_WORKER)});
+  streamModules.add(
+      Module{kj::str("streams-util"), ModuleType::ES_MODULE, copyModuleBytes(STREAMS_UTIL)});
   run(WorkerBundle{kj::str("web-streams-v1"), kj::str("2025-12-31"), noFlags(),
         kj::str("worker.js"), streamModules.finish()},
       R"JSON({"protocol_version":1,"request_id":"streams","method":"GET","url":"https://example.test/sync","headers":[],"body_base64":""})JSON"_kj,
@@ -2662,7 +3388,8 @@ int selfTest(bool filesystemEvidence) {
   commonJsFlags.add(kj::str("enable_nodejs_fs_module"));
   commonJsFlags.add(kj::str("nodejs_compat"));
   auto commonJsModules = kj::heapArrayBuilder<Module>(7);
-  commonJsModules.add(Module{kj::str("worker.js"), ModuleType::ES_MODULE, kj::str(R"JS(
+  commonJsModules.add(
+      Module{kj::str("worker.js"), ModuleType::ES_MODULE, copyModuleBytes(kj::str(R"JS(
 import { createRequire } from 'node:module';
 const require = createRequire('file:///bundle/');
 export default {
@@ -2679,27 +3406,29 @@ export default {
     });
   },
 };
-)JS")});
+)JS"))});
   commonJsModules.add(Module{kj::str("node_modules/buffer-crc32/dist/index.cjs"),
-    ModuleType::COMMON_JS_MODULE, kj::str("module.exports = { value: 32 };"_kj)});
+    ModuleType::COMMON_JS_MODULE, copyModuleBytes(kj::str("module.exports = { value: 32 };"_kj))});
   commonJsModules.add(Module{kj::str("node_modules/buffer-crc32/package.json"), ModuleType::TEXT,
-    kj::str(R"JSON({"main":"dist/index.cjs"})JSON"_kj)});
-  commonJsModules.add(Module{kj::str("node_modules/graceful-fs/graceful-fs.js"),
-    ModuleType::COMMON_JS_MODULE, kj::str("module.exports = { packageName: 'graceful-fs' };"_kj)});
-  commonJsModules.add(Module{kj::str("node_modules/semver/classes/range.js"),
-    ModuleType::COMMON_JS_MODULE, kj::str("module.exports = { marker: 'range' };"_kj)});
+    copyModuleBytes(kj::str(R"JSON({"main":"dist/index.cjs"})JSON"_kj))});
+  commonJsModules.add(
+      Module{kj::str("node_modules/graceful-fs/graceful-fs.js"), ModuleType::COMMON_JS_MODULE,
+        copyModuleBytes(kj::str("module.exports = { packageName: 'graceful-fs' };"_kj))});
+  commonJsModules.add(
+      Module{kj::str("node_modules/semver/classes/range.js"), ModuleType::COMMON_JS_MODULE,
+        copyModuleBytes(kj::str("module.exports = { marker: 'range' };"_kj))});
   commonJsModules.add(Module{kj::str("node_modules/semver/functions/satisfies.js"),
-    ModuleType::COMMON_JS_MODULE, kj::str(R"JS(
+    ModuleType::COMMON_JS_MODULE, copyModuleBytes(kj::str(R"JS(
 const Range = require('../classes/range');
 const satisfies = (version, range) => version === '7.7.3' && range === '^7.0.0';
 satisfies.range = Range.marker;
 module.exports = satisfies;
-)JS")});
-  commonJsModules.add(
-      Module{kj::str("node_modules/yazl/index.js"), ModuleType::COMMON_JS_MODULE, kj::str(R"JS(
+)JS"))});
+  commonJsModules.add(Module{kj::str("node_modules/yazl/index.js"), ModuleType::COMMON_JS_MODULE,
+    copyModuleBytes(kj::str(R"JS(
 const crc32 = require('buffer-crc32');
 module.exports = { packageName: 'yazl', crc32: crc32.value };
-)JS")});
+)JS"))});
   run(WorkerBundle{kj::str("commonjs-packages-v1"), kj::str("2025-12-31"), commonJsFlags.finish(),
         kj::str("worker.js"), commonJsModules.finish()},
       R"JSON({"protocol_version":1,"request_id":"commonjs","method":"GET","url":"https://example.test/","headers":[],"body_base64":""})JSON"_kj,
@@ -2715,9 +3444,10 @@ module.exports = { packageName: 'yazl', crc32: crc32.value };
     flags.add(kj::str("nodejs_compat"));
     auto modules = kj::heapArrayBuilder<Module>(2);
     modules.add(Module{kj::str("worker.js"), ModuleType::ES_MODULE,
-      kj::str("export default { fetch() { return new Response('unreachable'); } };"_kj)});
+      copyModuleBytes(
+          kj::str("export default { fetch() { return new Response('unreachable'); } };"_kj))});
     modules.add(Module{kj::str("node_modules/example/index.js"), ModuleType::COMMON_JS_MODULE,
-      kj::str("module.exports = require('", invalidRequire, "');")});
+      copyModuleBytes(kj::str("module.exports = require('", invalidRequire, "');"))});
     expectInitFailure(WorkerBundle{kj::str("commonjs-invalid-graph-v1"), kj::str("2025-12-31"),
                         flags.finish(), kj::str("worker.js"), modules.finish()},
         invalidRequire.startsWith("..") ? "CommonJS require escapes the bundle"_kj

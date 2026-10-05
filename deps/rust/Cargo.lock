@@ -450,6 +450,7 @@ dependencies = [
  "ada-url",
  "anyhow",
  "async-trait",
+ "base64",
  "bytes",
  "capnp",
  "capnp-rpc",
