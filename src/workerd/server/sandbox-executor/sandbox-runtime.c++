@@ -8,6 +8,7 @@
 #include "hyperlight-driver.h"
 #include "sandbox-fetch.h"
 #include "sandbox-logical-service.h"
+#include "sandbox-websocket.h"
 
 #include <workerd/api/global-scope.h>
 #include <workerd/api/memory-cache.h>
@@ -23,9 +24,13 @@
 #include <workerd/util/autogate.h>
 #include <workerd/util/stream-utils.h>
 
+#include <sys/random.h>
+
 #include <capnp/compat/http-over-capnp.h>
 #include <capnp/compat/json.h>
 #include <kj/async-io.h>
+
+#include <cerrno>
 
 namespace workerd::server::sandbox_executor {
 namespace {
@@ -334,6 +339,55 @@ class HyperlightTimerHostChannel final: public TimerHostChannel {
   }
 };
 
+class TrackedTimerHostChannel final: public TimerHostChannel {
+ public:
+  explicit TrackedTimerHostChannel(kj::Rc<TimerHostChannel> host): host(kj::mv(host)) {}
+
+  kj::String start(uint64_t delayNs) override {
+    KJ_REQUIRE(active.size() < 64, "too many active invocation timers");
+    KJ_ON_SCOPE_FAILURE(uncertain = true);
+    auto response = host->start(delayNs);
+    auto result = parseTimerResult(response);
+    if (result.state == TimerResult::State::PENDING) {
+      for (auto id: active) {
+        KJ_REQUIRE(id != result.timerId, "host reused an active timer ID");
+      }
+      active.add(result.timerId);
+    }
+    return response;
+  }
+
+  kj::String read(uint64_t id) override {
+    auto response = host->read(id);
+    auto result = parseTimerResult(response);
+    KJ_REQUIRE(result.timerId == id, "timer response ID mismatch");
+    if (result.state == TimerResult::State::FIRED ||
+        result.state == TimerResult::State::CANCELLED) {
+      for (auto i: kj::indices(active)) {
+        if (active[i] == id) {
+          active[i] = active.back();
+          active.removeLast();
+          break;
+        }
+      }
+    }
+    return response;
+  }
+
+  int32_t cancel(uint64_t id) override {
+    return host->cancel(id);
+  }
+
+  bool isQuiescent() const {
+    return active.size() == 0 && !uncertain;
+  }
+
+ private:
+  kj::Rc<TimerHostChannel> host;
+  kj::Vector<uint64_t> active;
+  bool uncertain = false;
+};
+
 class TimerChannelImpl final: public TimerChannel {
  public:
   TimerChannelImpl(kj::Rc<TimerHostChannel> host, kj::Timer& pollTimer)
@@ -405,20 +459,61 @@ class TimerChannelImpl final: public TimerChannel {
   kj::Timer& pollTimer;
 };
 
+class SystemEntropyHostChannel final: public EntropyHostChannel {
+ public:
+  kj::Array<byte> read(size_t amount) override {
+    auto bytes = kj::heapArray<byte>(amount);
+    size_t offset = 0;
+    while (offset < amount) {
+      auto count = getrandom(bytes.begin() + offset, amount - offset, 0);
+      if (count < 0 && errno == EINTR) continue;
+      KJ_REQUIRE(count > 0, "system CSPRNG entropy read failed", errno);
+      offset += static_cast<size_t>(count);
+    }
+    return bytes;
+  }
+};
+
+class HyperlightEntropyHostChannel final: public EntropyHostChannel {
+ public:
+  kj::Array<byte> read(size_t amount) override {
+    auto argument = hostCallU64(amount);
+    return hostCallBytes("WorkerdEntropyV1Read"_kj, kj::arrayPtr(&argument, 1), amount);
+  }
+};
+
 class EntropySource final: public kj::EntropySource {
  public:
+  explicit EntropySource(kj::Rc<EntropyHostChannel> host): host(kj::mv(host)) {}
+
   void generate(kj::ArrayPtr<byte> buffer) override {
-    for (auto& value: buffer) {
-      value = counter++;
+    while (buffer.size() > 0) {
+      auto amount = kj::min(buffer.size(), size_t(16 * 1024));
+      auto bytes = host->read(amount);
+      KJ_REQUIRE(bytes.size() == amount, "CSPRNG entropy returned an invalid byte count");
+      buffer.first(amount).copyFrom(bytes);
+      buffer = buffer.slice(amount);
     }
   }
 
  private:
-  byte counter = 0;
+  kj::Rc<EntropyHostChannel> host;
 };
 
 class LimitEnforcerImpl final: public LimitEnforcer {
  public:
+  LimitEnforcerImpl(kj::Timer& timer,
+      SandboxRuntime::Limits limits,
+      kj::Maybe<kj::Duration> lifetimeBudget,
+      kj::Maybe<WebSocketLimits> webSocketLimits = kj::none)
+      : timer(timer),
+        limits(limits),
+        deadline(lifetimeBudget.map([&timer](kj::Duration budget) {
+          KJ_REQUIRE(budget > 0 * kj::SECONDS, "invocation lifetime budget must be positive");
+          return timer.now() + budget;
+        })),
+        webSocketLimits(webSocketLimits) {}
+
   kj::Own<void> enterJs(jsg::Lock&, IoContext&) override {
     return {};
   }
@@ -431,10 +526,10 @@ class LimitEnforcerImpl final: public LimitEnforcer {
     KJ_FAIL_REQUIRE("analytics is unavailable");
   }
   kj::Promise<void> limitDrain() override {
-    return kj::NEVER_DONE;
+    return limit(limits.drainTimeout);
   }
   kj::Promise<void> limitScheduled() override {
-    return kj::NEVER_DONE;
+    return limit(limits.scheduledTimeout);
   }
   kj::Duration getAlarmLimit() override {
     return 0 * kj::SECONDS;
@@ -442,8 +537,11 @@ class LimitEnforcerImpl final: public LimitEnforcer {
   size_t getBufferingLimit() override {
     return 64 * 1024;
   }
+  kj::Maybe<WebSocketLimits> getWebSocketLimits() const override {
+    return webSocketLimits;
+  }
   kj::Maybe<EventOutcome> getLimitsExceeded() override {
-    return kj::none;
+    return exceeded ? kj::Maybe<EventOutcome>(EventOutcome::EXCEEDED_WALL_TIME) : kj::none;
   }
   kj::Promise<void> onLimitsExceeded() override {
     return kj::NEVER_DONE;
@@ -457,6 +555,20 @@ class LimitEnforcerImpl final: public LimitEnforcer {
   size_t getSqliteMemoryUsage() const override {
     return 0;
   }
+
+ private:
+  kj::Promise<void> limit(kj::Duration timeout) {
+    KJ_IF_SOME(end, deadline) {
+      timeout = kj::max(0 * kj::SECONDS, end - timer.now());
+    }
+    return timer.afterDelay(timeout).then([this]() { exceeded = true; });
+  }
+
+  kj::Timer& timer;
+  SandboxRuntime::Limits limits;
+  kj::Maybe<kj::TimePoint> deadline;
+  kj::Maybe<WebSocketLimits> webSocketLimits;
+  bool exceeded = false;
 };
 
 class IsolateLimitEnforcerImpl final: public IsolateLimitEnforcer {
@@ -530,7 +642,9 @@ class ChannelFactory final: public IoChannelFactory {
       kj::Rc<FetchBroker> fetchBroker,
       kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
       kj::HttpHeaderTable& headerTable,
-      kj::ArrayPtr<const Binding> bindings)
+      kj::ArrayPtr<const Binding> bindings,
+      kj::Rc<WebSocketBroker> webSocketBroker,
+      bool& providerNegotiated)
       : timer(timer),
         fetchBroker(kj::mv(fetchBroker)),
         logicalServiceHost(kj::mv(logicalServiceHost)),
@@ -541,10 +655,21 @@ class ChannelFactory final: public IoChannelFactory {
             .kind = binding.kind,
           };
         }),
-        nextRequestId(kj::rc<uint64_t>(1)) {}
+        nextRequestId(kj::rc<uint64_t>(1)),
+        webSocketBroker(kj::mv(webSocketBroker)),
+        providerNegotiated(providerNegotiated) {}
 
   void abortIsolate(kj::StringPtr reason) override {
     KJ_FAIL_REQUIRE("isolate aborted", reason);
+  }
+  kj::Promise<kj::Own<kj::WebSocket>> openProviderWebSocket(
+      uint channel, kj::String url, kj::Array<kj::String> protocols) override {
+    KJ_REQUIRE(providerNegotiated && channel > 0 && channel - 1 < bindings.size(),
+        "authenticated provider WebSocket capability or channel was not admitted");
+    const auto& binding = bindings[channel - 1];
+    KJ_REQUIRE(binding.kind == logical_service_broker::composite::BindingKind::PROVIDER_WEBSOCKET,
+        "channel is not a provider WebSocket binding");
+    return webSocketBroker->connect(kj::str(binding.name), kj::mv(url), kj::mv(protocols), timer);
   }
   kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) override {
     if (channel == 0) {
@@ -554,6 +679,9 @@ class ChannelFactory final: public IoChannelFactory {
     auto bindingIndex = channel - 1;
     KJ_REQUIRE(bindingIndex < bindings.size(), "invalid logical service channel");
     const auto& binding = bindings[bindingIndex];
+    if (binding.kind == logical_service_broker::composite::BindingKind::PROVIDER_WEBSOCKET) {
+      KJ_FAIL_REQUIRE("provider WebSocket bindings do not accept HTTP subrequests");
+    }
     auto serviceChannel = newCompositeServiceChannel(
         logicalServiceHost.addRef(), headerTable, kj::str(binding.name), binding.kind);
     return serviceChannel->startRequest(kj::mv(metadata));
@@ -570,6 +698,9 @@ class ChannelFactory final: public IoChannelFactory {
     auto bindingIndex = channel - 1;
     KJ_REQUIRE(bindingIndex < bindings.size(), "invalid logical service channel");
     const auto& binding = bindings[bindingIndex];
+    if (binding.kind == logical_service_broker::composite::BindingKind::PROVIDER_WEBSOCKET) {
+      KJ_FAIL_REQUIRE("provider WebSocket bindings do not accept HTTP subrequests");
+    }
     return newCompositeServiceChannel(
         logicalServiceHost.addRef(), headerTable, kj::str(binding.name), binding.kind);
   }
@@ -612,6 +743,8 @@ class ChannelFactory final: public IoChannelFactory {
   kj::HttpHeaderTable& headerTable;
   kj::Array<Binding> bindings;
   kj::Rc<uint64_t> nextRequestId;
+  kj::Rc<WebSocketBroker> webSocketBroker;
+  bool& providerNegotiated;
 };
 
 class TaskErrorHandler final: public kj::TaskSet::ErrorHandler {
@@ -624,11 +757,13 @@ class TaskErrorHandler final: public kj::TaskSet::ErrorHandler {
 class MemoryOutputStream final: public kj::AsyncOutputStream, public kj::Refcounted {
  public:
   kj::Promise<void> write(kj::ArrayPtr<const byte> buffer) override {
+    KJ_REQUIRE(buffer.size() <= 32 * 1024 - content.size(), "response body exceeds limit");
     content.addAll(buffer);
     return kj::READY_NOW;
   }
   kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
     for (auto piece: pieces) {
+      KJ_REQUIRE(piece.size() <= 32 * 1024 - content.size(), "response body exceeds limit");
       content.addAll(piece);
     }
     return kj::READY_NOW;
@@ -741,6 +876,20 @@ kj::Own<VirtualFileSystem> buildFileSystem(const WorkerBundle& bundle) {
 
 kj::Array<server::WorkerdApi::Global> buildGlobals(const WorkerBundle& bundle) {
   return KJ_MAP(index, kj::indices(bundle.bindings)) {
+    if (bundle.bindings[index].kind ==
+        logical_service_broker::composite::BindingKind::PROVIDER_WEBSOCKET) {
+      return server::WorkerdApi::Global{
+        .name = kj::str(bundle.bindings[index].name),
+        .value = server::WorkerdApi::Global::ProviderWebSocket{static_cast<uint>(index + 1)},
+      };
+    }
+    if (bundle.bindings[index].kind == logical_service_broker::composite::BindingKind::WEBHOOK) {
+      return server::WorkerdApi::Global{
+        .name = kj::str(bundle.bindings[index].name),
+        .value = server::WorkerdApi::Global::Webhook{static_cast<uint>(index + 1),
+          kj::str(bundle.bindings[index].name)},
+      };
+    }
     return server::WorkerdApi::Global{
       .name = kj::str(bundle.bindings[index].name),
       .value =
@@ -758,14 +907,19 @@ kj::Array<server::WorkerdApi::Global> buildGlobals(const WorkerBundle& bundle) {
 struct SandboxRuntime::Impl {
   Impl(const WorkerBundle& bundle,
       kj::Rc<FetchBroker> fetchBroker,
-      kj::Rc<LogicalServiceHostChannel> logicalServiceHost)
+      kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
+      kj::Rc<TimerHostChannel> timerHost,
+      SandboxRuntime::Limits limits,
+      kj::Rc<EntropyHostChannel> entropyHost,
+      kj::Rc<WebSocketBroker> webSocketBroker)
       : errorReporter(kj::heap<ErrorReporter>()),
         config(buildConfig(configArena, bundle)),
         compatibilityFlags(buildCompatibilityFlags(compatibilityArena, bundle, *errorReporter)),
         io(kj::setupAsyncIo()),
         timer(kj::heap<Timer>(io.provider->getTimer())),
-        timerChannel(newTimerChannel(newHyperlightTimerHostChannel(), io.provider->getTimer())),
-        entropySource(kj::heap<EntropySource>()),
+        trackedTimerHost(kj::rc<TrackedTimerHostChannel>(kj::mv(timerHost))),
+        timerChannel(newTimerChannel(trackedTimerHost.addRef(), io.provider->getTimer())),
+        entropySource(kj::heap<EntropySource>(kj::mv(entropyHost))),
         threadContextHeaderBundle(headerTableBuilder),
         httpOverCapnpFactory(byteStreamFactory,
             capnp::HttpOverCapnpFactory::HeaderIdBundle(headerTableBuilder),
@@ -817,35 +971,31 @@ struct SandboxRuntime::Impl {
             SpanParent(nullptr),
             Worker::LockType(Worker::Lock::TakeSynchronously(kj::none)))),
         errorHandler(kj::heap<TaskErrorHandler>()),
-        waitUntilTasks(*errorHandler),
+        limits(limits),
+        fetchBroker(kj::mv(fetchBroker)),
+        webSocketBroker(kj::mv(webSocketBroker)),
         headerTable(headerTableBuilder.build()),
         channelFactory(kj::rc<ChannelFactory>(*timerChannel,
-            kj::mv(fetchBroker),
+            this->fetchBroker.addRef(),
             kj::mv(logicalServiceHost),
             *headerTable,
-            bundle.bindings)) {}
+            bundle.bindings,
+            this->webSocketBroker.addRef(),
+            providerNegotiated)) {
+    KJ_REQUIRE(limits.drainTimeout > 0 * kj::SECONDS && limits.scheduledTimeout > 0 * kj::SECONDS,
+        "invocation timeouts must be positive");
+  }
 
   Response runRequest(kj::HttpMethod method,
       kj::StringPtr url,
       kj::ArrayPtr<const Header> requestHeaderList,
-      kj::StringPtr requestBodyText) {
-    kj::HttpHeaders requestHeaders(*headerTable);
-    for (const auto& header: requestHeaderList) {
-      requestHeaders.addPtrPtr(header.name, header.value);
-    }
+      kj::StringPtr requestBodyText,
+      kj::Maybe<kj::Duration> lifetimeBudget) {
     HttpResponse response;
     auto requestBody = newMemoryInputStream(requestBodyText);
-    auto context = kj::refcounted<IoContext>(
-        threadContext, kj::atomicAddRef(*worker), kj::none, kj::heap<LimitEnforcerImpl>());
-    auto incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::addRef(*context),
-        channelFactory.addRef(), kj::refcounted<RequestObserver>(), kj::none, kj::none);
-    incomingRequest->delivered();
-    incomingRequest->getContext()
-        .run([&](Worker::Lock& lock) {
-      auto& globalScope = lock.getGlobalScope();
-      return globalScope.request(method, url, requestHeaders, *requestBody, response, "{}"_kj, lock,
-          lock.getExportedHandler(kj::none, kj::none, {}, kj::none), kj::none);
-    }).wait(io.waitScope);
+    runRequestStream(method, url, requestHeaderList, *requestBody, response, lifetimeBudget,
+        []() -> kj::Promise<void> { return kj::READY_NOW; },
+        []() -> kj::Promise<void> { return kj::READY_NOW; });
     return {
       .statusCode = response.status,
       .headers = response.headers.releaseAsArray(),
@@ -853,9 +1003,83 @@ struct SandboxRuntime::Impl {
     };
   }
 
-  ScheduledResponse runScheduled(kj::Date scheduledTime, kj::StringPtr cron) {
-    auto context = kj::refcounted<IoContext>(
-        threadContext, kj::atomicAddRef(*worker), kj::none, kj::heap<LimitEnforcerImpl>());
+  void runRequestStream(kj::HttpMethod method,
+      kj::StringPtr url,
+      kj::ArrayPtr<const Header> requestHeaderList,
+      kj::AsyncInputStream& requestBody,
+      kj::HttpService::Response& response,
+      kj::Maybe<kj::Duration> lifetimeBudget,
+      kj::FunctionParam<kj::Promise<void>()> responseComplete,
+      kj::FunctionParam<kj::Promise<void>()> lifetimeComplete,
+      kj::Maybe<LimitEnforcer::WebSocketLimits> webSocketLimits = kj::none) {
+    KJ_REQUIRE(!busy, "executor invocation already active");
+    busy = true;
+    KJ_DEFER(busy = false);
+    KJ_ON_SCOPE_FAILURE(lifetimeFailed = true);
+    kj::HttpHeaders requestHeaders(*headerTable);
+    for (const auto& header: requestHeaderList) {
+      requestHeaders.addPtrPtr(header.name, header.value);
+    }
+    auto context = kj::refcounted<IoContext>(threadContext, kj::atomicAddRef(*worker), kj::none,
+        kj::heap<LimitEnforcerImpl>(*timer, limits, lifetimeBudget, webSocketLimits));
+    context->enableRequestDeadlineRetirement();
+    auto incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::addRef(*context),
+        channelFactory.addRef(), kj::refcounted<RequestObserver>(), kj::none, kj::none);
+    incomingRequest->delivered();
+    auto request = incomingRequest->getContext()
+                       .run([&](Worker::Lock& lock) {
+      auto& globalScope = lock.getGlobalScope();
+      auto bodyPresence = webSocketLimits != kj::none &&
+              (method == kj::HttpMethod::GET || method == kj::HttpMethod::HEAD)
+          ? api::ServiceWorkerGlobalScope::RequestBodyPresence::ABSENT
+          : api::ServiceWorkerGlobalScope::RequestBodyPresence::INFER;
+      return globalScope.request(method, url, requestHeaders, requestBody, response, "{}"_kj, lock,
+          lock.getExportedHandler(kj::none, kj::none, {}, kj::none), kj::none, bodyPresence);
+    }).then([](api::DeferredProxy<void> proxy) {
+      return kj::mv(proxy.proxyTask);
+    }).then([&]() { return responseComplete(); });
+    if (lifetimeBudget != kj::none) {
+      request = request.exclusiveJoin(context->getLimitEnforcer().limitScheduled().then(
+          [] { KJ_FAIL_REQUIRE("fetch invocation exceeded wall time"); }));
+    }
+    if (webSocketLimits != kj::none) {
+      // Native ingress polling is live I/O even after the JavaScript-side pipe closes.
+      request = request.attach(context->registerPendingEvent());
+    }
+    kj::Maybe<kj::Exception> failure;
+    try {
+      request.wait(io.waitScope);
+    } catch (const kj::Exception& exception) {
+      failure = exception.clone();
+    }
+    kj::TaskSet waitUntilTasks(*errorHandler);
+    incomingRequest->drain(waitUntilTasks, kj::mv(incomingRequest));
+    waitUntilTasks.onEmpty().wait(io.waitScope);
+    KJ_IF_SOME(exception, failure) {
+      kj::throwRecoverableException(kj::mv(exception));
+      KJ_UNREACHABLE;
+    }
+    KJ_REQUIRE(context->getAbortReason() == kj::none, "fetch tracked work was aborted");
+    KJ_REQUIRE(context->getLimitEnforcer().getLimitsExceeded() == kj::none,
+        "fetch waitUntil drain exceeded wall time");
+    auto completion = lifetimeComplete();
+    if (lifetimeBudget != kj::none) {
+      completion = completion.exclusiveJoin(context->getLimitEnforcer().limitScheduled().then(
+          [] { KJ_FAIL_REQUIRE("transport completion exceeded wall time"); }));
+    }
+    completion.wait(io.waitScope);
+    requireNoExternalWork();
+  }
+
+  ScheduledResponse runScheduled(
+      kj::Date scheduledTime, kj::StringPtr cron, kj::Maybe<kj::Duration> lifetimeBudget) {
+    KJ_REQUIRE(!busy, "executor invocation already active");
+    busy = true;
+    KJ_DEFER(busy = false);
+    KJ_ON_SCOPE_FAILURE(lifetimeFailed = true);
+    auto context = kj::refcounted<IoContext>(threadContext, kj::atomicAddRef(*worker), kj::none,
+        kj::heap<LimitEnforcerImpl>(*timer, limits, lifetimeBudget));
+    context->enableRequestDeadlineRetirement();
     auto incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::addRef(*context),
         channelFactory.addRef(), kj::refcounted<RequestObserver>(), kj::none, kj::none);
     incomingRequest->delivered();
@@ -865,13 +1089,22 @@ struct SandboxRuntime::Impl {
           scheduledTime, cron, lock, lock.getExportedHandler(kj::none, kj::none, {}, kj::none));
     }));
     auto result = incomingRequest->finishScheduled(kj::mv(incomingRequest)).wait(io.waitScope);
+    if (result.outcome == EventOutcome::EXCEEDED_WALL_TIME || context->getAbortReason() != kj::none)
+      lifetimeFailed = true;
+    if (!lifetimeFailed) {
+      requireNoExternalWork();
+    }
     return {
       .retry = result.retry,
       .outcome = result.outcome,
     };
   }
 
-  QueueResponse runQueue(QueueRequest request) {
+  QueueResponse runQueue(QueueRequest request, kj::Maybe<kj::Duration> lifetimeBudget) {
+    KJ_REQUIRE(!busy, "executor invocation already active");
+    busy = true;
+    KJ_DEFER(busy = false);
+    KJ_ON_SCOPE_FAILURE(lifetimeFailed = true);
     auto messages = KJ_MAP(message, request.messages) {
       return api::IncomingQueueMessage{
         .id = kj::mv(message.id),
@@ -895,14 +1128,16 @@ struct SandboxRuntime::Impl {
           },
     });
     auto eventResult = kj::addRef(*event);
-    auto context = kj::refcounted<IoContext>(
-        threadContext, kj::atomicAddRef(*worker), kj::none, kj::heap<LimitEnforcerImpl>());
+    auto context = kj::refcounted<IoContext>(threadContext, kj::atomicAddRef(*worker), kj::none,
+        kj::heap<LimitEnforcerImpl>(*timer, limits, lifetimeBudget));
+    context->enableRequestDeadlineRetirement();
     auto incomingRequest = kj::heap<IoContext::IncomingRequest>(kj::addRef(*context),
         channelFactory.addRef(), kj::refcounted<RequestObserver>(), kj::none, kj::none);
+    kj::TaskSet waitUntilTasks(*errorHandler);
     auto result = event->run(kj::mv(incomingRequest), kj::none, kj::none, {}, waitUntilTasks, false)
                       .wait(io.waitScope);
     auto retryBatch = eventResult->getRetryBatch();
-    return {
+    QueueResponse response{
       .outcome = result.outcome,
       .ackAll = eventResult->getAckAll(),
       .retryBatch = retryBatch.retry,
@@ -916,6 +1151,25 @@ struct SandboxRuntime::Impl {
       };
     },
     };
+    waitUntilTasks.onEmpty().wait(io.waitScope);
+    if (context->getLimitEnforcer().getLimitsExceeded() != kj::none ||
+        context->getAbortReason() != kj::none)
+      lifetimeFailed = true;
+    KJ_REQUIRE(result.outcome != EventOutcome::OK || context->getAbortReason() == kj::none,
+        "queue tracked work was aborted");
+    KJ_REQUIRE(result.outcome != EventOutcome::OK ||
+            context->getLimitEnforcer().getLimitsExceeded() == kj::none,
+        "queue waitUntil drain exceeded wall time");
+    if (!lifetimeFailed) {
+      requireNoExternalWork();
+    }
+    return response;
+  }
+
+  void requireNoExternalWork() {
+    KJ_REQUIRE(trackedTimerHost->isQuiescent() && fetchBroker->isQuiescent() &&
+            webSocketBroker->isQuiescent(),
+        "invocation ended with unsupported live external handles");
   }
 
   kj::Own<Worker::ValidationErrorReporter> errorReporter;
@@ -925,6 +1179,7 @@ struct SandboxRuntime::Impl {
   CompatibilityFlags::Reader compatibilityFlags;
   kj::AsyncIoContext io;
   kj::Own<kj::Timer> timer;
+  kj::Rc<TrackedTimerHostChannel> trackedTimerHost;
   kj::Own<TimerChannel> timerChannel;
   kj::Own<kj::EntropySource> entropySource;
   capnp::ByteStreamFactory byteStreamFactory;
@@ -938,9 +1193,14 @@ struct SandboxRuntime::Impl {
   kj::Own<Worker::Script> script;
   kj::Own<Worker> worker;
   kj::Own<kj::TaskSet::ErrorHandler> errorHandler;
-  kj::TaskSet waitUntilTasks;
+  SandboxRuntime::Limits limits;
+  kj::Rc<FetchBroker> fetchBroker;
+  kj::Rc<WebSocketBroker> webSocketBroker;
+  bool providerNegotiated = false;
   kj::Own<kj::HttpHeaderTable> headerTable;
   kj::Rc<ChannelFactory> channelFactory;
+  bool busy = false;
+  bool lifetimeFailed = false;
 };
 
 SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle, kj::Rc<FetchBroker> fetchBroker)
@@ -948,26 +1208,105 @@ SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle, kj::Rc<FetchBroker> f
 SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle,
     kj::Rc<FetchBroker> fetchBroker,
     kj::Rc<LogicalServiceHostChannel> logicalServiceHost)
-    : impl(kj::heap<Impl>(bundle, kj::mv(fetchBroker), kj::mv(logicalServiceHost))) {}
+    : SandboxRuntime(bundle,
+          kj::mv(fetchBroker),
+          kj::mv(logicalServiceHost),
+          newHyperlightTimerHostChannel(),
+          Limits{}) {}
+SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle,
+    kj::Rc<FetchBroker> fetchBroker,
+    kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
+    kj::Rc<TimerHostChannel> timerHost,
+    Limits limits)
+    : SandboxRuntime(bundle,
+          kj::mv(fetchBroker),
+          kj::mv(logicalServiceHost),
+          kj::mv(timerHost),
+          limits,
+          newSystemEntropyHostChannel()) {}
+SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle,
+    kj::Rc<FetchBroker> fetchBroker,
+    kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
+    kj::Rc<TimerHostChannel> timerHost,
+    Limits limits,
+    kj::Rc<EntropyHostChannel> entropyHost)
+    : SandboxRuntime(bundle,
+          kj::mv(fetchBroker),
+          kj::mv(logicalServiceHost),
+          kj::mv(timerHost),
+          limits,
+          kj::mv(entropyHost),
+          newAuthenticatedWebSocketBroker(newHyperlightWebSocketHostChannel())) {}
+SandboxRuntime::SandboxRuntime(const WorkerBundle& bundle,
+    kj::Rc<FetchBroker> fetchBroker,
+    kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
+    kj::Rc<TimerHostChannel> timerHost,
+    Limits limits,
+    kj::Rc<EntropyHostChannel> entropyHost,
+    kj::Rc<WebSocketBroker> webSocketBroker)
+    : impl(kj::heap<Impl>(bundle,
+          kj::mv(fetchBroker),
+          kj::mv(logicalServiceHost),
+          kj::mv(timerHost),
+          limits,
+          kj::mv(entropyHost),
+          kj::mv(webSocketBroker))) {}
 SandboxRuntime::~SandboxRuntime() noexcept(false) {}
 
 Response SandboxRuntime::runRequest(kj::HttpMethod method,
     kj::StringPtr url,
     kj::ArrayPtr<const Header> headers,
-    kj::StringPtr body) {
-  return impl->runRequest(method, url, headers, body);
+    kj::StringPtr body,
+    kj::Maybe<kj::Duration> lifetimeBudget) {
+  return impl->runRequest(method, url, headers, body, lifetimeBudget);
 }
 
-ScheduledResponse SandboxRuntime::runScheduled(kj::Date scheduledTime, kj::StringPtr cron) {
-  return impl->runScheduled(scheduledTime, cron);
+void SandboxRuntime::runRequestStream(kj::HttpMethod method,
+    kj::StringPtr url,
+    kj::ArrayPtr<const Header> headers,
+    kj::AsyncInputStream& body,
+    kj::HttpService::Response& response,
+    kj::Duration lifetimeBudget,
+    kj::FunctionParam<kj::Promise<void>()> responseComplete,
+    kj::FunctionParam<kj::Promise<void>()> lifetimeComplete) {
+  impl->runRequestStream(method, url, headers, body, response, lifetimeBudget, responseComplete,
+      lifetimeComplete,
+      LimitEnforcer::WebSocketLimits{MAX_INGRESS_FRAME_BYTES, 4, 4 * MAX_INGRESS_FRAME_BYTES});
 }
 
-QueueResponse SandboxRuntime::runQueue(QueueRequest request) {
-  return impl->runQueue(kj::mv(request));
+ScheduledResponse SandboxRuntime::runScheduled(
+    kj::Date scheduledTime, kj::StringPtr cron, kj::Maybe<kj::Duration> lifetimeBudget) {
+  return impl->runScheduled(scheduledTime, cron, lifetimeBudget);
+}
+
+QueueResponse SandboxRuntime::runQueue(
+    QueueRequest request, kj::Maybe<kj::Duration> lifetimeBudget) {
+  return impl->runQueue(kj::mv(request), lifetimeBudget);
+}
+
+bool SandboxRuntime::isQuiescent() const {
+  return !impl->busy && !impl->lifetimeFailed && impl->trackedTimerHost->isQuiescent() &&
+      impl->fetchBroker->isQuiescent() && impl->webSocketBroker->isQuiescent();
+}
+
+void SandboxRuntime::negotiateProviderWebSockets() {
+  impl->providerNegotiated = true;
+}
+
+kj::Timer& SandboxRuntime::getNativeTimer() {
+  return *impl->timer;
 }
 
 kj::Rc<TimerHostChannel> newHyperlightTimerHostChannel() {
   return kj::rc<HyperlightTimerHostChannel>();
+}
+
+kj::Rc<EntropyHostChannel> newSystemEntropyHostChannel() {
+  return kj::rc<SystemEntropyHostChannel>();
+}
+
+kj::Rc<EntropyHostChannel> newHyperlightEntropyHostChannel() {
+  return kj::rc<HyperlightEntropyHostChannel>();
 }
 
 kj::Own<TimerChannel> newTimerChannel(kj::Rc<TimerHostChannel> host, kj::Timer& pollTimer) {

@@ -141,6 +141,8 @@ wd_cc_binary(
         "sandbox-executor/sandbox-logical-service.h",
         "sandbox-executor/sandbox-runtime.c++",
         "sandbox-executor/sandbox-runtime.h",
+        "sandbox-executor/sandbox-websocket.c++",
+        "sandbox-executor/sandbox-websocket.h",
     ],
     copts = ["-fPIE"],
     linkopts = ["-static-pie"],
@@ -151,6 +153,7 @@ wd_cc_binary(
         ":web-streams-worker-embed",
         ":wintertc-smoke-embed",
         ":workerd-api",
+        "//:workerd-runtime-contract-embed",
         "//src/rust/sandbox-executor",
         "//src/workerd/io",
         "//src/workerd/io:compatibility-date",
@@ -163,6 +166,8 @@ wd_cc_binary(
         "@capnp-cpp//src/kj",
         "@capnp-cpp//src/kj:kj-async-core",
         "@capnp-cpp//src/kj:kj-async-io",
+        "@simdutf",
+        "@ssl",
     ],
 )
 
@@ -282,6 +287,32 @@ wd_cc_library(
 )
 
 wd_cc_library(
+    name = "provider-websocket-binding",
+    srcs = ["provider-websocket-binding.c++"],
+    hdrs = ["provider-websocket-binding.h"],
+    deps = [
+        "//src/workerd/io",
+        "//src/workerd/jsg",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj/compat:kj-http",
+    ],
+)
+
+wd_cc_library(
+    name = "webhook-binding",
+    srcs = ["webhook-binding.c++"],
+    hdrs = ["webhook-binding.h"],
+    deps = [
+        "//src/workerd/io",
+        "//src/workerd/jsg",
+        "//src/workerd/server/logical-service-broker",
+        "@capnp-cpp//src/capnp/compat:json",
+        "@capnp-cpp//src/kj",
+        "@capnp-cpp//src/kj/compat:kj-http",
+    ],
+)
+
+wd_cc_library(
     name = "workerd-api",
     srcs = [
         "workerd-api.c++",
@@ -307,7 +338,9 @@ wd_cc_library(
     deps = [
         ":actor-id-impl",
         ":fallback-service",
+        ":provider-websocket-binding",
         ":pyodide",
+        ":webhook-binding",
         ":workerd-debug-port-client",
         ":workerd_capnp",
         "//src/cloudflare",

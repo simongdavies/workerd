@@ -70,6 +70,7 @@ class IoContext::TimeoutManagerImpl final: public TimeoutManager {
   }
 
   void clearTimeout(IoContext&, TimeoutId id) override;
+  void cancelRequestDeadlines() override;
 
   size_t getTimeoutCount() const override {
     return timeoutsStarted - timeoutsFinished;
@@ -320,6 +321,13 @@ IoContext::IncomingRequest::~IoContext_IncomingRequest() noexcept(false) {
 
   bool hadUndrainedWaitUntilTasks = !waitedForWaitUntil && !context->waitUntilTasks.isEmpty();
   kj::Maybe<kj::Exception> cancellationException;
+
+  if (context->retireRequestDeadlines && waitedForWaitUntil && context->waitUntilTasks.isEmpty() &&
+      context->abortException == kj::none &&
+      context->limitEnforcer->getLimitsExceeded() == kj::none) {
+    // Cancellation needs the current request's timer channel until terminal handles are released.
+    context->cancelRequestDeadlineTimers();
+  }
 
   if (util::Autogate::isEnabled(util::AutogateKey::JSRPC_TRACING) && !context->isShared()) {
     // Reentry callbacks may have spans attached to their pending promises. Cancel them while the
@@ -1029,8 +1037,21 @@ void IoContext::TimeoutManagerImpl::clearTimeout(IoContext& context, TimeoutId t
   timeout->second.cancel();
 }
 
-TimeoutId IoContext::setTimeoutImpl(
-    TimeoutId::Generator& generator, bool repeat, jsg::Function<void()> function, double msDelay) {
+void IoContext::TimeoutManagerImpl::cancelRequestDeadlines() {
+  for (auto& entry: timeouts) {
+    auto& state = entry.second;
+    if (state.params.lifetime == Lifetime::REQUEST_DEADLINE) {
+      KJ_REQUIRE(!state.isRunning, "cannot retire a running request deadline");
+      state.cancel();
+    }
+  }
+}
+
+TimeoutId IoContext::setTimeoutImpl(TimeoutId::Generator& generator,
+    bool repeat,
+    jsg::Function<void()> function,
+    double msDelay,
+    TimeoutManager::Lifetime lifetime) {
   static constexpr int64_t max = 3153600000000;  // Milliseconds in 100 years
   // Clamp the range on timers to [0, 3153600000000] (inclusive). The specs
   // do not indicate a clear maximum range for setTimeout/setInterval so the
@@ -1039,7 +1060,14 @@ TimeoutId IoContext::setTimeoutImpl(
       : msDelay >= static_cast<double>(max)           ? max
                                                       : static_cast<int64_t>(msDelay);
   auto params = TimeoutManager::TimeoutParameters(repeat, delay, kj::mv(function));
+  params.lifetime = lifetime;
   return timeoutManager->setTimeout(*this, generator, kj::mv(params));
+}
+
+void IoContext::cancelRequestDeadlineTimers() {
+  KJ_REQUIRE(actor == kj::none && waitUntilTasks.isEmpty(),
+      "request deadlines cannot retire before tracked work drains");
+  timeoutManager->cancelRequestDeadlines();
 }
 
 void IoContext::clearTimeoutImpl(TimeoutId id) {

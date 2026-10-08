@@ -872,12 +872,22 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
 
   // Used to implement setTimeout(). We don't expose the timer directly because the
   // promises it returns need to live in this I/O context, anyway.
-  TimeoutId setTimeoutImpl(
-      TimeoutId::Generator& generator, bool repeat, jsg::Function<void()> function, double msDelay);
+  TimeoutId setTimeoutImpl(TimeoutId::Generator& generator,
+      bool repeat,
+      jsg::Function<void()> function,
+      double msDelay,
+      TimeoutManager::Lifetime lifetime = TimeoutManager::Lifetime::APPLICATION);
 
   // Used to implement clearTimeout(). We don't expose the timer directly because the
   // promises it returns need to live in this I/O context, anyway.
   void clearTimeoutImpl(TimeoutId key);
+  // Retire internal request deadlines only after handler, transport and tracked work finish.
+  void cancelRequestDeadlineTimers();
+  void enableRequestDeadlineRetirement() {
+    KJ_REQUIRE(actor == kj::none && incomingRequests.empty(),
+        "request deadline retirement must be enabled before delivery");
+    retireRequestDeadlines = true;
+  }
 
   size_t getTimeoutCount();
 
@@ -1224,6 +1234,7 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   // members in reverse declaration order, so declaring timeoutManager first ensures it is destroyed
   // last among these three.
   kj::Own<TimeoutManager> timeoutManager;
+  bool retireRequestDeadlines = false;
 
   kj::TaskSet waitUntilTasks;
   EventOutcome waitUntilStatusValue = EventOutcome::OK;

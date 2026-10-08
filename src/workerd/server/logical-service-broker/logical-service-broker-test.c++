@@ -237,6 +237,25 @@ KJ_TEST("composite router v2 parses the canonical envelope discriminator") {
   KJ_EXPECT(composite_v2::bindingKindFor(request.operation) == composite_v2::BindingKind::KV);
 }
 
+KJ_TEST("composite webhook verification is typed and bounded without credentials") {
+  auto request = composite_v2::parseRequestEnvelope(
+      R"JSON({"version":2,"request_id":"webhook-1","binding":"webhook","operation":{"kind":"webhook_verify","body_base64":"/wAB","signature":"t=1,v1=signature"}})JSON"_kj);
+  KJ_EXPECT(request.operation == composite_v2::OperationKind::WEBHOOK_VERIFY);
+  KJ_EXPECT(composite_v2::bindingKindFor(request.operation) == composite_v2::BindingKind::WEBHOOK);
+  KJ_EXPECT(composite_v2::parseBindingKind("webhook"_kj) == composite_v2::BindingKind::WEBHOOK);
+  for (auto operation:
+      {
+        R"JSON({"kind":"webhook_verify","body_base64":"!","signature":"signature"})JSON"_kj,
+        R"JSON({"kind":"webhook_verify","body_base64":"","signature":""})JSON"_kj,
+        R"JSON({"kind":"webhook_verify","body_base64":"","signature":"signature","secret":"forbidden"})JSON"_kj,
+      }) {
+    auto input = kj::str("{\"version\":2,\"request_id\":\"webhook-1\",\"binding\":\"webhook\","
+                         "\"operation\":",
+        operation, "}");
+    KJ_EXPECT_THROW(FAILED, composite_v2::parseRequestEnvelope(input));
+  }
+}
+
 KJ_TEST("composite router v2 rejects unknown operations before adapter dispatch") {
   auto input =
       R"JSON({"version":2,"request_id":"req-1","binding":"example","operation":{"kind":"kv_read"}})JSON"_kj;

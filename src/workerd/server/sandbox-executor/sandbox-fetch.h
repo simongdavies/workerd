@@ -57,6 +57,10 @@ struct FetchResponse {
 
 class FetchBroker: public kj::Refcounted {
  public:
+  virtual bool isQuiescent() const {
+    return false;
+  }
+
   virtual kj::Promise<void> request(FetchRequest request,
       const kj::HttpHeaders& requestHeaders,
       kj::AsyncInputStream& requestBody,

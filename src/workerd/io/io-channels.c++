@@ -4,9 +4,16 @@
 #include <workerd/io/worker.h>
 #include <workerd/util/entropy.h>
 
+#include <kj/compat/http.h>
+
 #include <random>
 
 namespace workerd {
+
+kj::Promise<kj::Own<kj::WebSocket>> IoChannelFactory::openProviderWebSocket(
+    uint, kj::String, kj::Array<kj::String>) {
+  KJ_FAIL_REQUIRE("scoped provider WebSocket transport is unavailable");
+}
 
 IoChannelFactory::ActorRetryRequestMetadata generateActorRetryRequestMetadata(
     kj::Date createdAt, ActorRetryGateEnabled retryGateEnabled) {

@@ -1,0 +1,392 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hyperloom:workerd-runtime:contract:1",
+  "title": "Hyperloom additive Workerd runtime contract v1",
+  "description": "Target contract, not a capability claim. Existing strict v1 init/fetch/scheduled/queue envelopes remain unchanged. Only implemented and qualified features may be advertised.",
+  "x-host-callbacks": {
+    "provider_websocket_v1": {
+      "callbacks": {
+        "WorkerdWebSocketV1Open": "ProviderWebSocketOpen -> ProviderWebSocketReply",
+        "WorkerdWebSocketV1Send": "ProviderWebSocketSend -> ProviderWebSocketReply",
+        "WorkerdWebSocketV1Receive": "ProviderWebSocketReceive -> ProviderWebSocketReply",
+        "WorkerdWebSocketV1Close": "ProviderWebSocketClose -> ProviderWebSocketReply"
+      },
+      "abi": "String strict JSON -> String strict JSON; field order independent",
+      "manifest": "Ordered {name,kind:provider_websocket}; logical names lowercase; native binding connect(publicURL,protocols=[]) returns a standard CONNECTING WebSocket",
+      "limits": "At most 4 connections per VM, 4 queued frames per direction per connection, 16384 decoded bytes per frame/message, 8388608 total session bytes; operator may set lower finite bounds",
+      "authority": "Captured app/revision/binding and original admitted invocation deadline; wss URL, normalized resource path/query and subprotocols must match operator policy",
+      "credentials": "No guest headers or credential selectors. Host-only destination-bound reference read per connection after DNS/IP/TLS/scope checks; no secret in guest, URL, query, environment or checkpoint",
+      "sequence": "Send and Receive directions independently start at zero; Receive open is event zero. Pending/backpressure consumes no sequence",
+      "lifetime": "Connecting/open/closing/failed-unreleased handles block checkpoint. Graceful close terminal event follows actual worker join; cancel may return cancelling pending until joined, never fake closed. Guest destructor pending cancel taints quiescence; host teardown owns final bounded join"
+    },
+    "secure_entropy_v1": {
+      "name": "WorkerdEntropyV1Read",
+      "argument": "U64 amount, inclusive 1..16384",
+      "result": "VecBytes, exactly amount bytes",
+      "source": "Fresh host OS CSPRNG for every call; no guest entropy cache or deterministic fallback",
+      "failure": "Invalid amount or OS entropy failure fails closed",
+      "availability": "Registered before guest initialization and on every template restore and changed-instance resume"
+    }
+  },
+  "x-routes": {
+    "capabilities": "GET /v1/capabilities",
+    "invocation": "POST /v1/apps/{app_id}/invoke",
+    "lifecycle": "POST /v1/instances/{instance_id}/{create|park|resume|release}",
+    "instance_invocation": "POST /v1/instances/{instance_id}/invoke",
+    "instance_list": "GET /v1/instances?app_id={app_id}&revision={revision}",
+    "instance_status": "GET /v1/instances/{instance_id}?app_id={app_id}&revision={revision}",
+    "instance_http": "ANY /v1/instances/{instance_id}/http on the data listener"
+  },
+  "x-guest-exports": {
+    "init": "Existing init v1/v2/v3 frozen; explicit init v4 selects InitManifest and bounded immutable source reads before runtime_capabilities.",
+    "runtime_capabilities": "ControlRequest -> GuestCapabilities via one HostPrint JSON line",
+    "checkpoint": "ControlRequest -> SafePoint via one HostPrint JSON line",
+    "invoke": "GuestInvocation -> existing typed v1 response via HostPrint",
+    "ingress_stream": "IngressInvocation -> WorkerdIngressV1Send/WorkerdIngressV1Receive callbacks"
+  },
+  "x-invariants": [
+    "Guest HostPrint emits LF; the existing host console translates it to CRLF. Preserve the exact existing buffered v1 transport.",
+    "Disposable and resident modes accept every invocation kind, independently of app category.",
+    "A response or end frame is not a safe point. CallDone must follow bounded completion of all tracked work.",
+    "The host watchdog covers the admitted remaining wall budget, including queue, restore, handler, transport and tracked work. Guest lifetime_budget_ms is the remaining budget, never a fresh deadline.",
+    "Each stream direction starts sequence at zero and increases by one. At most 16384 decoded bytes per frame. Send/Receive callbacks are nonblocking polls so full-duplex owner-thread progress is possible.",
+    "Receive kind pending consumes no sequence. SendAck accepted=false,cancelled=false,error=backpressure consumes no sequence; guest retries using a 1ms native poll timer within the same admitted deadline. All other rejection errors are terminal.",
+    "ingress_stream request.body_base64 is empty; Receive owns the entire inbound body.",
+    "websocket=true permits an upgrade but does not imply success; a valid headers frame with status 101 establishes it.",
+    "WebSocket opcodes: 1 strict UTF-8 text; 2 binary; 8 two-byte big-endian valid close code plus UTF-8 reason. The host validates client masking and wire framing.",
+    "accepted=false and cancelled=false requires an error. cancelled=true terminates transport, cancels the handler and drains tracked work before CallDone.",
+    "SafePoint quiescent=true requires zero invocations, streams, websockets, tasks and outstanding non-reconstructable external handles/timers.",
+    "Park snapshots the changed logical instance, never its initialized template. Commit the checkpoint atomically before confirmed live VM termination publishes parked.",
+    "Create expects generation zero. Park/release require the current generation; resume atomically claims a parked generation and publishes generation+1 only after compatible reconstruction.",
+    "A stale fence or simultaneous claim returns 409. Recovery failure returns 503 and failed state; never silently start pristine state.",
+    "Released is published with the same generation only after confirmed termination and reconciliation. Failed termination retains or quarantines capacity.",
+    "Durable is the per-app checkpoint default. Local-only is explicit. An encrypted authenticated durable backend, compatible target validation and persisted single-owner fencing are required.",
+    "A durable file on a persistent volume can establish local/replacement-host recovery only; ephemeral emptyDir and an untested cross-node backend are not cross-node recovery proof.",
+    "Network control endpoints require platform authentication and tenant/revision authority. The standalone operator host is not an authenticated multi-tenant control plane.",
+    "Init v4 raw source is UTF-8 bytes for string modules and decoded binary bytes for Wasm, never Wasm base64. Verify source_sha256 before constructing runtime. Max32modules,1MiB/module,8MiB aggregate decoded source,16MiB package JSON.",
+    "bundle_sha256 is the host-verified SHA256 of the canonical immutable WorkerBundle JSON including full sources; it is opaque to the guest and mandatory on every read. The manifest is not that canonical bundle and must not be rehashed as a substitute.",
+    "WorkerdBundleV1Read(String JSON)->VecBytes returns exactly max_bytes bytes, never a short read; offset must be below declared source_bytes and offset+max_bytes within it. Guest stops at descriptor length and never asks EOF.",
+    "Module reads are enabled only during init v4, bound to immutable worker_version+bundle_sha256+module_name, and revoked before the initialized snapshot. Legacy v1 retains48KiB source/60KiB envelope/32KiB buffered body limits.",
+    "Additive manifest v3/v4 binding kind webhook exposes only verify(rawBody,signature). It calls the existing composite logical-service v2 transport; v1/v2 init and existing binding kinds remain unchanged.",
+    "Webhook rawBody is exact UTF-8 string bytes or ArrayBuffer/view bytes, at most32768 decoded bytes; signature at most1024 bytes. Host-only private reference supplies HMAC-SHA256 key and trusted host replay clock. No key in guest environment/module/template/checkpoint.",
+    "Expected invalid signature/timestamp returns status ok, value valid=false. Malformed envelopes/oversized inputs return invalid_request; missing references/provider failures return host_error; wrong binding/app/revision authority returns denied. Native method throws on every non-ok status.",
+    "Webhook value is strictly {valid:boolean,event?:JSON}; event may appear only when valid=true and signed body is valid JSON. Host reference mappings and replay tolerance are admitted policy, rehydrated on resume; external resource creation/authorization is out of scope.",
+    "Fenced HTTP requires exactly one trusted x-hyperloom-app, x-hyperloom-revision, x-hyperloom-generation and x-hyperloom-request-url header. Validate actual admitted app/revision/current generation before execution; remove these routing headers before guest delivery. The authenticated platform overwrites them, never trusts client-supplied values.",
+    "Instance HTTP is served only on the data listener, not the separate admin probe listener. Lifecycle active replies publish http_endpoint separately from the JSON invoke endpoint. Both are runtime-local destinations, never an authentication grant.",
+    "Instance status/list require exact app_id and revision query authority and include persisted parked generations/checkpoint identities after process replacement. owner_loaded=false with ownership_reconciled=false is unresolved prior ownership, not a ready active VM. Do not create pristine state or assume such an owner is dead.",
+    "Parked logical instances consume bounded retention metadata but no live VM permit. Create/resume atomically reserve the configured live capacity; only confirmed park/termination frees that permit.",
+    "WorkerdEntropyV1Read(U64 amount)->VecBytes is additive, with exactly 1..16384 fresh host OS CSPRNG bytes per call. Empty guest generation is a no-op; larger requests use bounded chunks. Never cache guest entropy, copy a deterministic source into snapshots, or substitute deterministic bytes when the host callback fails.",
+    "secure-entropy-v1 identifies the corrected guest intrinsic entropy source, not merely host callback registration. Real UUID, random-value and cryptographic key-generation clone/resume qualification is required before broader crypto freshness claims."
+  ],
+  "$defs": {
+    "ProviderWebSocketOpen": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "binding", "url", "subprotocols"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "binding": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+        "url": {"type": "string", "minLength": 1, "maxLength": 8192},
+        "subprotocols": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "minLength": 1, "maxLength": 128}}
+      }
+    },
+    "ProviderWebSocketSend": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "binding", "handle_id", "sequence", "opcode", "body_base64"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "binding": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+        "handle_id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "opcode": {"enum": [1, 2]}, "body_base64": {"type": "string", "maxLength": 21848}
+      }
+    },
+    "ProviderWebSocketReceive": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "binding", "handle_id", "sequence"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "binding": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+        "handle_id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+      }
+    },
+    "ProviderWebSocketClose": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "binding", "handle_id", "mode"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "binding": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$"},
+        "handle_id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+        "mode": {"enum": ["graceful", "cancel"]}, "code": {"type": "integer", "minimum": 1000, "maximum": 4999},
+        "reason": {"type": "string", "maxLength": 123}
+      },
+      "allOf": [
+        {"if": {"properties": {"mode": {"const": "graceful"}}}, "then": {"required": ["code", "reason"]},
+         "else": {"not": {"anyOf": [{"required": ["code"]}, {"required": ["reason"]}]}}}
+      ]
+    },
+    "ProviderWebSocketReply": {
+      "type": "object", "unevaluatedProperties": false,
+      "required": ["protocol_version", "request_id", "status", "code"],
+      "properties": {"protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"}},
+      "oneOf": [
+        {"properties": {"status": {"const": "pending"}, "code": {"const": "pending"}}},
+        {"required": ["handle_id"], "properties": {"status": {"const": "pending"}, "code": {"const": "connecting"}, "handle_id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}}},
+        {"required": ["accepted"], "properties": {"status": {"const": "ok"}, "code": {"const": "accepted"}, "accepted": {"const": true}}},
+        {"required": ["accepted"], "properties": {"status": {"const": "pending"}, "code": {"const": "backpressure"}, "accepted": {"const": false}}},
+        {"required": ["accepted"], "properties": {"status": {"const": "pending"}, "code": {"enum": ["closing", "cancelling"]}, "accepted": {"const": true}}},
+        {"properties": {"status": {"const": "ok"}, "code": {"const": "cancelled"}}},
+        {"properties": {"status": {"enum": ["denied", "invalid_request", "host_error"]}, "code": {"type": "string", "minLength": 1, "maxLength": 64}}},
+        {
+          "required": ["handle_id", "sequence", "kind"],
+          "properties": {
+            "status": {"const": "ok"}, "code": {"const": "event"},
+            "handle_id": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+            "sequence": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+          },
+          "oneOf": [
+            {"properties": {"kind": {"const": "open"}}},
+            {"required": ["opcode", "body_base64"], "properties": {"kind": {"const": "message"}, "opcode": {"enum": [1, 2]}, "body_base64": {"type": "string", "maxLength": 21848}}},
+            {"required": ["close_code", "reason"], "properties": {"kind": {"const": "close"}, "close_code": {"type": "integer", "minimum": 1000, "maximum": 4999}, "reason": {"type": "string", "maxLength": 123}}}
+          ]
+        }
+      ]
+    },
+    "EntropyReadAmount": {"type": "integer", "minimum": 1, "maximum": 16384},
+    "WebhookOperation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["kind", "body_base64", "signature"],
+      "properties": {
+        "kind": {"const": "webhook_verify"},
+        "body_base64": {"type": "string", "maxLength": 43692},
+        "signature": {"type": "string", "minLength": 1, "maxLength": 1024}
+      }
+    },
+    "WebhookRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "request_id", "binding", "operation"],
+      "properties": {
+        "version": {"const": 2}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "binding": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z][a-z0-9_-]*$"},
+        "operation": {"$ref": "#/$defs/WebhookOperation"}
+      }
+    },
+    "WebhookResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "request_id", "status", "code"],
+      "properties": {
+        "version": {"const": 2}, "request_id": {"type": "string", "maxLength": 64},
+        "status": {"enum": ["ok", "denied", "invalid_request", "host_error"]},
+        "code": {"type": "string", "maxLength": 128},
+        "value": {
+          "type": "object", "additionalProperties": false, "required": ["valid"],
+          "properties": {"valid": {"type": "boolean"}, "event": {}}
+        }
+      }
+    },
+    "BundleReadQuery": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "worker_version", "bundle_sha256", "module_name", "offset", "max_bytes"],
+      "properties": {
+        "protocol_version": {"const": 1}, "worker_version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "module_name": {"type": "string", "minLength": 1, "maxLength": 256},
+        "offset": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 16384}
+      }
+    },
+    "InitManifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "worker_version", "bundle_sha256", "compatibility_date", "compatibility_flags", "main_module", "modules", "storage", "bindings"],
+      "properties": {
+        "protocol_version": {"const": 4}, "worker_version": {"type": "string", "minLength": 1, "maxLength": 256},
+        "bundle_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "compatibility_date": {"type": "string"}, "compatibility_flags": {"type": "array", "maxItems": 32, "items": {"type": "string"}},
+        "main_module": {"type": "string"},
+        "modules": {
+          "type": "array", "minItems": 1, "maxItems": 32,
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["name", "type", "source_bytes", "source_sha256"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1, "maxLength": 256},
+              "type": {"enum": ["esModule", "commonJsModule", "wasm", "text", "json"]},
+              "source_bytes": {"type": "integer", "minimum": 0, "maximum": 1048576},
+              "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+            }
+          }
+        },
+        "storage": {"type": "array", "maxItems": 8},
+        "bindings": {"type": "array", "maxItems": 32}
+      }
+    },
+    "RequestId": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[A-Za-z0-9._:-]+$"},
+    "ControlRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id"],
+      "properties": {"protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"}}
+    },
+    "GuestCapabilities": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "extensions", "max_frame_bytes"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "extensions": {"type": "array", "uniqueItems": true, "items": {"enum": ["tracked-work-drain-v1", "safe-point-v1", "ingress-stream-v1", "invocation-budget-v2", "secure-entropy-v1", "authenticated-egress-websocket-v1"]}},
+        "max_frame_bytes": {"type": "integer", "minimum": 1, "maximum": 16384}
+      }
+    },
+    "SafePoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "quiescent", "active_invocations", "active_streams", "active_websockets", "active_tasks"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "quiescent": {"type": "boolean"},
+        "active_invocations": {"type": "integer", "minimum": 0},
+        "active_streams": {"type": "integer", "minimum": 0},
+        "active_websockets": {"type": "integer", "minimum": 0},
+        "active_tasks": {"type": "integer", "minimum": 0}
+      }
+    },
+    "Invocation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "kind", "request"],
+      "properties": {
+        "protocol_version": {"const": 1}, "kind": {"enum": ["fetch", "scheduled", "queue"]},
+        "request": {"type": "object", "description": "Existing strict v1 envelope for the selected kind, with existing validation and bounds."}
+      }
+    },
+    "InvocationResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "kind", "response"],
+      "properties": {
+        "protocol_version": {"const": 1},
+        "kind": {"enum": ["fetch", "scheduled", "queue"]},
+        "response": {"type": "object", "description": "Selected unchanged v1 response envelope. Outer HTTP200 means successful invocation transport, not response.status200."}
+      }
+    },
+    "GuestInvocation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "kind", "request", "lifetime_budget_ms"],
+      "properties": {
+        "protocol_version": {"const": 2}, "kind": {"enum": ["fetch", "scheduled", "queue"]},
+        "request": {"type": "object"},
+        "lifetime_budget_ms": {"type": "integer", "minimum": 1, "maximum": 4294967295}
+      }
+    },
+    "IngressInvocation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "request", "websocket", "lifetime_budget_ms"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "request": {"type": "object", "properties": {"body_base64": {"const": ""}}},
+        "websocket": {"type": "boolean"},
+        "lifetime_budget_ms": {"type": "integer", "minimum": 1, "maximum": 4294967295}
+      }
+    },
+    "Header": {
+      "type": "object", "additionalProperties": false, "required": ["name", "value"],
+      "properties": {"name": {"type": "string"}, "value": {"type": "string"}}
+    },
+    "Frame": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "sequence", "kind"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "sequence": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+        "kind": {"enum": ["headers", "data", "websocket", "end", "error", "cancel", "pending"]},
+        "status": {"type": "integer", "minimum": 100, "maximum": 599},
+        "headers": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/Header"}},
+        "body_base64": {"type": "string", "maxLength": 21848},
+        "opcode": {"enum": [1, 2, 8]},
+        "error": {"type": "string", "maxLength": 1024}
+      }
+    },
+    "SendAck": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "sequence", "accepted", "cancelled"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "sequence": {"type": "integer", "minimum": 0},
+        "accepted": {"type": "boolean"}, "cancelled": {"type": "boolean"},
+        "error": {"type": "string", "maxLength": 1024}
+      }
+    },
+    "LifecycleRequest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "app_id", "revision", "expected_generation", "checkpoint_policy"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "app_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "revision": {"type": "string", "minLength": 1, "maxLength": 256},
+        "expected_generation": {"type": "integer", "minimum": 0},
+        "checkpoint_policy": {"enum": ["durable", "local"]}
+      }
+    },
+    "LifecycleReply": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "instance_id", "generation", "state"],
+      "properties": {
+        "protocol_version": {"const": 1}, "request_id": {"$ref": "#/$defs/RequestId"},
+        "instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "generation": {"type": "integer", "minimum": 1},
+        "state": {"enum": ["active", "draining", "checkpointing", "parked", "resuming", "failed", "released"]},
+        "checkpoint_id": {"type": "string", "minLength": 1},
+        "endpoint": {"type": "string", "format": "uri", "description": "Runtime-local fenced per-instance JSON invocation endpoint, published only while active. Never substitute the app/pool endpoint."},
+        "http_endpoint": {"type": "string", "format": "uri", "description": "Separate runtime-local fenced HTTP/SSE/WebSocket data-listener endpoint. Authenticate and validate the four explicit routing headers before forwarding."}
+      }
+    },
+    "InstanceInvocation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_version", "request_id", "app_id", "revision", "instance_id", "expected_generation", "lifetime_budget_ms", "invocation"],
+      "properties": {
+        "protocol_version": {"const": 1},
+        "request_id": {"$ref": "#/$defs/RequestId"},
+        "app_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "revision": {"type": "string", "minLength": 1, "maxLength": 256},
+        "instance_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "expected_generation": {"type": "integer", "minimum": 1},
+        "lifetime_budget_ms": {"type": "integer", "minimum": 1, "maximum": 4294967295},
+        "invocation": {"description": "Typed kind/request without an extra outer protocol_version; request is the unchanged strict v1 envelope.", "type": "object"}
+      }
+    }
+  },
+  "x-golden-vectors": [
+    {"schema": "ProviderWebSocketOpen", "value": {"protocol_version": 1, "request_id": "open-1", "binding": "transcribe", "url": "wss://approved.example/realtime?model=example-stream", "subprotocols": []}},
+    {"schema": "ProviderWebSocketReply", "value": {"protocol_version": 1, "request_id": "open-1", "status": "pending", "code": "connecting", "handle_id": 1}},
+    {"schema": "ProviderWebSocketReply", "value": {"protocol_version": 1, "request_id": "read-1", "status": "ok", "code": "event", "handle_id": 1, "sequence": 0, "kind": "open"}},
+    {"schema": "ProviderWebSocketReply", "value": {"protocol_version": 1, "request_id": "read-2", "status": "ok", "code": "event", "handle_id": 1, "sequence": 1, "kind": "message", "opcode": 2, "body_base64": "AAE="}},
+    {"schema": "ProviderWebSocketReply", "value": {"protocol_version": 1, "request_id": "read-3", "status": "ok", "code": "event", "handle_id": 1, "sequence": 2, "kind": "close", "close_code": 1000, "reason": "complete"}},
+    {"schema": "ProviderWebSocketClose", "value": {"protocol_version": 1, "request_id": "cancel-1", "binding": "transcribe", "handle_id": 1, "mode": "cancel"}},
+    {"schema": "ProviderWebSocketReply", "value": {"protocol_version": 1, "request_id": "cancel-1", "status": "pending", "code": "cancelling", "accepted": true}},
+    {"schema": "EntropyReadAmount", "value": 1},
+    {"schema": "EntropyReadAmount", "value": 16384},
+    {"schema": "ControlRequest", "value": {"protocol_version": 1, "request_id": "checkpoint-1"}},
+    {"schema": "SafePoint", "value": {"protocol_version": 1, "request_id": "checkpoint-1", "quiescent": true, "active_invocations": 0, "active_streams": 0, "active_websockets": 0, "active_tasks": 0}},
+    {"schema": "Frame", "value": {"protocol_version": 1, "request_id": "stream-1", "sequence": 0, "kind": "headers", "status": 200, "headers": [{"name": "content-type", "value": "text/event-stream"}]}},
+    {"schema": "Frame", "value": {"protocol_version": 1, "request_id": "stream-1", "sequence": 1, "kind": "data", "body_base64": "ZGF0YTogaGkKCg=="}},
+    {"schema": "SendAck", "value": {"protocol_version": 1, "request_id": "stream-1", "sequence": 1, "accepted": true, "cancelled": false}},
+    {"schema": "LifecycleRequest", "value": {"protocol_version": 1, "request_id": "resume-1", "app_id": "hello", "revision": "hello-v1", "expected_generation": 1, "checkpoint_policy": "durable"}},
+    {"schema": "LifecycleReply", "value": {"protocol_version": 1, "request_id": "resume-1", "instance_id": "hello-instance-1", "generation": 2, "state": "active", "checkpoint_id": "checkpoint-1"}},
+    {"schema": "Frame", "value": {"protocol_version": 1, "request_id": "stream-1", "sequence": 0, "kind": "pending"}},
+    {"schema": "SendAck", "value": {"protocol_version": 1, "request_id": "stream-1", "sequence": 1, "accepted": false, "cancelled": false, "error": "backpressure"}},
+    {"schema": "WebhookRequest", "value": {"version": 2, "request_id": "webhook-1", "binding": "webhook", "operation": {"kind": "webhook_verify", "body_base64": "eyJpZCI6ImV2dF8xIn0=", "signature": "t=1,v1=0000000000000000000000000000000000000000000000000000000000000000"}}},
+    {"schema": "WebhookResponse", "value": {"version": 2, "request_id": "webhook-1", "status": "ok", "code": "verified", "value": {"valid": false}}}
+  ],
+  "x-negative-vectors": [
+    {"schema": "ProviderWebSocketOpen", "value": {"protocol_version": 1, "request_id": "open-1", "binding": "transcribe", "url": "wss://approved.example/", "subprotocols": [], "headers": {"Authorization": "forbidden"}}},
+    {"schema": "ProviderWebSocketClose", "value": {"protocol_version": 1, "request_id": "cancel-1", "binding": "transcribe", "handle_id": 1, "mode": "cancel", "code": 1000}},
+    {"schema": "EntropyReadAmount", "value": 0},
+    {"schema": "EntropyReadAmount", "value": 16385},
+    {"schema": "EntropyReadAmount", "value": -1},
+    {"schema": "SafePoint", "expected_request_id": "checkpoint-1", "value": {"protocol_version": 1, "request_id": "checkpoint-1", "quiescent": true, "active_invocations": 1, "active_streams": 0, "active_websockets": 0, "active_tasks": 0}},
+    {"schema": "SafePoint", "expected_request_id": "checkpoint-1", "value": {"protocol_version": 1, "request_id": "wrong-id", "quiescent": true, "active_invocations": 0, "active_streams": 0, "active_websockets": 0, "active_tasks": 0}},
+    {"schema": "GuestCapabilities", "required": "safe-point-v1", "value": {"protocol_version": 1, "request_id": "cap-1", "extensions": ["tracked-work-drain-v1"], "max_frame_bytes": 16384}},
+    {"schema": "GuestInvocation", "value": {"protocol_version": 2, "kind": "scheduled", "request": {"protocol_version": 1, "request_id": "scheduled-1", "scheduled_time_unix_ms": 1767225600000, "cron": "0 0 * * *"}, "lifetime_budget_ms": 0}},
+    {"schema": "Frame", "expected_sequence": 0, "value": {"protocol_version": 1, "request_id": "stream-1", "sequence": 1, "kind": "headers", "status": 200, "headers": []}},
+    {"schema": "Frame", "value": {"protocol_version": 1, "request_id": "stream-1", "sequence": 0, "kind": "data", "body_base64": "not-base64!"}},
+    {"schema": "Frame", "value": {"protocol_version": 1, "request_id": "stream-1", "sequence": 0, "kind": "headers", "status": 200, "headers": [{"name": "x-test", "value": "bad\r\nheader"}]}},
+    {"schema": "StreamCompletion", "transport_ended": true, "tracked_work_drained": false},
+    {"schema": "LifecycleRequest", "current_generation": 2, "value": {"protocol_version": 1, "request_id": "resume-1", "app_id": "hello", "revision": "hello-v1", "expected_generation": 1, "checkpoint_policy": "durable"}},
+    {"schema": "LifecycleRequest", "current_state": "resuming", "value": {"protocol_version": 1, "request_id": "resume-race", "app_id": "hello", "revision": "hello-v1", "expected_generation": 1, "checkpoint_policy": "durable"}}
+  ]
+}

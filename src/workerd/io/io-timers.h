@@ -65,6 +65,11 @@ class TimeoutId::Generator {
 
 class TimeoutManager {
  public:
+  enum class Lifetime {
+    APPLICATION,
+    REQUEST_DEADLINE,
+  };
+
   // Upper bound on the number of timeouts a user can *ever* have active.
   constexpr static auto MAX_TIMEOUTS = 10'000;
 
@@ -73,6 +78,7 @@ class TimeoutManager {
 
     bool repeat;
     int64_t msDelay;
+    Lifetime lifetime = Lifetime::APPLICATION;
 
     // This is a maybe to allow cancel to clear it and free the reference
     // when it is no longer needed.
@@ -85,6 +91,7 @@ class TimeoutManager {
   virtual size_t getTimeoutCount() const = 0;
   virtual kj::Maybe<kj::Date> getNextTimeout() const = 0;
   virtual void cancelAll() = 0;
+  virtual void cancelRequestDeadlines() = 0;
 };
 
 }  // namespace workerd

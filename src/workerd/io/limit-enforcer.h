@@ -178,6 +178,17 @@ class LimitEnforcer {
   // data in C++ memory, such as reading an entire HTTP response into an `ArrayBuffer`.
   virtual size_t getBufferingLimit() = 0;
 
+  struct WebSocketLimits {
+    size_t messageBytes;
+    size_t queuedMessages;
+    size_t queuedBytes;
+  };
+
+  // Optional transport-specific bounds; absent limits preserve native WebSocket behavior.
+  virtual kj::Maybe<WebSocketLimits> getWebSocketLimits() const {
+    return kj::none;
+  }
+
   // If a limit has been exceeded which prevents further JavaScript execution, such as the CPU or
   // memory limit, returns a request status code indicating which one. Returns null if no limits
   // are exceeded.

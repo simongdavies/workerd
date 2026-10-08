@@ -20,6 +20,7 @@
 namespace kj {
 class HttpClient;
 class Network;
+class WebSocket;
 }  // namespace kj
 
 namespace workerd {
@@ -205,6 +206,8 @@ class IoChannelFactory: public virtual kj::Refcounted {
   };
 
   virtual kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) = 0;
+  virtual kj::Promise<kj::Own<kj::WebSocket>> openProviderWebSocket(
+      uint channel, kj::String url, kj::Array<kj::String> protocols);
 
   // Get a Cap'n Proto RPC capability. Various binding types are backed by capabilities.
   //

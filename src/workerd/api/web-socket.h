@@ -304,6 +304,9 @@ class WebSocket: public EventTarget {
   static jsg::Ref<WebSocket> constructor(jsg::Lock& js,
       kj::String url,
       jsg::Optional<kj::OneOf<kj::Array<kj::String>, kj::String>> protocols);
+  static jsg::Ref<WebSocket> fromScopedConnection(
+      jsg::Lock& js, kj::String publicUrl, kj::Promise<kj::Own<kj::WebSocket>> connection);
+  double getBufferedAmount();
 
   // Begin delivering events locally.
   void accept(jsg::Lock& js, jsg::Optional<AcceptOptions> options);
@@ -436,9 +439,20 @@ class WebSocket: public EventTarget {
   kj::Own<WebSocketAdapter> impl;
 };
 
+class ScopedProviderWebSocket final: public WebSocket {
+ public:
+  ScopedProviderWebSocket(jsg::Lock& js, kj::String publicUrl): WebSocket(js, kj::mv(publicUrl)) {}
+  static jsg::Ref<ScopedProviderWebSocket> constructor() = delete;
+
+  JSG_RESOURCE_TYPE(ScopedProviderWebSocket) {
+    JSG_INHERIT(WebSocket);
+    JSG_READONLY_PROTOTYPE_PROPERTY(bufferedAmount, getBufferedAmount);
+  }
+};
+
 #define EW_WEBSOCKET_ISOLATE_TYPES                                                                 \
-  api::CloseEvent, api::CloseEvent::Initializer, api::WebSocket, api::WebSocket::AcceptOptions,    \
-      api::WebSocketPair, api::WebSocketPair::PairIterator,                                        \
+  api::CloseEvent, api::CloseEvent::Initializer, api::WebSocket, api::ScopedProviderWebSocket,     \
+      api::WebSocket::AcceptOptions, api::WebSocketPair, api::WebSocketPair::PairIterator,         \
       api::WebSocketPair::PairIterator::                                                           \
           Next  // The list of websocket.h types that are added to worker.c++'s JSG_DECLARE_ISOLATE_TYPE
 
@@ -497,6 +511,12 @@ class WebSocketAdapter {
   // Initiates the `new WebSocket(url)` outbound connection. Called once during shell
   // construction for the URL ctor.
   virtual void initConnection(jsg::Lock& js, kj::Promise<PackedWebSocket> packedWsPromise) = 0;
+  virtual void configureScopedProvider() {
+    KJ_FAIL_REQUIRE("scoped provider transport is unavailable on this WebSocket adapter");
+  }
+  virtual uint64_t getBufferedAmount() {
+    return 0;
+  }
 
   // Pumps messages between this WebSocket and `other`. Only valid in the post-connect /
   // pre-accept state.
@@ -612,6 +632,8 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   void setBinaryType(kj::String value) override;
 
   void initConnection(jsg::Lock& js, kj::Promise<PackedWebSocket> packedWsPromise) override;
+  void configureScopedProvider() override;
+  uint64_t getBufferedAmount() override;
   kj::Promise<DeferredProxy<void>> couple(
       jsg::Lock& js, kj::Own<kj::WebSocket> other, RequestObserver& request) override;
   void internalAccept(jsg::Lock& js, kj::Maybe<kj::Own<InputGate::CriticalSection>> cs) override;
@@ -750,6 +772,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
 
     // Have we detected that the peer has stopped accepting messages?
     bool outgoingAborted = false;
+    size_t inFlightBytes = 0;
   };
 
   struct GatedMessage {
@@ -898,6 +921,7 @@ class LegacyWebSocketAdapter final: public WebSocketAdapter {
   // Queue of messages to be sent. Wrapped in an IoOwn so the pump loop can safely access
   // the map without locking the isolate.
   IoOwn<OutgoingMessagesMap> outgoingMessages;
+  bool scopedProvider = false;
 
   // Auto-responses can run without a current IoContext, so they access the state directly while
   // the IoOwn ensures it is destroyed by the owning IoContext.

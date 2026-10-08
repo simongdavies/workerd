@@ -419,7 +419,8 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(kj::HttpMetho
     kj::Maybe<kj::StringPtr> cfBlobJson,
     Worker::Lock& lock,
     kj::Maybe<ExportedHandler&> exportedHandler,
-    kj::Maybe<jsg::Ref<AbortSignal>> abortSignal) {
+    kj::Maybe<jsg::Ref<AbortSignal>> abortSignal,
+    RequestBodyPresence bodyPresence) {
   TRACE_EVENT("workerd", "ServiceWorkerGlobalScope::request()");
   // To construct a ReadableStream object, we're supposed to pass in an Own<AsyncInputStream>, so
   // that it can drop the reference whenever it gets GC'ed. But in this case the stream's lifetime
@@ -463,9 +464,10 @@ kj::Promise<DeferredProxy<void>> ServiceWorkerGlobalScope::request(kj::HttpMetho
   // TODO(cleanup): Should KJ HTTP interfaces explicitly communicate the difference between a
   //   missing body and an empty one?
   kj::Maybe<Body::ExtractedBody> body;
-  if (headers.get(kj::HttpHeaderId::CONTENT_LENGTH) != kj::none ||
-      headers.get(kj::HttpHeaderId::TRANSFER_ENCODING) != kj::none ||
-      requestBody.tryGetLength().orDefault(1) > 0) {
+  if (bodyPresence == RequestBodyPresence::INFER &&
+      (headers.get(kj::HttpHeaderId::CONTENT_LENGTH) != kj::none ||
+          headers.get(kj::HttpHeaderId::TRANSFER_ENCODING) != kj::none ||
+          requestBody.tryGetLength().orDefault(1) > 0)) {
     // We do not automatically decode gzipped request bodies because the fetch() standard doesn't
     // specify any automatic encoding of requests. https://github.com/whatwg/fetch/issues/589
     auto b = newSystemStream(kj::addRef(*ownRequestBody), StreamEncoding::IDENTITY);
@@ -1203,9 +1205,9 @@ jsg::JsValue ServiceWorkerGlobalScope::structuredClone(
 }
 
 TimeoutId::NumberType ServiceWorkerGlobalScope::setTimeoutInternal(
-    jsg::Function<void()> function, double msDelay) {
+    jsg::Function<void()> function, double msDelay, TimeoutManager::Lifetime lifetime) {
   auto timeoutId = IoContext::current().setTimeoutImpl(timeoutIdGenerator,
-      /* repeat */ false, kj::mv(function), msDelay);
+      /* repeat */ false, kj::mv(function), msDelay, lifetime);
   return timeoutId.toNumber();
 }
 

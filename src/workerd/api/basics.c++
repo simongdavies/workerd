@@ -694,7 +694,7 @@ jsg::Ref<AbortSignal> AbortSignal::timeout(jsg::Lock& js, double delay) {
     signal->triggerAbort(js,
         JSG_KJ_EXCEPTION(
             DISCONNECTED, DOMTimeoutError, "The operation was aborted due to timeout"));
-  }, delay);
+  }, delay, TimeoutManager::Lifetime::REQUEST_DEADLINE);
 
   return kj::mv(signal);
 }

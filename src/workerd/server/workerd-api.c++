@@ -4,6 +4,9 @@
 
 #include "workerd-api.h"
 
+#include "provider-websocket-binding.h"
+#include "webhook-binding.h"
+
 #include <workerd/api/actor-state.h>
 #include <workerd/api/actor.h>
 #include <workerd/api/analytics-engine.h>
@@ -147,6 +150,8 @@ JSG_DECLARE_ISOLATE_TYPE(JsgWorkerdIsolate,
     EW_WORKERD_DEBUG_PORT_CLIENT_ISOLATE_TYPES,
     EW_WRAPPED_BINDING_ISOLATE_TYPES,
     workerd::api::EnvModule,
+    workerd::server::WebhookBinding,
+    workerd::server::ProviderWebSocketBinding,
 
     jsg::TypeWrapperExtension<PromiseWrapper>,
     jsg::InjectConfiguration<CompatibilityFlags::Reader>,
@@ -599,6 +604,13 @@ static v8::Local<v8::Value> createBindingValue(JsgWorkerdIsolate::Lock& lock,
                                     : api::Fetcher::RequiresHostAndProtocol::NO,
               pipeline.isInHouse, api::RpcCompatGateBypassed(isInternal.toBool())));
     }
+    KJ_CASE_ONEOF(webhook, Global::Webhook) {
+      value = lock.wrap(
+          context, lock.alloc<WebhookBinding>(webhook.channel, kj::str(webhook.bindingName)));
+    }
+    KJ_CASE_ONEOF(provider, Global::ProviderWebSocket) {
+      value = lock.wrap(context, lock.alloc<ProviderWebSocketBinding>(provider.channel));
+    }
 
     KJ_CASE_ONEOF(loopback, Global::LoopbackServiceStub) {
       value = lock.wrap(context, lock.alloc<api::LoopbackServiceStub>(loopback.channel));
@@ -792,6 +804,12 @@ WorkerdApi::Global WorkerdApi::Global::clone() const {
     }
     KJ_CASE_ONEOF(fetcher, Global::Fetcher) {
       result.value = fetcher.clone();
+    }
+    KJ_CASE_ONEOF(webhook, Global::Webhook) {
+      result.value = webhook.clone();
+    }
+    KJ_CASE_ONEOF(provider, Global::ProviderWebSocket) {
+      result.value = provider.clone();
     }
     KJ_CASE_ONEOF(loopback, Global::LoopbackServiceStub) {
       result.value = loopback.clone();

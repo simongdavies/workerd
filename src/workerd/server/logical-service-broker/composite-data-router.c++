@@ -9,6 +9,7 @@
 #include <capnp/compat/json.h>
 #include <capnp/message.h>
 #include <kj/debug.h>
+#include <kj/encoding.h>
 #include <kj/vector.h>
 
 #include <cmath>
@@ -102,6 +103,8 @@ BindingKind parseBindingKind(kj::StringPtr value) {
   if (value == "cache"_kj) return BindingKind::CACHE;
   if (value == "d1"_kj) return BindingKind::D1;
   if (value == "durable_object"_kj) return BindingKind::DURABLE_OBJECT;
+  if (value == "webhook"_kj) return BindingKind::WEBHOOK;
+  if (value == "provider_websocket"_kj) return BindingKind::PROVIDER_WEBSOCKET;
   KJ_FAIL_REQUIRE("unknown composite binding kind", value);
 }
 
@@ -115,6 +118,10 @@ kj::StringPtr bindingKindName(BindingKind kind) {
       return "d1"_kj;
     case BindingKind::DURABLE_OBJECT:
       return "durable_object"_kj;
+    case BindingKind::WEBHOOK:
+      return "webhook"_kj;
+    case BindingKind::PROVIDER_WEBSOCKET:
+      return "provider_websocket"_kj;
   }
   KJ_UNREACHABLE;
 }
@@ -137,6 +144,7 @@ OperationKind parseOperationKind(kj::StringPtr value) {
   if (value == "do_set_alarm"_kj) return OperationKind::DO_SET_ALARM;
   if (value == "do_delete_alarm"_kj) return OperationKind::DO_DELETE_ALARM;
   if (value == "do_passivate"_kj) return OperationKind::DO_PASSIVATE;
+  if (value == "webhook_verify"_kj) return OperationKind::WEBHOOK_VERIFY;
   KJ_FAIL_REQUIRE("unknown composite operation kind", value);
 }
 
@@ -176,6 +184,8 @@ kj::StringPtr operationKindName(OperationKind operation) {
       return "do_delete_alarm"_kj;
     case OperationKind::DO_PASSIVATE:
       return "do_passivate"_kj;
+    case OperationKind::WEBHOOK_VERIFY:
+      return "webhook_verify"_kj;
   }
   KJ_UNREACHABLE;
 }
@@ -203,6 +213,8 @@ BindingKind bindingKindFor(OperationKind operation) {
     case OperationKind::DO_DELETE_ALARM:
     case OperationKind::DO_PASSIVATE:
       return BindingKind::DURABLE_OBJECT;
+    case OperationKind::WEBHOOK_VERIFY:
+      return BindingKind::WEBHOOK;
   }
   KJ_UNREACHABLE;
 }
@@ -256,10 +268,27 @@ RequestEnvelope parseRequestEnvelope(kj::ArrayPtr<const char> input) {
   KJ_REQUIRE(operationFields.size() > 0 && operationFields[0].getName() == "kind"_kj &&
           operationFields[0].getValue().isString(),
       "composite router operation kind must be the first field");
+  auto operation = parseOperationKind(operationFields[0].getValue().getString());
+  if (operation == OperationKind::WEBHOOK_VERIFY) {
+    KJ_REQUIRE(operationFields.size() == 3 && operationFields[1].getName() == "body_base64"_kj &&
+            operationFields[1].getValue().isString() &&
+            operationFields[2].getName() == "signature"_kj &&
+            operationFields[2].getValue().isString(),
+        "invalid webhook verification operation");
+    auto encoded = operationFields[1].getValue().getString();
+    auto signature = operationFields[2].getValue().getString();
+    KJ_REQUIRE(encoded.size() <= ((MAX_WEBHOOK_BODY_BYTES + 2) / 3) * 4 && signature.size() > 0 &&
+            signature.size() <= MAX_WEBHOOK_SIGNATURE_BYTES,
+        "webhook verification input exceeds limit");
+    auto body = kj::decodeBase64(encoded);
+    KJ_REQUIRE(!body.hadErrors && body.size() <= MAX_WEBHOOK_BODY_BYTES &&
+            kj::encodeBase64(body) == encoded,
+        "invalid webhook verification body");
+  }
   return RequestEnvelope{
     .requestId = kj::mv(requestId),
     .binding = kj::mv(binding),
-    .operation = parseOperationKind(operationFields[0].getValue().getString()),
+    .operation = operation,
   };
 }
 

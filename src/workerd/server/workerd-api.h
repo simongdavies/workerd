@@ -110,6 +110,20 @@ class WorkerdApi final: public Worker::Api {
         return *this;
       }
     };
+    struct Webhook {
+      uint channel;
+      kj::String bindingName;
+
+      Webhook clone() const {
+        return Webhook{channel, kj::str(bindingName)};
+      }
+    };
+    struct ProviderWebSocket {
+      uint channel;
+      ProviderWebSocket clone() const {
+        return *this;
+      }
+    };
     struct KvNamespace {
       uint subrequestChannel;
       kj::String bindingName;
@@ -287,6 +301,8 @@ class WorkerdApi final: public Worker::Api {
     kj::String name;
     kj::OneOf<Json,
         Fetcher,
+        Webhook,
+        ProviderWebSocket,
         LoopbackServiceStub,
         KvNamespace,
         R2Bucket,

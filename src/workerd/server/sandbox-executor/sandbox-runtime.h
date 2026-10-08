@@ -14,7 +14,18 @@
 
 namespace workerd::server::sandbox_executor {
 
+inline constexpr size_t MAX_INGRESS_FRAME_BYTES = 16 * 1024;
+
 class LogicalServiceHostChannel;
+class WebSocketBroker;
+
+class EntropyHostChannel: public kj::Refcounted {
+ public:
+  virtual kj::Array<byte> read(size_t amount) = 0;
+};
+
+kj::Rc<EntropyHostChannel> newSystemEntropyHostChannel();
+kj::Rc<EntropyHostChannel> newHyperlightEntropyHostChannel();
 
 class TimerHostChannel: public kj::Refcounted {
  public:
@@ -110,20 +121,59 @@ struct WorkerBundle {
 
 class SandboxRuntime {
  public:
+  struct Limits {
+    kj::Duration drainTimeout = 30 * kj::SECONDS;
+    kj::Duration scheduledTimeout = 15 * kj::MINUTES;
+  };
+
   SandboxRuntime(const WorkerBundle& bundle, kj::Rc<FetchBroker> fetchBroker);
   SandboxRuntime(const WorkerBundle& bundle,
       kj::Rc<FetchBroker> fetchBroker,
       kj::Rc<LogicalServiceHostChannel> logicalServiceHost);
+  SandboxRuntime(const WorkerBundle& bundle,
+      kj::Rc<FetchBroker> fetchBroker,
+      kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
+      kj::Rc<TimerHostChannel> timerHost,
+      Limits limits);
+  SandboxRuntime(const WorkerBundle& bundle,
+      kj::Rc<FetchBroker> fetchBroker,
+      kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
+      kj::Rc<TimerHostChannel> timerHost,
+      Limits limits,
+      kj::Rc<EntropyHostChannel> entropyHost);
+  SandboxRuntime(const WorkerBundle& bundle,
+      kj::Rc<FetchBroker> fetchBroker,
+      kj::Rc<LogicalServiceHostChannel> logicalServiceHost,
+      kj::Rc<TimerHostChannel> timerHost,
+      Limits limits,
+      kj::Rc<EntropyHostChannel> entropyHost,
+      kj::Rc<WebSocketBroker> webSocketBroker);
   ~SandboxRuntime() noexcept(false);
 
   Response runRequest(kj::HttpMethod method,
       kj::StringPtr url,
       kj::ArrayPtr<const Header> headers,
-      kj::StringPtr body);
+      kj::StringPtr body,
+      kj::Maybe<kj::Duration> lifetimeBudget = kj::none);
 
-  ScheduledResponse runScheduled(kj::Date scheduledTime, kj::StringPtr cron);
+  void runRequestStream(kj::HttpMethod method,
+      kj::StringPtr url,
+      kj::ArrayPtr<const Header> headers,
+      kj::AsyncInputStream& body,
+      kj::HttpService::Response& response,
+      kj::Duration lifetimeBudget,
+      kj::FunctionParam<kj::Promise<void>()> responseComplete,
+      kj::FunctionParam<kj::Promise<void>()> lifetimeComplete);
 
-  QueueResponse runQueue(QueueRequest request);
+  ScheduledResponse runScheduled(kj::Date scheduledTime,
+      kj::StringPtr cron,
+      kj::Maybe<kj::Duration> lifetimeBudget = kj::none);
+
+  QueueResponse runQueue(QueueRequest request, kj::Maybe<kj::Duration> lifetimeBudget = kj::none);
+
+  bool isQuiescent() const;
+  kj::Timer& getNativeTimer();
+  void negotiateProviderWebSockets();
 
  private:
   struct Impl;

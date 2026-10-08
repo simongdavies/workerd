@@ -406,6 +406,45 @@ void LegacyWebSocketAdapter::initConnection(jsg::Lock& js, kj::Promise<PackedWeb
   // whichever comes first.
 }
 
+jsg::Ref<WebSocket> WebSocket::fromScopedConnection(
+    jsg::Lock& js, kj::String publicUrl, kj::Promise<kj::Own<kj::WebSocket>> connection) {
+  auto socket = js.alloc<ScopedProviderWebSocket>(js, kj::mv(publicUrl));
+  socket->impl->configureScopedProvider();
+  socket->impl->initConnection(js, connection.then([](kj::Own<kj::WebSocket> native) {
+    return WebSocketAdapter::PackedWebSocket{
+      .ws = kj::mv(native),
+      .proto = kj::none,
+      .extensions = kj::none,
+    };
+  }));
+  return socket;
+}
+
+void LegacyWebSocketAdapter::configureScopedProvider() {
+  scopedProvider = true;
+  allowHalfOpen = AllowHalfOpen::NO;
+}
+
+double WebSocket::getBufferedAmount() {
+  return static_cast<double>(impl->getBufferedAmount());
+}
+
+uint64_t LegacyWebSocketAdapter::getBufferedAmount() {
+  auto bytes = farNative->inFlightBytes;
+  for (const auto& entry: outgoingMessages->ordered()) {
+    KJ_SWITCH_ONEOF(entry.message) {
+      KJ_CASE_ONEOF(text, kj::String) {
+        bytes += text.size();
+      }
+      KJ_CASE_ONEOF(data, kj::Array<byte>) {
+        bytes += data.size();
+      }
+      KJ_CASE_ONEOF(close, kj::WebSocket::Close) {}
+    }
+  }
+  return bytes;
+}
+
 namespace {
 
 // See item 10 of https://datatracker.ietf.org/doc/html/rfc6455#section-4.1
@@ -782,6 +821,12 @@ void LegacyWebSocketAdapter::startReadLoop(
   if (FeatureFlags::get(js).getIncreaseWebsocketMessageSize()) {
     maxMessageSize = 128u << 20;
   }
+  if (scopedProvider) maxMessageSize = kj::min(maxMessageSize, size_t(16 * 1024));
+  auto configuredLimits = IoContext::current().getLimitEnforcer().getWebSocketLimits();
+  if (scopedProvider) configuredLimits = LimitEnforcer::WebSocketLimits{16 * 1024, 4, 64 * 1024};
+  KJ_IF_SOME(limits, configuredLimits) {
+    maxMessageSize = kj::min(maxMessageSize, limits.messageBytes);
+  }
 
   // If the kj::WebSocket happens to be an AbortableWebSocket (see util/abortable.h), then
   // calling readLoop here could throw synchronously if the canceler has already been tripped.
@@ -831,7 +876,12 @@ void LegacyWebSocketAdapter::startReadLoop(
                   jsg::Lock& js, kj::Maybe<kj::Exception>&& maybeError) mutable {
     auto& native = *farNative;
     KJ_IF_SOME(e, maybeError) {
-      if (!native.closedIncoming && e.getType() == kj::Exception::Type::DISCONNECTED) {
+      if (scopedProvider && !native.closedIncoming) {
+        native.closedIncoming = true;
+        reportError(js, e.clone());
+        dispatchReportOnly(js, shell,
+            js.alloc<CloseEvent>(1006, kj::str("Provider WebSocket connection failed."), false));
+      } else if (!native.closedIncoming && e.getType() == kj::Exception::Type::DISCONNECTED) {
         // Report premature disconnect or cancel as a close event.
         dispatchReportOnly(js, shell,
             js.alloc<CloseEvent>(
@@ -871,6 +921,34 @@ void LegacyWebSocketAdapter::send(jsg::Lock& js, kj::OneOf<kj::Array<byte>, kj::
   JSG_REQUIRE(native.state.is<Accepted>(), TypeError,
       "You must call one of accept() or state.acceptWebSocket() on this WebSocket before sending "
       "messages.");
+
+  auto configuredLimits = IoContext::current().getLimitEnforcer().getWebSocketLimits();
+  if (scopedProvider) configuredLimits = LimitEnforcer::WebSocketLimits{16 * 1024, 4, 64 * 1024};
+  KJ_IF_SOME(limits, configuredLimits) {
+    auto size = message.is<kj::String>() ? message.get<kj::String>().size()
+                                         : message.get<kj::Array<byte>>().size();
+    JSG_REQUIRE(
+        size <= limits.messageBytes, RangeError, "WebSocket message exceeds invocation limit.");
+    auto retainedMessages = outgoingMessages->size() + (scopedProvider && native.isPumping ? 1 : 0);
+    JSG_REQUIRE(retainedMessages < limits.queuedMessages, RangeError,
+        "WebSocket send queue exceeds invocation limit.");
+    size_t retainedBytes = scopedProvider ? native.inFlightBytes : 0;
+    for (const auto& pending: outgoingMessages->ordered()) {
+      KJ_SWITCH_ONEOF(pending.message) {
+        KJ_CASE_ONEOF(text, kj::String) {
+          retainedBytes += text.size();
+        }
+        KJ_CASE_ONEOF(data, kj::Array<byte>) {
+          retainedBytes += data.size();
+        }
+        KJ_CASE_ONEOF(close, kj::WebSocket::Close) {
+          retainedBytes += 2 + close.reason.size();
+        }
+      }
+    }
+    JSG_REQUIRE(retainedBytes <= limits.queuedBytes && size <= limits.queuedBytes - retainedBytes,
+        RangeError, "WebSocket queued bytes exceed invocation limit.");
+  }
 
   auto maybeOutputLock = IoContext::current().waitForOutputLocksIfNecessary();
   auto msg = [&]() -> kj::WebSocket::Message {
@@ -969,8 +1047,8 @@ void LegacyWebSocketAdapter::close(
 
   outgoingMessages->insert(GatedMessage{IoContext::current().waitForOutputLocksIfNecessary(),
     kj::WebSocket::Close{
-      // Code 1005 actually translates to sending a close message with no body on the wire.
-      static_cast<uint16_t>(code.orDefault(1005)),
+      // Provider callbacks require a wire-valid code; ordinary sockets keep 1005 for an empty frame.
+      static_cast<uint16_t>(code.orDefault(scopedProvider ? 1000 : 1005)),
       kj::mv(reason).orDefault(jsg::USVString(kj::str())),
     },
     getPendingAutoResponseCount()});
@@ -1281,6 +1359,10 @@ kj::Promise<void> LegacyWebSocketAdapter::pump(IoContext& context,
   do {
     while (outgoingMessages.size() > 0) {
       GatedMessage gatedMessage = outgoingMessages.release(*outgoingMessages.ordered().begin());
+      native.inFlightBytes = gatedMessage.message.is<kj::WebSocket::Close>()
+          ? 0
+          : countBytesFromMessage(gatedMessage.message);
+      KJ_DEFER(native.inFlightBytes = 0);
       KJ_IF_SOME(promise, gatedMessage.outputLock) {
         co_await promise;
       }

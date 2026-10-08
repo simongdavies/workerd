@@ -710,6 +710,12 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
   //
   // If `exportedHandler` is provided, the request will be delivered to it rather than to event
   // listeners.
+  enum class RequestBodyPresence {
+    INFER,
+    // Trusted transports can certify absence without stripping request framing headers.
+    ABSENT,
+  };
+
   kj::Promise<DeferredProxy<void>> request(kj::HttpMethod method,
       kj::StringPtr url,
       const kj::HttpHeaders& headers,
@@ -718,7 +724,8 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
       kj::Maybe<kj::StringPtr> cfBlobJson,
       Worker::Lock& lock,
       kj::Maybe<ExportedHandler&> exportedHandler,
-      kj::Maybe<jsg::Ref<AbortSignal>> abortSignal);
+      kj::Maybe<jsg::Ref<AbortSignal>> abortSignal,
+      RequestBodyPresence bodyPresence = RequestBodyPresence::INFER);
   // TODO(cleanup): Factor out the shared code used between old-style event listeners vs. module
   //   exports and move that code somewhere more appropriate.
 
@@ -836,7 +843,9 @@ class ServiceWorkerGlobalScope: public WorkerGlobalScope {
       jsg::Arguments<jsg::Value> args);
   void clearTimeout(jsg::Lock& js, kj::Maybe<jsg::JsNumber> timeoutId);
 
-  TimeoutId::NumberType setTimeoutInternal(jsg::Function<void()> function, double msDelay);
+  TimeoutId::NumberType setTimeoutInternal(jsg::Function<void()> function,
+      double msDelay,
+      TimeoutManager::Lifetime lifetime = TimeoutManager::Lifetime::APPLICATION);
 
   TimeoutId::NumberType setInterval(jsg::Lock& js,
       jsg::Function<void(jsg::Arguments<jsg::Value>)> function,

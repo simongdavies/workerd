@@ -15,12 +15,16 @@ namespace workerd::server::logical_service_broker::composite {
 inline constexpr uint32_t PROTOCOL_VERSION = 2;
 inline constexpr size_t MAX_BINDING_NAME_BYTES = 64;
 inline constexpr size_t MAX_REQUEST_ID_BYTES = 128;
+inline constexpr size_t MAX_WEBHOOK_BODY_BYTES = 32 * 1024;
+inline constexpr size_t MAX_WEBHOOK_SIGNATURE_BYTES = 1024;
 
 enum class BindingKind {
   KV,
   CACHE,
   D1,
   DURABLE_OBJECT,
+  WEBHOOK,
+  PROVIDER_WEBSOCKET,
 };
 
 enum class OperationKind {
@@ -41,6 +45,7 @@ enum class OperationKind {
   DO_SET_ALARM,
   DO_DELETE_ALARM,
   DO_PASSIVATE,
+  WEBHOOK_VERIFY,
 };
 
 enum class ResponseStatus {
