@@ -134,6 +134,7 @@ wd_cc_binary(
         "sandbox-executor/host-fs.c++",
         "sandbox-executor/host-fs.h",
         "sandbox-executor/hyperlight-driver.h",
+        "sandbox-executor/sandbox-d1.c++",
         "sandbox-executor/sandbox-executor.c++",
         "sandbox-executor/sandbox-fetch.c++",
         "sandbox-executor/sandbox-fetch.h",

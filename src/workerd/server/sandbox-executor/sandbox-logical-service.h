@@ -29,4 +29,10 @@ kj::Own<IoChannelFactory::SubrequestChannel> newCompositeServiceChannel(
     kj::String binding,
     logical_service_broker::composite::BindingKind kind);
 
+kj::Own<IoChannelFactory::SubrequestChannel> newD1ServiceChannel(
+    kj::Rc<LogicalServiceHostChannel> host,
+    kj::HttpHeaderTable& headerTable,
+    kj::String binding,
+    kj::Rc<uint64_t> nextRequestId);
+
 }  // namespace workerd::server::sandbox_executor

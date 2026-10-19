@@ -103,9 +103,15 @@ struct StorageMount {
   StorageMode mode;
 };
 
+enum class BindingApi {
+  FETCHER,
+  D1,
+};
+
 struct Binding {
   kj::String name;
   logical_service_broker::composite::BindingKind kind;
+  BindingApi api = BindingApi::FETCHER;
 };
 
 struct WorkerBundle {

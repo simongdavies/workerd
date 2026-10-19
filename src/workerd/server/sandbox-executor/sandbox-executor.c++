@@ -770,9 +770,9 @@ WorkerBundle parseWorkerBundleLegacy(kj::ArrayPtr<const char> input) {
     for (auto value: bindingValues) {
       KJ_REQUIRE(value.isObject(), "invalid binding manifest entry");
       auto bindingFields = value.getObject();
-      KJ_REQUIRE(bindingFields.size() == 2 && bindingFields[0].getName() == "name"_kj &&
-              bindingFields[1].getName() == "kind"_kj && bindingFields[0].getValue().isString() &&
-              bindingFields[1].getValue().isString(),
+      KJ_REQUIRE((bindingFields.size() == 2 || bindingFields.size() == 3) &&
+              bindingFields[0].getName() == "name"_kj && bindingFields[1].getName() == "kind"_kj &&
+              bindingFields[0].getValue().isString() && bindingFields[1].getValue().isString(),
           "invalid binding manifest entry");
       auto name = kj::str(bindingFields[0].getValue().getString());
       KJ_REQUIRE(composite::isBindingName(name), "invalid binding name");
@@ -781,9 +781,20 @@ WorkerBundle parseWorkerBundleLegacy(kj::ArrayPtr<const char> input) {
             "binding names must be globally sorted and unique");
       }
       previousName = name;
+      auto kind = composite::parseBindingKind(bindingFields[1].getValue().getString());
+      auto api = BindingApi::FETCHER;
+      if (bindingFields.size() == 3) {
+        KJ_REQUIRE(bindingFields[2].getName() == "api"_kj &&
+                bindingFields[2].getValue().isString() &&
+                bindingFields[2].getValue().getString() == "d1"_kj &&
+                kind == composite::BindingKind::D1,
+            "unsupported binding API selector");
+        api = BindingApi::D1;
+      }
       bindingBuilder.add(Binding{
         .name = kj::mv(name),
-        .kind = composite::parseBindingKind(bindingFields[1].getValue().getString()),
+        .kind = kind,
+        .api = api,
       });
     }
     bindings = bindingBuilder.finish();
@@ -1958,6 +1969,10 @@ kj::String serializeWorkerBundleLegacy(const WorkerBundle& bundle) {
       appendJsonString(output, binding.name);
       output.addAll(",\"kind\":"_kj);
       appendJsonString(output, composite::bindingKindName(binding.kind));
+      if (binding.api == BindingApi::D1) {
+        KJ_REQUIRE(binding.kind == composite::BindingKind::D1, "D1 API requires a D1 binding");
+        output.addAll(",\"api\":\"d1\""_kj);
+      }
       output.add('}');
     }
     output.add(']');
@@ -2984,7 +2999,7 @@ class Executor {
       worker->negotiateProviderWebSockets();
       output.addAll(",\"extensions\":[\"tracked-work-drain-v1\",\"safe-point-v1\","
                     "\"ingress-stream-v1\",\"invocation-budget-v2\",\"secure-entropy-v1\","
-                    "\"authenticated-egress-websocket-v1\"],"
+                    "\"authenticated-egress-websocket-v1\",\"binding-d1-api-v1\"],"
                     "\"max_frame_bytes\":16384}\n"_kj);
     }
     output.add('\0');
@@ -3594,6 +3609,82 @@ class SelfTestEntropyHost final: public EntropyHostChannel {
   bool shortRead = false;
 };
 
+class SelfTestD1Host final: public LogicalServiceHostChannel {
+ public:
+  kj::String invoke(kj::ArrayPtr<const char> query) override {
+    capnp::JsonCodec codec;
+    capnp::MallocMessageBuilder arena;
+    auto root = arena.initRoot<capnp::JsonValue>();
+    codec.decodeRaw(kj::str(query), root);
+    auto request = composite::parseRequestEnvelope(query);
+    KJ_REQUIRE(request.operation == composite::OperationKind::D1_BATCH &&
+            (request.binding == "DB"_kj || request.binding == "store"_kj),
+        "D1 wrapper changed binding authority or operation");
+    ++calls;
+    auto operation = jsonField(root, "operation");
+    auto statements = jsonField(operation, "statements");
+    KJ_REQUIRE(statements.isArray(), "D1 wrapper did not submit a statement vector");
+    maxBatch = kj::max(maxBatch, statements.getArray().size());
+    auto prefix = kj::str("{\"version\":2,\"request_id\":\"", request.requestId, "\"");
+    for (auto statement: statements.getArray()) {
+      if (jsonField(statement, "sql").getString() == "FAIL"_kj) {
+        return kj::str(prefix, ",\"status\":\"host_error\",\"code\":\"sqlite_execute\"}");
+      }
+    }
+    kj::Vector<char> result;
+    result.addAll(kj::str(prefix, ",\"status\":\"ok\",\"code\":\"ok\",\"results\":["));
+    bool first = true;
+    for (auto statement: statements.getArray()) {
+      if (!first) result.add(',');
+      first = false;
+      auto parameters = jsonField(statement, "parameters");
+      if (parameters.getArray().size() > 0) {
+        KJ_REQUIRE(parameters.getArray().size() == 6, "D1 bind lost parameters");
+        auto values = parameters.getArray();
+        KJ_REQUIRE(jsonField(values[0], "type").getString() == "integer"_kj &&
+                jsonField(values[0], "value").getNumber() == 7 &&
+                jsonField(values[1], "type").getString() == "real"_kj &&
+                jsonField(values[1], "value").getNumber() == 1.5 &&
+                jsonField(values[2], "type").getString() == "text"_kj &&
+                jsonField(values[2], "value").getString() == "hello"_kj &&
+                jsonField(values[3], "type").getString() == "null"_kj &&
+                jsonField(values[4], "type").getString() == "integer"_kj &&
+                jsonField(values[4], "value").getNumber() == 1 &&
+                jsonField(values[5], "type").getString() == "blob"_kj &&
+                jsonField(values[5], "value").getString() == "AP8="_kj,
+            "D1 bind changed scalar or blob types");
+      }
+      auto sql = jsonField(statement, "sql").getString();
+      if (sql == "SELECT scalars"_kj) {
+        result.addAll(
+            R"JSON({"columns":["integer","real","number","text","nothing","bytes"],"rows":[[{"type":"integer","value":7},{"type":"real","value":1.5},{"type":"number","value":2.0},{"type":"text","value":"text\n\u00e9"},{"type":"null"},{"type":"blob","value":"AP8="}]],"rows_affected":0,"meta":{"duration":0.25,"changes":0}})JSON"_kj);
+      } else if (sql == "UNSAFE"_kj) {
+        result.addAll(
+            R"JSON({"columns":["value"],"rows":[[{"type":"integer","value":9007199254740992}]],"rows_affected":0,"meta":{"duration":0.25,"changes":0}})JSON"_kj);
+      } else if (sql == "UNSAFE_NUMBER"_kj) {
+        result.addAll(
+            R"JSON({"columns":["value"],"rows":[[{"type":"number","value":9007199254740992}]],"rows_affected":0,"meta":{"duration":0.25,"changes":0}})JSON"_kj);
+      } else if (sql == "UNSAFE_META"_kj) {
+        result.addAll(
+            R"JSON({"columns":[],"rows":[],"rows_affected":0,"meta":{"duration":0.25,"last_row_id":9007199254740992}})JSON"_kj);
+      } else if (sql == "MISSING_META"_kj) {
+        result.addAll(R"JSON({"columns":[],"rows":[],"rows_affected":0})JSON"_kj);
+      } else if (sql == "BAD_DURATION"_kj) {
+        result.addAll(
+            R"JSON({"columns":[],"rows":[],"rows_affected":0,"meta":{"duration":-1}})JSON"_kj);
+      } else {
+        result.addAll(
+            R"JSON({"columns":["value","bytes"],"rows":[[{"type":"text","value":"hello"},{"type":"blob","value":"AP8="}]],"rows_affected":0,"meta":{"duration":0.25,"changes":0,"last_row_id":7}})JSON"_kj);
+      }
+    }
+    result.addAll("]}\0"_kj);
+    return kj::String(result.releaseAsArray());
+  }
+
+  size_t calls = 0;
+  size_t maxBatch = 0;
+};
+
 class SelfTestProviderHost final: public WebSocketHostChannel {
  public:
   struct Session {
@@ -3779,6 +3870,25 @@ int selfTest(bool filesystemEvidence) {
       R"JSON({"protocol_version":2,"worker_version":"v2","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"readonly","mode":"ro"},{"name":"scratch","mode":"rw"}]})JSON"_kj);
   expectCanonicalBundle(
       R"JSON({"protocol_version":3,"worker_version":"v3","compatibility_date":"2025-01-01","compatibility_flags":["nodejs_compat"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[{"name":"cache","kind":"cache"},{"name":"database","kind":"d1"},{"name":"objects","kind":"durable_object"},{"name":"settings","kind":"kv"}]})JSON"_kj);
+  expectCanonicalBundle(
+      R"JSON({"protocol_version":3,"worker_version":"case-sensitive-bindings","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[{"name":"DB","kind":"d1"},{"name":"_CACHE","kind":"cache"},{"name":"db","kind":"d1"}]})JSON"_kj);
+  expectCanonicalBundle(
+      R"JSON({"protocol_version":3,"worker_version":"standard-d1-opt-in","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[{"name":"DB","kind":"d1","api":"d1"},{"name":"store","kind":"d1"}]})JSON"_kj);
+  for (auto bindings: {
+         R"JSON([{"name":"__proto__","kind":"d1"}])JSON"_kj,
+         R"JSON([{"name":"DB","kind":"d1"},{"name":"DB","kind":"d1"}])JSON"_kj,
+         R"JSON([{"name":"db","kind":"d1"},{"name":"DB","kind":"d1"}])JSON"_kj,
+         R"JSON([{"name":"DB","kind":"d1","api":null}])JSON"_kj,
+         R"JSON([{"name":"DB","kind":"d1","api":""}])JSON"_kj,
+         R"JSON([{"name":"DB","kind":"d1","api":"unknown"}])JSON"_kj,
+         R"JSON([{"name":"DB","kind":"kv","api":"d1"}])JSON"_kj,
+       }) {
+    expectRejected(kj::str(
+        R"JSON({"protocol_version":3,"worker_version":"invalid-case-bindings","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":)JSON"_kj,
+        bindings, "}"));
+  }
+  expectRejected(
+      R"JSON({"protocol_version":2,"worker_version":"uppercase-storage-rejected","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[{"name":"DB","mode":"rw"}]})JSON"_kj);
   expectRejected(
       R"JSON({"protocol_version":1,"worker_version":"v1-storage","compatibility_date":"2025-01-01","compatibility_flags":[],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[]})JSON"_kj);
   expectRejected(
@@ -4529,6 +4639,122 @@ int selfTest(bool filesystemEvidence) {
     modules.add(Module{kj::str(name), ModuleType::ES_MODULE, copyModuleBytes(source)});
     return modules.finish();
   };
+
+  {
+    fprintf(stderr, "self-test: upstream D1 binding and legacy Fetcher coexistence\n");
+    auto host = kj::rc<SelfTestD1Host>();
+    Executor executor(host.addRef(), kj::rc<HyperlightIngressHostChannel>(),
+        kj::rc<FakeTimerHostChannel>(), kj::rc<HyperlightBundleHostChannel>());
+    auto bindings = kj::heapArray<Binding>(2);
+    bindings[0] = Binding{kj::str("DB"), composite::BindingKind::D1, BindingApi::D1};
+    bindings[1] = Binding{kj::str("store"), composite::BindingKind::D1};
+    WorkerBundle bundle{
+      .workerVersion = kj::str("upstream-standard-d1"),
+      .compatibilityDate = kj::str("2025-01-01"),
+      .compatibilityFlags = kj::heapArray<kj::String>(0),
+      .mainModule = kj::str("worker.js"),
+      .modules = oneModule("worker.js", R"JS(
+        function check(value, message) {
+          if (!value) throw new Error(message);
+        }
+        export default {
+          async fetch(request, env) {
+            if (new URL(request.url).pathname === '/unnegotiated') {
+              let rejected = false;
+              try { await env.DB.prepare('SELECT value').all(); }
+              catch (error) { rejected = true; }
+              check(rejected, 'unnegotiated SQL capability reached a host service');
+              return new Response('negotiation-required');
+            }
+            check(typeof env.DB.prepare === 'function' && env.DB.fetch === undefined,
+              'standard binding was replaced with a Fetcher facade');
+            check(typeof env.store.fetch === 'function', 'legacy Fetcher changed');
+            const statement = env.DB.prepare('SELECT types').bind(
+              7, 1.5, 'hello', null, true, new Uint8Array([0, 255]));
+            const all = await statement.all();
+            check(all.success && all.results[0].value === 'hello' &&
+              all.results[0].bytes.join(',') === '0,255', 'D1 all result mismatch');
+            check(all.meta.duration === 0.25 && all.meta.last_row_id === 7 &&
+              !('rows_read' in all.meta), 'D1 metadata was fabricated');
+            check((await env.DB.prepare('SELECT value').first('value')) === 'hello',
+              'D1 first result mismatch');
+            const raw = await env.DB.prepare('SELECT value').raw({columnNames: true});
+            check(raw[0].join(',') === 'value,bytes' && raw[1][0] === 'hello',
+              'D1 raw result mismatch');
+            const scalars = await env.DB.prepare('SELECT scalars').first();
+            check(scalars.integer === 7 && scalars.real === 1.5 && scalars.number === 2 &&
+              scalars.text === 'text\n\u00e9' && scalars.nothing === null &&
+              scalars.bytes.join(',') === '0,255', 'SQL result value mapping mismatch');
+            const run = await env.DB.prepare('SELECT value').run();
+            check(run.success && Array.isArray(run.results) && run.results[0].value === 'hello',
+              'D1 run result shape mismatch');
+            const before = await env.DB.batch([
+              env.DB.prepare('SELECT first'), env.DB.prepare('SELECT second')]);
+            check(before.length === 2 && before.every(result => result.success), 'D1 batch mismatch');
+            const exec = await env.DB.exec('SELECT first\nSELECT second');
+            check(exec.count === 2 && exec.duration === 0.5, 'D1 exec duration mismatch');
+            let failed = false;
+            try {
+              await env.DB.batch([env.DB.prepare('SELECT first'), env.DB.prepare('FAIL')]);
+            } catch (error) {
+              failed = error.message === 'D1_ERROR: sqlite_execute';
+            }
+            check(failed, 'D1 batch failure was returned as success');
+            let badType = false;
+            try { env.DB.prepare('SELECT ?').bind(1n); }
+            catch (error) { badType = error.message.startsWith('D1_TYPE_ERROR:'); }
+            check(badType, 'D1 upstream bind validation changed');
+            let missingColumn = false;
+            try { await env.DB.prepare('SELECT value').first('missing'); }
+            catch (error) { missingColumn = error.message.startsWith('D1_COLUMN_NOTFOUND:'); }
+            check(missingColumn, 'D1 upstream missing-column error changed');
+            for (const invalid of [
+              'UNSAFE', 'UNSAFE_NUMBER', 'UNSAFE_META', 'MISSING_META', 'BAD_DURATION'
+            ]) {
+              let rejected = false;
+              try { await env.DB.prepare(invalid).all(); } catch (error) { rejected = true; }
+              check(rejected, 'invalid backend result returned success: ' + invalid);
+            }
+            for (const unsupported of [
+              () => env.DB.dump(),
+              () => env.DB.withSession('first-primary').prepare('SELECT value').all()
+            ]) {
+              let rejected = false;
+              try { await unsupported(); } catch (error) { rejected = true; }
+              check(rejected, 'unsupported D1 method did not reject');
+            }
+            const legacy = await env.store.fetch('https://logical.invalid/', {
+              method: 'POST', body: JSON.stringify({
+                version: 2, request_id: 'legacy', binding: 'store',
+                operation: {kind: 'd1_batch', statements: [{sql: 'SELECT legacy', parameters: []}]}
+              })
+            });
+            check((await legacy.json()).status === 'ok', 'legacy SQL transport changed');
+            return new Response('upstream-d1-passed');
+          }
+        };
+      )JS"_kj),
+      .protocolVersion = 3,
+      .storageMounts = kj::heapArray<StorageMount>(0),
+      .bindings = kj::mv(bindings),
+    };
+    executor.initialize(serializeWorkerBundle(bundle));
+    auto unnegotiated = fetchBody(executor,
+        R"JSON({"protocol_version":1,"request_id":"unnegotiated-sql","method":"GET","url":"https://example.test/unnegotiated","headers":[],"body_base64":""})JSON"_kj);
+    KJ_REQUIRE(unnegotiated == "negotiation-required"_kj && host->calls == 0,
+        "standard SQL binding did not require actual guest negotiation", unnegotiated);
+    executor.control(R"JSON({"protocol_version":1,"request_id":"d1-capabilities"})JSON"_kj, false);
+    auto result = fetchBody(executor,
+        R"JSON({"protocol_version":1,"request_id":"native-d1","method":"GET","url":"https://example.test/","headers":[],"body_base64":""})JSON"_kj);
+    KJ_REQUIRE(result == "upstream-d1-passed"_kj, "real upstream D1 binding failed", result);
+    KJ_REQUIRE(host->maxBatch == 2 && host->calls == 15,
+        "D1 wrapper split batch, called unsupported methods, or lost legacy transport",
+        host->calls);
+    executor.control(R"JSON({"protocol_version":1,"request_id":"d1-drained"})JSON"_kj, true);
+  }
+
+  expectRejected(
+      R"JSON({"protocol_version":3,"worker_version":"unsupported-sql-rpc","compatibility_date":"2025-01-01","compatibility_flags":["d1_binding_jsrpc"],"main_module":"worker.js","modules":[{"name":"worker.js","type":"esModule","source":"export default {}"}],"storage":[],"bindings":[{"name":"DB","kind":"d1","api":"d1"}]})JSON"_kj);
 
   for (size_t failure = 0; failure < 4; ++failure) {
     fprintf(stderr, "self-test: scoped provider failure %zu\n", failure);
@@ -6098,7 +6324,7 @@ module.exports = { packageName: 'yazl', crc32: crc32.value };
           filesystemEvidence ? "true"_kj : "false"_kj,
           ",\"runtime_extensions\":[\"tracked-work-drain-v1\",\"safe-point-v1\","
           "\"ingress-stream-v1\",\"invocation-budget-v2\",\"secure-entropy-v1\","
-          "\"authenticated-egress-websocket-v1\"],\"tracked_work_cases\":24,"
+          "\"authenticated-egress-websocket-v1\",\"binding-d1-api-v1\"],\"tracked_work_cases\":24,"
           "\"shared_negative_vectors\":4,\"bundle_loader\":{\"protocol_version\":4,"
           "\"executed_source_bytes\":757597,\"max_module_bytes\":1048576,"
           "\"max_bundle_bytes\":8388608},\"native_webhook_cases\":8,\"secure_entropy_cases\":4,"
@@ -6108,7 +6334,12 @@ module.exports = { packageName: 'yazl', crc32: crc32.value };
           "\"negotiation-required\",\"exact-frame-bound\",\"connection-bound\","
           "\"exact-session-byte-bound\",\"joined-cancellation\",\"pending-cancellation\","
           "\"repeated-cancellation\",\"callback-revocation\",\"unordered-replies\","
-          "\"default-close\"]}\n"_kj));
+          "\"default-close\"],\"standard_sql_cases\":[\"upstream-wrapper\","
+          "\"prepare-bind-first-all-raw-run\",\"batch-single-host-call\",\"exec-duration\","
+          "\"error-prefix\",\"parameter-type-errors\",\"legacy-fetcher-coexistence\","
+          "\"case-preserving-manifest\",\"unsupported-session-dump-rpc\","
+          "\"unsafe-row-and-metadata-integers\",\"normalized-backend-number\","
+          "\"missing-and-invalid-metadata\"]}\n"_kj));
 }
 
 int selfTestBundle(kj::StringPtr path) {

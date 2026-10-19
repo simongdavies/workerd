@@ -117,12 +117,46 @@ and rejects corrupted digests, short reads, oversized descriptors, invalid UTF-8
 
 ## Logical service bindings
 
-Worker bundle init protocol v3 adds a sorted `bindings` manifest containing only `{name,kind}`.
+Worker bundle init protocol v3 adds a sorted `bindings` manifest containing `{name,kind}`.
+Names preserve ASCII case and match `[A-Za-z_][A-Za-z0-9_-]{0,63}`, except `__proto__`, which
+is rejected. Names remain sorted and unique by their exact bytes: `DB` and `db` are distinct.
+This identifier grammar does not change storage-mount names or filesystem permissions.
 Names are globally unique and kinds are `kv`, `cache`, `d1`, `durable_object`, or `webhook`.
 KV, Cache, D1, and Durable Object bindings are exposed through a standard Workerd `Fetcher`-style
 service channel. Calls are `POST` requests whose
 body is the canonical composite-router v2 envelope. Workerd rejects a binding-name or operation-kind
 mismatch before invoking the host.
+
+### Standard SQL binding API
+
+An explicit `{name:"DB",kind:"d1",api:"d1"}` manifest entry selects Workerd's existing
+`cloudflare-internal:d1-api` wrapped binding. The `d1` identifiers here preserve upstream
+Worker and Wrangler compatibility; the database backend is selected independently by host policy.
+The application uses the unchanged `env.DB.prepare().bind()`, `first`, `all`, `raw`, `run`,
+`batch`, and `exec` APIs. No application adapter, source rewrite, or alternate SQL API is required.
+Omitting `api` preserves the legacy `Fetcher` transport, including existing `env.store.fetch()`
+callers. Unknown, null, empty, or non-SQL API selectors fail initialization.
+
+The private transport translates upstream query/execute HTTP requests to one typed host SQL batch,
+preserving the binding's exact name and operator authorization. A batch is not split into multiple
+host transactions. The local SQL host must finish execution, result validation, safe-integer validation,
+and the public response-size check before committing. The guest separately validates host responses.
+Each transport batch contains at most 16 statements; request, typed response, and public response
+envelopes are bounded to 60 KiB. Remote post-dispatch failures may have an unknown mutation outcome;
+they must not be presented as successful rollback or retried automatically.
+The advertised `binding-d1-api-v1` capability is required for configured standard SQL bindings;
+older guest artifacts must not be reported ready for this API.
+
+Result metadata contains genuine backend measurements only. Duration is measured in milliseconds;
+unavailable scan counts, storage size, change flags, or insert IDs are omitted, not invented.
+The upstream wrapper passes this metadata through, so a complete Cloudflare metadata contract is not
+implied. Typed integers and metadata integers outside JavaScript's safe-integer range are rejected.
+A backend may return a normalized numeric result without claiming its original SQLite storage class.
+Blob parameters and results preserve their byte values through the upstream binding's conversions.
+
+Session bookmarks/replica routing and deprecated database dumps are unsupported and return explicit
+errors. The experimental `d1_binding_jsrpc` compatibility flag is rejected with this transport.
+These limits do not change Workerd's upstream wrapper or imply support for every Cloudflare binding.
 
 All bindings share the single historical `WorkerdLogicalServiceV1Invoke` host registration.
 Canonical envelope version selects frozen dotted v1 or composite v2; no aliases, second

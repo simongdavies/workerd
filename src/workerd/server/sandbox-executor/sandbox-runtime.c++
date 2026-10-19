@@ -653,6 +653,7 @@ class ChannelFactory final: public IoChannelFactory {
           return Binding{
             .name = kj::str(binding.name),
             .kind = binding.kind,
+            .api = binding.api,
           };
         }),
         nextRequestId(kj::rc<uint64_t>(1)),
@@ -679,6 +680,12 @@ class ChannelFactory final: public IoChannelFactory {
     auto bindingIndex = channel - 1;
     KJ_REQUIRE(bindingIndex < bindings.size(), "invalid logical service channel");
     const auto& binding = bindings[bindingIndex];
+    if (binding.api == BindingApi::D1) {
+      KJ_REQUIRE(providerNegotiated, "D1 binding API capability was not negotiated");
+      return newD1ServiceChannel(
+          logicalServiceHost.addRef(), headerTable, kj::str(binding.name), nextRequestId.addRef())
+          ->startRequest(kj::mv(metadata));
+    }
     if (binding.kind == logical_service_broker::composite::BindingKind::PROVIDER_WEBSOCKET) {
       KJ_FAIL_REQUIRE("provider WebSocket bindings do not accept HTTP subrequests");
     }
@@ -698,6 +705,11 @@ class ChannelFactory final: public IoChannelFactory {
     auto bindingIndex = channel - 1;
     KJ_REQUIRE(bindingIndex < bindings.size(), "invalid logical service channel");
     const auto& binding = bindings[bindingIndex];
+    if (binding.api == BindingApi::D1) {
+      KJ_REQUIRE(providerNegotiated, "D1 binding API capability was not negotiated");
+      return newD1ServiceChannel(
+          logicalServiceHost.addRef(), headerTable, kj::str(binding.name), nextRequestId.addRef());
+    }
     if (binding.kind == logical_service_broker::composite::BindingKind::PROVIDER_WEBSOCKET) {
       KJ_FAIL_REQUIRE("provider WebSocket bindings do not accept HTTP subrequests");
     }
@@ -847,6 +859,10 @@ CompatibilityFlags::Reader buildCompatibilityFlags(capnp::MallocMessageBuilder& 
   compileCompatibilityFlags(bundle.compatibilityDate, bundle.compatibilityFlags, flags,
       errorReporter, false, CompatibilityDateValidation::CODE_VERSION,
       kj::arrayPtr(ALLOWED_EXPERIMENTAL_FLAGS));
+  for (const auto& binding: bundle.bindings) {
+    KJ_REQUIRE(binding.api != BindingApi::D1 || !flags.getD1BindingJsrpc(),
+        "D1 binding API does not support d1_binding_jsrpc");
+  }
   return flags;
 }
 
@@ -876,6 +892,29 @@ kj::Own<VirtualFileSystem> buildFileSystem(const WorkerBundle& bundle) {
 
 kj::Array<server::WorkerdApi::Global> buildGlobals(const WorkerBundle& bundle) {
   return KJ_MAP(index, kj::indices(bundle.bindings)) {
+    if (bundle.bindings[index].api == BindingApi::D1) {
+      KJ_REQUIRE(bundle.bindings[index].kind == logical_service_broker::composite::BindingKind::D1,
+          "D1 API requires a D1 binding");
+      auto innerBindings = kj::heapArray<server::WorkerdApi::Global>(1);
+      innerBindings[0] = server::WorkerdApi::Global{
+        .name = kj::str("fetcher"),
+        .value =
+            server::WorkerdApi::Global::Fetcher{
+              .channel = static_cast<uint>(index + 1),
+              .requiresHost = false,
+              .isInHouse = true,
+            },
+      };
+      return server::WorkerdApi::Global{
+        .name = kj::str(bundle.bindings[index].name),
+        .value =
+            server::WorkerdApi::Global::Wrapped{
+              .moduleName = kj::str("cloudflare-internal:d1-api"),
+              .entrypoint = kj::str("default"),
+              .innerBindings = kj::mv(innerBindings),
+            },
+      };
+    }
     if (bundle.bindings[index].kind ==
         logical_service_broker::composite::BindingKind::PROVIDER_WEBSOCKET) {
       return server::WorkerdApi::Global{

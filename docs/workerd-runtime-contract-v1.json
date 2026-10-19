@@ -76,9 +76,75 @@
     "Instance status/list require exact app_id and revision query authority and include persisted parked generations/checkpoint identities after process replacement. owner_loaded=false with ownership_reconciled=false is unresolved prior ownership, not a ready active VM. Do not create pristine state or assume such an owner is dead.",
     "Parked logical instances consume bounded retention metadata but no live VM permit. Create/resume atomically reserve the configured live capacity; only confirmed park/termination frees that permit.",
     "WorkerdEntropyV1Read(U64 amount)->VecBytes is additive, with exactly 1..16384 fresh host OS CSPRNG bytes per call. Empty guest generation is a no-op; larger requests use bounded chunks. Never cache guest entropy, copy a deterministic source into snapshots, or substitute deterministic bytes when the host callback fails.",
-    "secure-entropy-v1 identifies the corrected guest intrinsic entropy source, not merely host callback registration. Real UUID, random-value and cryptographic key-generation clone/resume qualification is required before broader crypto freshness claims."
+    "secure-entropy-v1 identifies the corrected guest intrinsic entropy source, not merely host callback registration. Real UUID, random-value and cryptographic key-generation clone/resume qualification is required before broader crypto freshness claims.",
+    "Logical SQL/data binding names preserve exact ASCII case: [A-Za-z_][A-Za-z0-9_-]{0,63}, excluding exact __proto__. DB and db are distinct authorities; no normalization or path interpretation. Storage-mount/provider-specific restrictions remain unchanged.",
+    "Optional api:d1 is a compatibility selector ONLY on an existing kind:d1 SQL binding. Omitted selector preserves legacy Fetcher and the exact ordered two-field name,kind manifest; explicit selection emits ordered name,kind,api in init3/4. Present null, empty, unknown or wrong-kind selectors fail closed. Admission binds the selector into policy/checkpoint identity and requires the actual guest extension binding-d1-api-v1 before advertising the per-app capability.",
+    "The selected standard SQL API uses the real upstream database wrapper over a private native Fetcher. One request or batch maps to ONE existing canonical composite v2 d1_batch transaction; legacy operation/parameter/callback layouts are unchanged. Unsupported sessions/bookmarks/dump/RPC modes fail explicitly, not via fabricated metadata or lowered authority.",
+    "SQL result meta is additive and optional for legacy results, but is a required object for the selected standard API. duration is actual finite nonnegative statement milliseconds. Only measured backend metadata is included; unavailable rows_read,rows_written,changed_db,size_after,last_row_id are omitted rather than invented. Local last_row_id is emitted only when observably changed by a statement that changed rows; it is not a prior insert ID attributed to SELECT.",
+    "The selected standard SQL API rejects unsafe typed integers and metadata integers before local SQLite commit. Legacy typed integer/real/blob responses remain unchanged. Result-only type:number denotes a finite JavaScript Number, NOT an original SQLite storage class; integral magnitudes above 9007199254740991 are rejected. It is allowed only for selected standard SQL API providers, never request parameters or a legacy Fetcher binding.",
+    "Before local SQLite commit, selected standard SQL API results are charged for both typed-wire size and a conservative native HTTP JSON bound of at most 61440 bytes, including decoded blobs as byte arrays. Bound the MAXIMUM of ROWS_AND_COLUMNS and object-array results (execute/NONE repeats column names PER ROW); batch-array framing also bounds a single query object. Strings reserve 2+6*UTF8 byte length, numbers 64 bytes, and blob arrays reserve max(2,1+4*decoded length), plus fixed JSON fields, punctuation and measured metadata. Expansion/quota/metadata failures roll back the whole local batch. Remote post-dispatch transport/validation failures must not be claimed as rolled-back mutations or automatically retried."
   ],
   "$defs": {
+    "SqlApiBinding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "kind", "api"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_-]{0,63}$", "not": {"const": "__proto__"}},
+        "kind": {"const": "d1"}, "api": {"const": "d1"}
+      }
+    },
+    "SqlApiNumber": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "value"],
+      "properties": {"type": {"const": "number"}, "value": {"type": "number"}},
+      "allOf": [{
+        "if": {"properties": {"value": {"multipleOf": 1}}},
+        "then": {"properties": {"value": {"minimum": -9007199254740991, "maximum": 9007199254740991}}}
+      }]
+    },
+    "SqlStatementMetadata": {
+      "type": "object", "additionalProperties": false, "required": ["duration"],
+      "properties": {
+        "duration": {"type": "number", "minimum": 0},
+        "changes": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "last_row_id": {"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991},
+        "rows_read": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "rows_written": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "changed_db": {"type": "boolean"},
+        "size_after": {"type": "integer", "minimum": 0, "maximum": 9007199254740991}
+      }
+    },
+    "SqlApiValue": {
+      "oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["type"], "properties": {"type": {"const": "null"}}},
+        {"type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": {"type": {"const": "integer"}, "value": {"type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991}}},
+        {"type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": {"type": {"const": "real"}, "value": {"type": "number"}}},
+        {"type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": {"type": {"const": "text"}, "value": {"type": "string"}}},
+        {"type": "object", "additionalProperties": false, "required": ["type", "value"], "properties": {"type": {"const": "blob"}, "value": {"type": "string", "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"}}},
+        {"$ref": "#/$defs/SqlApiNumber"}
+      ]
+    },
+    "SqlApiResultSet": {
+      "type": "object", "additionalProperties": false,
+      "required": ["columns", "rows", "rows_affected", "meta"],
+      "properties": {
+        "columns": {"type": "array", "items": {"type": "string"}},
+        "rows": {"type": "array", "items": {"type": "array", "items": {"$ref": "#/$defs/SqlApiValue"}}},
+        "rows_affected": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "meta": {"$ref": "#/$defs/SqlStatementMetadata"}
+      }
+    },
+    "SqlApiHostResponse": {
+      "type": "object", "additionalProperties": false,
+      "required": ["version", "request_id", "status", "code"],
+      "properties": {
+        "version": {"const": 2}, "request_id": {"type": "string", "maxLength": 64},
+        "status": {"enum": ["ok", "denied", "quota_exceeded", "invalid_request", "host_error"]},
+        "code": {"type": "string", "pattern": "^[a-z0-9_]{1,64}$"},
+        "results": {"type": "array", "minItems": 1, "maxItems": 16, "items": {"$ref": "#/$defs/SqlApiResultSet"}}
+      },
+      "allOf": [{"if": {"properties": {"status": {"const": "ok"}}}, "then": {"required": ["results"]}}]
+    },
     "ProviderWebSocketOpen": {
       "type": "object", "additionalProperties": false,
       "required": ["protocol_version", "request_id", "binding", "url", "subprotocols"],
@@ -351,6 +417,12 @@
     }
   },
   "x-golden-vectors": [
+    {"schema": "SqlApiBinding", "value": {"name": "DB", "kind": "d1", "api": "d1"}},
+    {"schema": "SqlApiBinding", "value": {"name": "_Store", "kind": "d1", "api": "d1"}},
+    {"schema": "SqlApiNumber", "value": {"type": "number", "value": 1.25}},
+    {"schema": "SqlApiNumber", "value": {"type": "number", "value": 1}},
+    {"schema": "SqlStatementMetadata", "value": {"duration": 0.25, "changes": 1, "last_row_id": 7}},
+    {"schema": "SqlApiHostResponse", "value": {"version": 2, "request_id": "sql-1", "status": "ok", "code": "ok", "results": [{"columns": ["n", "b"], "rows": [[{"type": "number", "value": 1.25}, {"type": "blob", "value": "AAE="}]], "rows_affected": 0, "meta": {"duration": 0.25, "changes": 0}}]}},
     {"schema": "ProviderWebSocketOpen", "value": {"protocol_version": 1, "request_id": "open-1", "binding": "transcribe", "url": "wss://approved.example/realtime?model=example-stream", "subprotocols": []}},
     {"schema": "ProviderWebSocketReply", "value": {"protocol_version": 1, "request_id": "open-1", "status": "pending", "code": "connecting", "handle_id": 1}},
     {"schema": "ProviderWebSocketReply", "value": {"protocol_version": 1, "request_id": "read-1", "status": "ok", "code": "event", "handle_id": 1, "sequence": 0, "kind": "open"}},
@@ -373,6 +445,12 @@
     {"schema": "WebhookResponse", "value": {"version": 2, "request_id": "webhook-1", "status": "ok", "code": "verified", "value": {"valid": false}}}
   ],
   "x-negative-vectors": [
+    {"schema": "SqlApiBinding", "value": {"name": "DB", "kind": "kv", "api": "d1"}},
+    {"schema": "SqlApiBinding", "value": {"name": "DB", "kind": "d1", "api": null}},
+    {"schema": "SqlApiBinding", "value": {"name": "__proto__", "kind": "d1", "api": "d1"}},
+    {"schema": "SqlApiNumber", "value": {"type": "number", "value": 9007199254740992}},
+    {"schema": "SqlStatementMetadata", "value": {}},
+    {"schema": "SqlStatementMetadata", "value": {"duration": -1}},
     {"schema": "ProviderWebSocketOpen", "value": {"protocol_version": 1, "request_id": "open-1", "binding": "transcribe", "url": "wss://approved.example/", "subprotocols": [], "headers": {"Authorization": "forbidden"}}},
     {"schema": "ProviderWebSocketClose", "value": {"protocol_version": 1, "request_id": "cancel-1", "binding": "transcribe", "handle_id": 1, "mode": "cancel", "code": 1000}},
     {"schema": "EntropyReadAmount", "value": 0},

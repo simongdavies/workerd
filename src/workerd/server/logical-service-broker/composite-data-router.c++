@@ -86,12 +86,15 @@ void appendJsonString(kj::Vector<char>& output, kj::StringPtr value) {
 }  // namespace
 
 bool isBindingName(kj::StringPtr value) {
-  if (value.size() == 0 || value.size() > MAX_BINDING_NAME_BYTES || value[0] < 'a' ||
-      value[0] > 'z') {
+  if (value.size() == 0 || value.size() > MAX_BINDING_NAME_BYTES || value == "__proto__"_kj) {
+    return false;
+  }
+  auto isLetter = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+  if (!isLetter(value[0]) && value[0] != '_') {
     return false;
   }
   for (auto c: value) {
-    if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+    if (!(isLetter(c) || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
       return false;
     }
   }

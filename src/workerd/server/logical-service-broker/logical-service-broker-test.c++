@@ -237,6 +237,24 @@ KJ_TEST("composite router v2 parses the canonical envelope discriminator") {
   KJ_EXPECT(composite_v2::bindingKindFor(request.operation) == composite_v2::BindingKind::KV);
 }
 
+KJ_TEST("composite binding names preserve Wrangler case without relaxing identifier bounds") {
+  for (auto name: {"DB"_kj, "db"_kj, "_DB"_kj, "MY_DATABASE_1"_kj, "edge-cache"_kj}) {
+    KJ_EXPECT(composite_v2::isBindingName(name), name);
+    auto request = composite_v2::parseRequestEnvelope(
+        kj::str("{\"version\":2,\"request_id\":\"case-1\",\"binding\":\"", name,
+            "\",\"operation\":{\"kind\":\"d1_batch\"}}"));
+    KJ_EXPECT(request.binding == name, name);
+    KJ_EXPECT(request.operation == composite_v2::OperationKind::D1_BATCH);
+  }
+  auto maximum = kj::str("D", kj::repeat('b', composite_v2::MAX_BINDING_NAME_BYTES - 1));
+  KJ_EXPECT(composite_v2::isBindingName(maximum));
+  KJ_EXPECT(!composite_v2::isBindingName(kj::str(maximum, "b")));
+  for (auto name: {""_kj, "__proto__"_kj, "0DB"_kj, "-DB"_kj, "DB.name"_kj, "DB/name"_kj,
+         "../DB"_kj, "DB\\name"_kj, "DB name"_kj, "DB\n"_kj, "DB\x7f"_kj, "D\xc3\x89"_kj}) {
+    KJ_EXPECT(!composite_v2::isBindingName(name), name);
+  }
+}
+
 KJ_TEST("composite webhook verification is typed and bounded without credentials") {
   auto request = composite_v2::parseRequestEnvelope(
       R"JSON({"version":2,"request_id":"webhook-1","binding":"webhook","operation":{"kind":"webhook_verify","body_base64":"/wAB","signature":"t=1,v1=signature"}})JSON"_kj);
