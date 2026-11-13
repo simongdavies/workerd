@@ -1,4 +1,17 @@
 load("//:build/wd_rust_crate.bzl", "wd_rust_crate")
+load("//:build/wd_rust_test.bzl", "wd_rust_test")
+
+wd_rust_test(
+    name = "worker-admission_test",
+    size = "small",
+    srcs = [
+        "admission.rs",
+        "admission-test.rs",
+    ],
+    crate_name = "worker_admission",
+    crate_root = "admission.rs",
+    edition = "2024",
+)
 
 # The Rust server. Everything that needs the isolate is behind the C++ worker factory
 # (//src/workerd/server/factory), reached through the cxx bridge in bridge.rs.
@@ -23,6 +36,7 @@ wd_rust_crate(
     ],
     # The tests link C++ that reaches kj::setupAsyncIo(), the binary's tokio-backed one.
     test_deps = [
+        "//src/workerd/io:outcome_capnp_rust",
         "//src/workerd/util:setup-async-io",
     ],
     visibility = ["//visibility:public"],

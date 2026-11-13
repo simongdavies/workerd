@@ -1,0 +1,83 @@
+load("//:build/wd_rust_binary.bzl", "wd_rust_binary")
+load("//:build/wd_rust_crate.bzl", "wd_rust_crate")
+load("//:build/wd_rust_test.bzl", "wd_rust_test")
+
+wd_rust_test(
+    name = "worker-selection_test",
+    size = "small",
+    srcs = [
+        "selection.rs",
+        "selection-test.rs",
+    ],
+    crate_name = "worker_selection",
+    crate_root = "selection.rs",
+    edition = "2024",
+    deps = [
+        "//src/workerd/server:workerd_capnp_rust",
+        "@crates_vendor//:anyhow",
+        "@crates_vendor//:capnp",
+    ],
+)
+
+wd_rust_crate(
+    name = "executor",
+    srcs = glob(
+        ["*.rs"],
+        exclude = [
+            "main-selected.rs",
+            "main.rs",
+        ],
+    ),
+    proc_macro_deps = ["@crates_vendor//:async-trait"],
+    test_size = "medium",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//src/rust/cxx/kj-hyper",
+        "//src/rust/cxx/kj-rs",
+        "//src/rust/cxx/kj-rs-io",
+        "//src/rust/cxx/kj-rs-tokio",
+        "//src/rust/kj",
+        "//src/rust/worker",
+        "//src/workerd/server:workerd_capnp_rust",
+        "//src/workerd/server/server:workerd-server",
+        "@crates_vendor//:anyhow",
+        "@crates_vendor//:bytes",
+        "@crates_vendor//:capnp",
+        "@crates_vendor//:flatbuffers",
+        "@crates_vendor//:futures",
+        "@crates_vendor//:httparse",
+        "@crates_vendor//:hyperlight-common",
+        "@crates_vendor//:libc",
+        "@crates_vendor//:ring",
+        "@crates_vendor//:tokio",
+    ] + select({
+        "@platforms//os:linux": ["@crates_vendor//:nix"],
+        "//conditions:default": [],
+    }),
+)
+
+wd_rust_binary(
+    name = "workerd-hyperlight-executor",
+    srcs = ["main.rs"],
+    malloc = "//src/workerd/server:malloc",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    test = False,
+    visibility = ["//visibility:public"],
+    deps = [":executor"],
+)
+
+wd_rust_binary(
+    name = "workerd-hyperlight-selected-executor",
+    srcs = ["main-selected.rs"],
+    malloc = "//src/workerd/server:malloc",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    test = False,
+    visibility = ["//visibility:public"],
+    deps = [":executor"],
+)

@@ -6,6 +6,7 @@
 #include "global-scope.h"
 
 #include <workerd/io/io-context.h>
+#include <workerd/io/request-context.h>
 #include <workerd/io/worker-interface.h>
 #include <workerd/jsg/script.h>
 #include <workerd/tests/test-fixture.h>
@@ -16,6 +17,8 @@
 
 namespace workerd::api {
 namespace {
+
+using RecordedRequestContexts = kj::Vector<kj::Maybe<kj::Rc<RequestContext>>>;
 
 // Minimal WorkerInterface that answers every outgoing request() with an empty 200, draining the
 // request body first so a streaming sender doesn't block on backpressure.
@@ -221,6 +224,7 @@ struct ReplayState {
   bool acceptWebSocket = false;
   kj::Maybe<kj::Own<kj::WebSocket>> acceptedWebSocket;
   kj::Vector<IoChannelFactory::ActorRetryRequestMetadata> metadata;
+  RecordedRequestContexts requestContexts;
   kj::Vector<kj::Array<kj::byte>> requestBodies;
   kj::Vector<CountSubrequest> countSubrequests;
   uint requestCount = 0;
@@ -604,11 +608,16 @@ class MockActorIdFactory final: public ActorIdFactory {
 
 class RecordingActorChannel final: public IoChannelFactory::ActorChannel {
  public:
-  RecordingActorChannel(kj::Maybe<IoChannelFactory::ActorRetryRequestMetadata>& capturedMetadata)
-      : capturedMetadata(capturedMetadata) {}
+  RecordingActorChannel(kj::Maybe<IoChannelFactory::ActorRetryRequestMetadata>& capturedMetadata,
+      kj::Maybe<RecordedRequestContexts&> contexts = kj::none)
+      : capturedMetadata(capturedMetadata),
+        contexts(contexts) {}
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
     capturedMetadata = kj::mv(metadata.actorRetryRequestMetadata);
+    KJ_IF_SOME(recorded, contexts) {
+      recorded.add(kj::mv(metadata.requestContext));
+    }
     return kj::heap<MockFetchTarget>();
   }
 
@@ -623,6 +632,7 @@ class RecordingActorChannel final: public IoChannelFactory::ActorChannel {
 
  private:
   kj::Maybe<IoChannelFactory::ActorRetryRequestMetadata>& capturedMetadata;
+  kj::Maybe<RecordedRequestContexts&> contexts;
 };
 
 class ReplayActorChannel final: public IoChannelFactory::ActorChannel {
@@ -630,6 +640,7 @@ class ReplayActorChannel final: public IoChannelFactory::ActorChannel {
   ReplayActorChannel(ReplayState& state): state(state) {}
 
   kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    state.requestContexts.add(kj::mv(metadata.requestContext));
     KJ_IF_SOME(retryMetadata, metadata.actorRetryRequestMetadata) {
       state.metadata.add(kj::mv(retryMetadata));
     }
@@ -654,12 +665,14 @@ struct ActorIoChannelFactory final: public TestFixture::DummyIoChannelFactory {
       kj::Maybe<IoChannelFactory::ActorRetryRequestMetadata>& capturedMetadata,
       uint& channelCount,
       kj::Vector<kj::String>& locationHints,
-      kj::Vector<kj::String>& cohorts)
+      kj::Vector<kj::String>& cohorts,
+      kj::Maybe<RecordedRequestContexts&> contexts = kj::none)
       : DummyIoChannelFactory(timer),
         capturedMetadata(capturedMetadata),
         channelCount(channelCount),
         locationHints(locationHints),
-        cohorts(cohorts) {}
+        cohorts(cohorts),
+        contexts(contexts) {}
 
   kj::Rc<ActorChannel> getGlobalActor(uint,
       const ActorIdFactory::ActorId&,
@@ -679,13 +692,14 @@ struct ActorIoChannelFactory final: public TestFixture::DummyIoChannelFactory {
         cohorts.add(kj::mv(cohort));
       }
     }
-    return kj::rc<RecordingActorChannel>(capturedMetadata);
+    return kj::rc<RecordingActorChannel>(capturedMetadata, contexts);
   }
 
   kj::Maybe<IoChannelFactory::ActorRetryRequestMetadata>& capturedMetadata;
   uint& channelCount;
   kj::Vector<kj::String>& locationHints;
   kj::Vector<kj::String>& cohorts;
+  kj::Maybe<RecordedRequestContexts&> contexts;
 };
 
 KJ_TEST("fetch generates actor retry metadata for a supported outgoing factory") {
@@ -1408,12 +1422,15 @@ KJ_TEST("GlobalActorOutgoingFactory forwards metadata and recreates channels for
   kj::Vector<kj::String> locationHints;
   kj::Vector<kj::String> cohorts;
   kj::Vector<CountSubrequest> countSubrequests;
+  RecordedRequestContexts contexts;
+  auto firstContext = kj::rc<RequestContext>();
+  auto secondContext = kj::rc<RequestContext>();
   TestFixture fixture(TestFixture::SetupParams{
     .useRealTimers = false,
     .ioChannelFactory = kj::Function<kj::Rc<IoChannelFactory>(TimerChannel&)>(
         [&](TimerChannel& timer) -> kj::Rc<IoChannelFactory> {
     return kj::rc<ActorIoChannelFactory>(
-        timer, capturedMetadata, channelCount, locationHints, cohorts);
+        timer, capturedMetadata, channelCount, locationHints, cohorts, contexts);
   }),
     .requestObserverFactory = kj::Function<kj::Own<RequestObserver>()>(
         [&]() { return kj::refcounted<RecordingRequestObserver>(countSubrequests); }),
@@ -1435,6 +1452,7 @@ KJ_TEST("GlobalActorOutgoingFactory forwards metadata and recreates channels for
     KJ_EXPECT(retryPolicy.maxRetries == 2);
     KJ_EXPECT(retryPolicy.timeout == 500 * kj::MILLISECONDS);
 
+    auto firstScope = env.context.makeRequestContextScope(env.lock, firstContext.addRef());
     auto client = factory.newActorCallAttempt(kj::none,
         ActorCallRetryState::Attempt(
             IoChannelFactory::ActorRetryRequestMetadata{
@@ -1454,7 +1472,9 @@ KJ_TEST("GlobalActorOutgoingFactory forwards metadata and recreates channels for
       KJ_FAIL_EXPECT("actor retry metadata was not forwarded to the actor channel");
     }
 
+    firstScope = kj::none;
     factory.onActorCallRetry();
+    auto secondScope = env.context.makeRequestContextScope(env.lock, secondContext.addRef());
     auto retryClient = factory.newActorCallAttempt(kj::none,
         ActorCallRetryState::Attempt(
             IoChannelFactory::ActorRetryRequestMetadata{
@@ -1476,6 +1496,9 @@ KJ_TEST("GlobalActorOutgoingFactory forwards metadata and recreates channels for
     KJ_ASSERT(countSubrequests.size() == 2);
     KJ_EXPECT(countSubrequests[0] == CountSubrequest::YES);
     KJ_EXPECT(countSubrequests[1] == CountSubrequest::NO);
+    KJ_ASSERT(contexts.size() == 2);
+    KJ_EXPECT(KJ_ASSERT_NONNULL(contexts[0]).get() == firstContext.get());
+    KJ_EXPECT(KJ_ASSERT_NONNULL(contexts[1]).get() == secondContext.get());
 
     GlobalActorOutgoingFactory retriesDisallowedFactory(
         GlobalActorOutgoingFactory::ChannelIdOrFactory(static_cast<uint>(1)),
@@ -1484,6 +1507,45 @@ KJ_TEST("GlobalActorOutgoingFactory forwards metadata and recreates channels for
         ActorCallRetriesAllowed::NO, Persistent::NO, kj::none);
     KJ_EXPECT(!retriesDisallowedFactory.supportsActorCallRetries());
   });
+}
+
+KJ_TEST("replica actor retries retain initiating frames after interleaved calls") {
+  ReplayState firstState{.actions = kj::arr(ReplayAction::AMBIGUOUS)};
+  ReplayState secondState{.actions = kj::heapArray<ReplayAction>(0)};
+  auto firstContext = kj::rc<RequestContext>();
+  auto secondContext = kj::rc<RequestContext>();
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
+  DeterministicTimerChannel timerChannel(timer);
+  firstState.timerChannel = timerChannel;
+  secondState.timerChannel = timerChannel;
+  TestFixture fixture(TestFixture::SetupParams{
+    .useRealTimers = false,
+    .ioChannelFactory = kj::Function<kj::Rc<IoChannelFactory>(TimerChannel&)>(
+        [&](TimerChannel&) -> kj::Rc<IoChannelFactory> {
+    return kj::rc<TestFixture::DummyIoChannelFactory>(timerChannel);
+  }),
+  });
+  util::Autogate::initAutogateNamesForTest({}, util::IgnoreAllAutogatesEnv::YES);
+  fixture.runInIoContext([&](const TestFixture::Environment& env) {
+    auto start = [&](ReplayState& state, kj::Rc<RequestContext> context) {
+      auto scope = env.context.makeRequestContextScope(env.lock, kj::mv(context));
+      auto fetcher = env.js.alloc<Fetcher>(
+          env.context.addObject<Fetcher::OutgoingFactory>(kj::heap<ReplicaActorOutgoingFactory>(
+              kj::rc<ReplayActorChannel>(state), kj::str("actor-id"))),
+          Fetcher::RequiresHostAndProtocol::YES);
+      return fetcher->fetch(env.js, kj::str("http://example.com"), kj::none);
+    };
+    auto first = start(firstState, firstContext.addRef());
+    auto second = start(secondState, secondContext.addRef());
+    return kj::joinPromises(kj::arr(env.context.awaitJs(env.js, kj::mv(first)).ignoreResult(),
+        env.context.awaitJs(env.js, kj::mv(second)).ignoreResult()));
+  });
+  KJ_EXPECT(firstState.requestCount == 2);
+  KJ_ASSERT(firstState.requestContexts.size() == 2);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(firstState.requestContexts[0]).get() == firstContext.get());
+  KJ_EXPECT(KJ_ASSERT_NONNULL(firstState.requestContexts[1]).get() == firstContext.get());
+  KJ_ASSERT(secondState.requestContexts.size() == 1);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(secondState.requestContexts[0]).get() == secondContext.get());
 }
 
 CompatibilityFlags::Reader makeExperimentalFlags(capnp::MallocMessageBuilder& message) {

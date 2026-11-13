@@ -41,6 +41,18 @@ pub type TokenUsage = ffi::TokenUsage;
 /// Whether a stub for the channel may outlive the process (`Persistent` in the runtime).
 pub type Persistent = bool;
 
+/// Namespace routing without requiring an actor or isolate to be constructed in this factory.
+/// A durable route retains its original namespace key; remote routes own their capability.
+pub trait ActorNamespaceChannel {
+    fn unique_key(&self) -> Option<&str>;
+
+    fn channel(&self, id: KjOwn<ActorIdHandle>, persistent: Persistent) -> Result<Rc<dyn Channel>>;
+
+    fn channel_by_name(&self, name: &str, persistent: Persistent) -> Result<Rc<dyn Channel>>;
+
+    fn evict_all_for_test(&self, hibernate: bool) -> LocalBoxFuture<'_, Result<()>>;
+}
+
 /// Something that starts requests: a worker entrypoint, an actor, an external server, the
 /// network, a directory. The runtime's `IoChannelFactory::SubrequestChannel`.
 pub trait Channel {

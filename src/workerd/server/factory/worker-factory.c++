@@ -259,6 +259,14 @@ bool factory_tail_workers(const WorkerFactory& factory) {
   return factory.getImpl().options->tailWorkers;
 }
 
+void factory_set_worker_admission(
+    const WorkerFactory& factory, ::rust::Box<WorkerAdmission> admission) {
+  auto& impl = factory.getImpl();
+  KJ_REQUIRE(!impl.workerCreationStarted && impl.workerAdmission == kj::none,
+      "Worker admission must be selected once, before any Worker startup");
+  impl.workerAdmission = kj::mv(admission);
+}
+
 Worker::Actor::Id normalizeActorId(Worker::Actor::Id id) {
   KJ_IF_SOME(doId, id.tryGet<kj::Own<ActorIdFactory::ActorId>>()) {
     KJ_IF_SOME(name, doId->getName()) {
@@ -651,6 +659,7 @@ class CacheHttpClientImpl final: public kj::HttpClient {
           .cfBlobJson = kj::mv(metadata.cfBlobJson),
           .parentSpan = kj::mv(metadata.parentSpan),
           .userSpanParent = kj::mv(metadata.userSpanParent),
+          .requestContext = kj::mv(metadata.requestContext),
         }))),
         cacheName(kj::mv(cacheName)),
         cacheNamespaceHeader(cacheNamespaceHeader) {}
@@ -757,9 +766,12 @@ kj::Own<AccessInfo> parseAccessBlob(
 // C++ (a dynamic worker's env tables, channel tokens, the debug port).
 class RustIoChannelFactory final: public IoChannelFactory {
  public:
-  RustIoChannelFactory(kj::Own<CompiledWorker::Impl> worker, ::rust::Box<ChannelFactory> channels)
+  RustIoChannelFactory(kj::Own<CompiledWorker::Impl> worker,
+      ::rust::Box<ChannelFactory> channels,
+      kj::Maybe<kj::Rc<RequestContext>> requestContext)
       : worker(kj::mv(worker)),
-        channels(kj::mv(channels)) {}
+        channels(kj::mv(channels)),
+        requestContext(kj::mv(requestContext)) {}
 
   ~RustIoChannelFactory() noexcept(false) {
     // A request's drain task runs in the worker's own task set and may hold the worker's last
@@ -787,6 +799,10 @@ class RustIoChannelFactory final: public IoChannelFactory {
 
   capnp::Capability::Client getCapability(uint channel) override {
     KJ_FAIL_REQUIRE("no capability channels");
+  }
+
+  kj::Maybe<kj::Rc<RequestContext>> getRequestContext() override {
+    return requestContext.clone();
   }
 
   kj::Own<CacheClient> getCache() override {
@@ -941,6 +957,7 @@ class RustIoChannelFactory final: public IoChannelFactory {
  private:
   kj::Own<CompiledWorker::Impl> worker;
   ::rust::Box<ChannelFactory> channels;
+  kj::Maybe<kj::Rc<RequestContext>> requestContext;
 
   ChannelTokenHandler& tokens() {
     return worker->factory.getImpl().channelTokenHandler;
@@ -1131,7 +1148,8 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
     }
   }
 
-  auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
+  auto ioChannelFactory = kj::rc<RustIoChannelFactory>(
+      kj::addRef(worker), kj::mv(channels), metadata.requestContext.clone());
   return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
       entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
@@ -1209,6 +1227,39 @@ void compileGlobals(jsg::Lock& lock,
 
 // =======================================================================================
 // Value shims
+
+namespace {
+class RustRequestContext final: public RequestContext {
+ public:
+  explicit RustRequestContext(::rust::Box<RequestContextHandle> value): value(kj::mv(value)) {}
+
+  ::rust::Box<RequestContextHandle> value;
+};
+}  // namespace
+
+kj::Rc<RequestContext> new_request_context(::rust::Box<RequestContextHandle> value) {
+  return kj::rc<RustRequestContext>(kj::mv(value));
+}
+
+::rust::Box<RequestContextHandle> request_context_value(const RequestContext& context) {
+  KJ_IF_SOME(value, kj::tryDowncast<const RustRequestContext>(context)) {
+    return value.value->context_handle_clone();
+  }
+  KJ_FAIL_REQUIRE("request context does not contain a Rust embedder value");
+}
+
+kj::Maybe<kj::Rc<RequestContext>> request_metadata_context(RequestMetadata& metadata) {
+  return metadata.requestContext.clone();
+}
+
+void request_metadata_set_context(RequestMetadata& metadata, kj::Rc<RequestContext> context) {
+  metadata.requestContext = kj::mv(context);
+}
+
+kj::Maybe<kj::Rc<RequestContext>> current_request_context() {
+  if (!IoContext::hasCurrent()) return kj::none;
+  return IoContext::current().getCurrentRequestContext();
+}
 
 kj::Own<WorkerInterface> worker_interface_attach(
     kj::Own<WorkerInterface> inner, ::rust::Box<KeepAlive> keep) {
@@ -1515,6 +1566,10 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
     kj::Maybe<uint32_t> configService,
     kj::Maybe<kj::Own<DynamicSource>> dynamicSource) {
   auto& factory = constFactory.getImpl();
+  factory.workerCreationStarted = true;
+  KJ_IF_SOME(admission, factory.workerAdmission) {
+    admission->begin_worker(configService != kj::none, configService.orDefault(0), spec.name);
+  }
   auto name = kj::str(spec.name);
   TRACE_EVENT("workerd", "factory_new_worker()", "name", name.cStr());
   auto impl = kj::refcounted<CompiledWorker::Impl>(constFactory, kj::mv(name));
@@ -1596,6 +1651,9 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   // The isolate of the Worker, or of the zygote that snapshots its startup.
   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
+    KJ_IF_SOME(admission, factory.workerAdmission) {
+      admission->admit_isolate(configService != kj::none, configService.orDefault(0), spec.name);
+    }
     auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
       return Worker::Api::InboundListener{
@@ -1620,7 +1678,8 @@ kj::Promise<kj::Own<CompiledWorker>> factory_new_worker(const WorkerFactory& con
   // Behind the STARTUP_SNAPSHOT autogate, a throwaway zygote Worker evaluates the top-level code
   // to produce a V8 startup snapshot of it.
   kj::Maybe<jsg::SnapshotConfig> snapshotConfig;
-  if (util::Autogate::isEnabled(util::AutogateKey::STARTUP_SNAPSHOT) &&
+  if (factory.workerAdmission == kj::none &&
+      util::Autogate::isEnabled(util::AutogateKey::STARTUP_SNAPSHOT) &&
       supportsStartupSnapshot(featureFlags, workerSource)) {
     // The zygote reports into a reporter of its own: its failures must never surface as the
     // Worker's.

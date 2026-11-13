@@ -2,10 +2,9 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-#include "ffi.h"
-
 #include "bridge.h"
 
+#include <workerd/rust/worker/ffi.h>
 #include <workerd/rust/worker/ffi.rs.h>
 
 #include <kj-rs/date.h>

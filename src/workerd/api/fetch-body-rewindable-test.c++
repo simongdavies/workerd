@@ -6,6 +6,7 @@
 
 #include <workerd/io/io-context.h>
 #include <workerd/io/observer.h>
+#include <workerd/io/request-context.h>
 #include <workerd/io/worker-interface.h>
 #include <workerd/tests/test-fixture.h>
 
@@ -88,6 +89,83 @@ struct FetchTargetIoChannelFactory final: public TestFixture::DummyIoChannelFact
     return kj::heap<MockFetchTarget>();
   }
 };
+
+class ContextRecordingChannel final: public IoChannelFactory::SubrequestChannel {
+ public:
+  explicit ContextRecordingChannel(kj::Vector<kj::Maybe<kj::Rc<RequestContext>>>& contexts)
+      : contexts(contexts) {}
+
+  kj::Own<WorkerInterface> startRequest(IoChannelFactory::SubrequestMetadata metadata) override {
+    contexts.add(kj::mv(metadata.requestContext));
+    return kj::heap<MockFetchTarget>(kj::Function<void()>([]() {}));
+  }
+  void requireAllowsTransfer() override {
+    KJ_UNIMPLEMENTED("not used in this test");
+  }
+  kj::OneOf<kj::Array<byte>, kj::Promise<kj::Array<byte>>> getTokenMaybeSync(
+      IoChannelFactory::ChannelTokenUsage) override {
+    KJ_UNIMPLEMENTED("not used in this test");
+  }
+
+ private:
+  kj::Vector<kj::Maybe<kj::Rc<RequestContext>>>& contexts;
+};
+
+KJ_TEST("owned HTTP client overloads propagate only the initiating request frame") {
+  kj::Vector<kj::Maybe<kj::Rc<RequestContext>>> contexts;
+  auto first = kj::rc<RequestContext>();
+  auto second = kj::rc<RequestContext>();
+  TestFixture fixture;
+  fixture.runInIoContext([&](const TestFixture::Environment& env) {
+    kj::Rc<IoChannelFactory::SubrequestChannel> channel = kj::rc<ContextRecordingChannel>(contexts);
+    auto fetcher = env.js.alloc<Fetcher>(env.context.addObject(kj::mv(channel)));
+    {
+      auto scope = env.context.makeRequestContextScope(env.lock, first.addRef());
+      auto client =
+          fetcher->getClientWithTracing(env.context, kj::none, kj::ConstString("first"_kjc));
+    }
+    {
+      auto scope = env.context.makeRequestContextScope(env.lock, second.addRef());
+      auto client =
+          fetcher->getClientWithTracing(env.context, kj::none, kj::ConstString("second"_kjc),
+              [](TraceContext&) -> kj::Maybe<SpanParent> { return kj::none; });
+    }
+    auto unscoped =
+        fetcher->getClientWithTracing(env.context, kj::none, kj::ConstString("unscoped"_kjc));
+  });
+  KJ_ASSERT(contexts.size() == 3);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(contexts[0]).get() == first.get());
+  KJ_EXPECT(KJ_ASSERT_NONNULL(contexts[1]).get() == second.get());
+  KJ_EXPECT(contexts[2] == kj::none);
+}
+
+KJ_TEST("owned HTTP channels retain distinct request frames across interleaved native I/O") {
+  kj::Vector<kj::Maybe<kj::Rc<RequestContext>>> contexts;
+  auto first = kj::rc<RequestContext>();
+  auto second = kj::rc<RequestContext>();
+  TestFixture fixture;
+  fixture.runInIoContext([&](const TestFixture::Environment& env) {
+    kj::Rc<IoChannelFactory::SubrequestChannel> channel = kj::rc<ContextRecordingChannel>(contexts);
+    auto fetcher = env.js.alloc<Fetcher>(env.context.addObject(kj::mv(channel)));
+    auto start = [&](kj::Rc<RequestContext> context) {
+      auto scope = env.context.makeRequestContextScope(env.lock, kj::mv(context));
+      return fetcher->fetch(env.js, kj::str("http://example.com/first"), kj::none)
+          .then(env.js, [fetcher = fetcher.addRef()](jsg::Lock& js, jsg::Ref<Response>) mutable {
+        return fetcher->fetch(js, kj::str("http://example.com/continued"), kj::none);
+      });
+    };
+    auto firstResponse = start(first.addRef());
+    auto secondResponse = start(second.addRef());
+    return kj::joinPromises(
+        kj::arr(env.context.awaitJs(env.js, kj::mv(firstResponse)).ignoreResult(),
+            env.context.awaitJs(env.js, kj::mv(secondResponse)).ignoreResult()));
+  });
+  KJ_ASSERT(contexts.size() == 4);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(contexts[0]).get() == first.get());
+  KJ_EXPECT(KJ_ASSERT_NONNULL(contexts[1]).get() == second.get());
+  KJ_EXPECT(KJ_ASSERT_NONNULL(contexts[2]).get() == first.get());
+  KJ_EXPECT(KJ_ASSERT_NONNULL(contexts[3]).get() == second.get());
+}
 
 // fetchImplNoOutputLock forwards payload and target retryability to RequestObserver so edgeworker
 // can classify disconnected outgoing actor calls. The stashed signal is per-call, not sticky: one

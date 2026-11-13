@@ -25,6 +25,7 @@
 #include <workerd/rust/kj/ffi.h>
 #include <workerd/rust/worker/bridge.h>
 #include <workerd/server/channel-token.h>
+#include <workerd/server/factory/actor-storage-backend.h>
 #include <workerd/server/workerd.capnp.h>
 
 #include <kj-rs/kj-rs.h>
@@ -58,6 +59,8 @@ struct AbortReason;
 struct KeepAlive;
 struct WorkerInterfaceList;
 struct WorkerStub;
+struct WorkerAdmission;
+struct RequestContextHandle;
 struct UdpFlow;
 
 // The hibernation manager of an evicted actor, handed to its replacement.
@@ -172,6 +175,13 @@ class WorkerFactory final: private ChannelTokenHandler::Resolver {
 const kj::HttpHeaderTable& factory_header_table(const WorkerFactory& factory);
 bool factory_experimental(const WorkerFactory& factory);
 bool factory_tail_workers(const WorkerFactory& factory);
+void factory_set_worker_admission(
+    const WorkerFactory& factory, ::rust::Box<WorkerAdmission> admission);
+kj::Rc<RequestContext> new_request_context(::rust::Box<RequestContextHandle> value);
+::rust::Box<RequestContextHandle> request_context_value(const RequestContext& context);
+kj::Maybe<kj::Rc<RequestContext>> request_metadata_context(RequestMetadata& metadata);
+void request_metadata_set_context(RequestMetadata& metadata, kj::Rc<RequestContext> context);
+kj::Maybe<kj::Rc<RequestContext>> current_request_context();
 void factory_set_server(const WorkerFactory& factory, ::rust::Box<ServerHandle> server);
 void factory_spawn(const WorkerFactory& factory, ::rust::Box<SpawnedTask> task);
 void factory_clear_tasks(const WorkerFactory& factory);
@@ -283,6 +293,10 @@ kj::Own<ActorStorage> factory_new_actor_storage(const WorkerFactory& factory,
     ::rust::Str path,
     ::rust::Str uniqueKey,
     ::rust::Box<ActorNamespaceHandle> actors);
+kj::Own<ActorStorage> factory_new_actor_storage_with_backend(const WorkerFactory& factory,
+    ::rust::Str uniqueKey,
+    ::rust::Box<ActorNamespaceHandle> actors,
+    kj::Own<ActorStorageBackend> backend);
 void actor_storage_delete_all(const ActorStorage& storage);
 // Facets have numbers only in a directory (SQLite storage). In-memory storage is an ActorCache per
 // actor, in which they have none, and nothing to delete or clone.
@@ -385,6 +399,8 @@ class RpcClient final {
 };
 
 kj::Own<RpcClient> new_rpc_client(const WorkerFactory& factory, kj::Own<kj::AsyncIoStream> stream);
+kj::Own<WorkerInterface> rpc_client_into_worker(
+    kj::Own<RpcClient> client, const RequestMetadata& metadata);
 kj::Promise<rust::worker::CustomEventResult> rpc_client_custom_event(const RpcClient& client,
     kj::Own<WorkerInterface::CustomEvent> event,
     kj::Maybe<::rust::Str> cfBlobJson);

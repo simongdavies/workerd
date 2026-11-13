@@ -2,8 +2,7 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-#include "ffi.h"
-
+#include <workerd/rust/kj/ffi.h>
 #include <workerd/rust/kj/http.rs.h>
 
 #include <kj/compat/http.h>

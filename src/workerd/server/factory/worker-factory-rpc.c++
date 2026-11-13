@@ -181,6 +181,21 @@ kj::Own<RpcClient> new_rpc_client(const WorkerFactory& factory, kj::Own<kj::Asyn
   return kj::heap<RpcClient>(kj::heap<RpcClient::Impl>(factory, kj::mv(stream)));
 }
 
+kj::Own<WorkerInterface> rpc_client_into_worker(
+    kj::Own<RpcClient> client, const RequestMetadata& metadata) {
+  auto& impl = client->getImpl();
+  auto request = impl.rpcSystem.bootstrap().castAs<rpc::WorkerdBootstrap>().startEventRequest();
+  KJ_IF_SOME(cf, metadata.cfBlobJson) {
+    request.setCfBlobJson(cf);
+  }
+  request.setFromPersistentStub(metadata.fromPersistentStub.toBool());
+  auto dispatcher = request.sendForPipeline().getDispatcher();
+  auto& factory = impl.factory.getImpl();
+  return kj::heap<RpcWorkerInterface>(factory.httpOverCapnpFactory, factory.byteStreamFactory,
+      getUnsupportedFrankenvalueHandler(), kj::mv(dispatcher))
+      .attach(kj::mv(client));
+}
+
 kj::Promise<rust::worker::CustomEventResult> rpc_client_custom_event(const RpcClient& client,
     kj::Own<WorkerInterface::CustomEvent> event,
     kj::Maybe<::rust::Str> cfBlobJson) {

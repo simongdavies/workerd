@@ -59,6 +59,11 @@ glob = "0"
 # The server's `network` services: the `allow` / `deny` CIDR ranges.
 ipnet = "2"
 hyper = { version = "1", default-features = false, features = ["client", "http1", "server"] }
+# The Hyperlight guest's official FunctionCall verifier and external-value codec.
+hyperlight-common = { version = "=0.18.0", default-features = false }
+flatbuffers = { version = "=25.12.19", default-features = false }
+# Exact finite HTTP message framing before dispatching to the normal HTTP server.
+httparse = "1"
 # The pooled HTTP/1.1 client (kj-hyper/client.rs) is hyper-util's legacy client over a connector
 # kj-hyper supplies; tower-service is the trait that connector implements.
 hyper-util = { version = "0", default-features = false, features = ["client-legacy", "http1", "tokio"] }
@@ -79,6 +84,8 @@ ruff_python_ast = { git = "https://github.com/astral-sh/ruff", tag = "0.12.1" }
 ruff_python_parser = { git = "https://github.com/astral-sh/ruff", tag = "0.12.1" }
 # ring rather than aws-lc-rs: its crates.io package builds with plain cc (no cmake/NASM).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# Verify admitted guest-image config bytes with the existing TLS digest implementation.
+ring = { version = "0.17", default-features = false }
 rustls-platform-verifier = "0.7"
 # kj-hyper's TLS direct trust recognizes webpki's chain-building errors, and checks a directly
 # trusted certificate's validity and key usage itself.

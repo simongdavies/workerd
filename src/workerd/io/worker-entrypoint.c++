@@ -480,7 +480,11 @@ kj::Promise<void> WorkerEntrypoint::requestImpl(kj::HttpMethod method,
         // listener.
         if (proxyTask == kj::none && !loggedExceptionEarlier && abortController != kj::none) {
           auto ctrl = KJ_ASSERT_NONNULL(abortController).addRef();
-          context.addWaitUntil(context.run([ctrl = kj::mv(ctrl)](Worker::Lock& lock) mutable {
+          context.addWaitUntil(context.run(
+              [ctrl = kj::mv(ctrl), requestContext = incomingRequest->getRequestContext()](
+                  Worker::Lock& lock, IoContext& context) mutable {
+            auto requestContextScope =
+                context.makeRequestContextScope(lock, kj::mv(requestContext));
             ctrl->getSignal()->triggerAbort(
                 lock, JSG_KJ_EXCEPTION(DISCONNECTED, DOMAbortError, "The client has disconnected"));
           }));
@@ -497,11 +501,13 @@ kj::Promise<void> WorkerEntrypoint::requestImpl(kj::HttpMethod method,
         api::DeferredProxy<void> deferredProxy = co_await context.run(
             [this, method, url, &headers, &requestBody, &wrappedResponse = *wrappedResponse,
                 entrypointName = entrypointName.clone(),
+                requestContext = incomingRequest->getRequestContext(),
                 metrics = kj::addRef(incomingRequest->getMetrics())](
                 Worker::Lock& lock, IoContext& context) mutable {
           TRACE_EVENT_END("workerd", PERFETTO_TRACK_FROM_POINTER(&context));
           TRACE_EVENT(
               "workerd", "WorkerEntrypoint::request() run", PERFETTO_FLOW_FROM_POINTER(this));
+          auto requestContextScope = context.makeRequestContextScope(lock, kj::mv(requestContext));
           jsg::AsyncContextFrame::StorageScope traceScope = context.makeAsyncTraceScope(lock);
           jsg::AsyncContextFrame::StorageScope userTraceScope =
               context.makeUserAsyncTraceScope(lock);
@@ -789,8 +795,10 @@ kj::Promise<void> WorkerEntrypoint::connect(kj::StringPtr host,
       context
           .run([this, &headers, &connection, &response = *wrappedResponse,
                    entrypointName = entrypointName.clone(), versionInfo = kj::mv(versionInfo),
-                   host = kj::str(host), clientAddress = kj::mv(clientAddress)](
+                   requestContext = incomingRequest->getRequestContext(), host = kj::str(host),
+                   clientAddress = kj::mv(clientAddress)](
                    Worker::Lock& lock, IoContext& context) mutable {
+    auto requestContextScope = context.makeRequestContextScope(lock, kj::mv(requestContext));
     jsg::AsyncContextFrame::StorageScope traceScope = context.makeAsyncTraceScope(lock);
     jsg::AsyncContextFrame::StorageScope userTraceScope = context.makeUserAsyncTraceScope(lock);
 
@@ -935,9 +943,11 @@ kj::Promise<WorkerInterface::ScheduledResult> WorkerEntrypoint::runScheduled(
   // Scheduled handlers run entirely in waitUntil() tasks.
   context.addWaitUntil(context.run([scheduledTime, cron, entrypointName = entrypointName.clone(),
                                        versionInfo = kj::mv(versionInfo), props = kj::mv(props),
+                                       requestContext = incomingRequest->getRequestContext(),
                                        &metrics = incomingRequest->getMetrics()](
                                        Worker::Lock& lock, IoContext& context) mutable {
     TRACE_EVENT("workerd", "WorkerEntrypoint::runScheduled() run");
+    auto requestContextScope = context.makeRequestContextScope(lock, kj::mv(requestContext));
     jsg::AsyncContextFrame::StorageScope traceScope = context.makeAsyncTraceScope(lock);
     jsg::AsyncContextFrame::StorageScope userTraceScope = context.makeUserAsyncTraceScope(lock);
 
@@ -1017,6 +1027,8 @@ kj::Promise<WorkerInterface::AlarmResult> WorkerEntrypoint::runAlarmImpl(
             [scheduledTime, retryCount, &incomingRequest = *incomingRequest,
                 entrypointName = entrypointName.clone(), versionInfo = kj::mv(versionInfo),
                 props = kj::mv(props)](Worker::Lock& lock, IoContext& context) mutable {
+          auto requestContextScope =
+              context.makeRequestContextScope(lock, incomingRequest.getRequestContext());
           jsg::AsyncContextFrame::StorageScope traceScope = context.makeAsyncTraceScope(lock);
           jsg::AsyncContextFrame::StorageScope userTraceScope =
               context.makeUserAsyncTraceScope(lock);
@@ -1120,8 +1132,10 @@ kj::Promise<void> WorkerEntrypoint::bench(
   // the report needs the handler's result.
   auto result = co_await context.run(
       [params, entrypointName = entrypointName.clone(), versionInfo = kj::mv(versionInfo),
+          requestContext = incomingRequest->getRequestContext(),
           props = kj::mv(props)](Worker::Lock& lock, IoContext& context) mutable {
     TRACE_EVENT("workerd", "WorkerEntrypoint::bench() run");
+    auto requestContextScope = context.makeRequestContextScope(lock, kj::mv(requestContext));
     jsg::AsyncContextFrame::StorageScope traceScope = context.makeAsyncTraceScope(lock);
     jsg::AsyncContextFrame::StorageScope userTraceScope = context.makeUserAsyncTraceScope(lock);
 
@@ -1148,9 +1162,11 @@ kj::Promise<bool> WorkerEntrypoint::test() {
 
   context.addWaitUntil(
       context.run([entrypointName = entrypointName.clone(), versionInfo = kj::mv(versionInfo),
-                      props = kj::mv(props), &metrics = incomingRequest->getMetrics()](
+                      requestContext = incomingRequest->getRequestContext(), props = kj::mv(props),
+                      &metrics = incomingRequest->getMetrics()](
                       Worker::Lock& lock, IoContext& context) mutable -> kj::Promise<void> {
     TRACE_EVENT("workerd", "WorkerEntrypoint::test() run");
+    auto requestContextScope = context.makeRequestContextScope(lock, kj::mv(requestContext));
     jsg::AsyncContextFrame::StorageScope traceScope = context.makeAsyncTraceScope(lock);
     jsg::AsyncContextFrame::StorageScope userTraceScope = context.makeUserAsyncTraceScope(lock);
 

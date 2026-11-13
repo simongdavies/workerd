@@ -1081,6 +1081,10 @@ class ActorCache::SharedLru {
 
   explicit SharedLru(Options options);
 
+  const Options& getOptions() const {
+    return options;
+  }
+
   ~SharedLru() noexcept(false);
   KJ_DISALLOW_COPY_AND_MOVE(SharedLru);
 

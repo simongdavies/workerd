@@ -598,6 +598,7 @@ kj::Own<kj::HttpClient> Cache::getHttpClient(IoContext& context,
     .parentSpan = traceContext.getInternalSpanParent(),
     .featureFlagsForFl = kj::none,
     .userSpanParent = traceContext.getUserSpanParent(),
+    .requestContext = context.getCurrentRequestContext(),
   };
   if (enableCompatFlags) {
     metadata.featureFlagsForFl = context.getWorker().getIsolate().getFeatureFlagsForFl().clone();

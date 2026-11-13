@@ -42,6 +42,7 @@ use crate::bridge::ffi;
 use crate::channels::ActorClass;
 use crate::channels::ActorClassChannel;
 use crate::channels::ActorIdHandle;
+use crate::channels::ActorNamespaceChannel;
 use crate::channels::Channel;
 use crate::channels::Frankenvalue;
 use crate::channels::NewActor;
@@ -52,6 +53,7 @@ use crate::channels::SubrequestChannel;
 use crate::channels::TokenUsage;
 use crate::channels::WorkerInterface;
 use crate::listen::loopback::Loopback;
+use crate::loader::DynamicWorkerLoader;
 use crate::loader::WorkerLoaderNamespace;
 use crate::services::DiskDirectoryService;
 use crate::worker::LinkedChannels;
@@ -61,15 +63,72 @@ use crate::worker::WorkerService;
 pub struct Factory {
     inner: KjOwn<ffi::WorkerFactory>,
     loopback: Loopback,
+    actor_storage: Option<Rc<dyn ActorStorageProvider>>,
+    pub(crate) owned_endpoints: RefCell<Vec<Rc<dyn WorkerEndpoint>>>,
+    pub(crate) endpoint_retirements:
+        RefCell<Vec<futures::future::LocalBoxFuture<'static, Result<()>>>>,
+}
+
+/// Trusted embedder selection for all durable namespaces of this factory.
+/// Missing/foreign namespaces must fail; errors never fall back to in-memory storage.
+pub trait ActorStorageProvider {
+    fn open_namespace(
+        &self,
+        class_name: &str,
+        unique_key: &str,
+    ) -> Result<KjOwn<ffi::ActorStorageBackend>>;
 }
 
 impl Factory {
+    /// Restricts this factory to one configured Worker source and one application isolate.
+    /// The embedder must supply the other workers' capabilities separately; this does not
+    /// partition the service graph or allocate any VMs.
+    pub fn restrict_to_worker(&self, index: u32) -> Result<()> {
+        let message = self.config()?;
+        let services = message
+            .get_root::<config::Reader>()
+            .and_then(config::Reader::get_services)
+            .map_err(capnp_error)?;
+        if index >= services.len() {
+            return Err(kj::failed!("selected Worker index is outside the config"));
+        }
+        let service = services.get(index);
+        if !matches!(service.which(), Ok(service::Which::Worker(_))) {
+            return Err(kj::failed!("selected service is not a Worker"));
+        }
+        let name = text(service.get_name())?;
+        let admission = crate::admission::WorkerAdmission::configured(index, name)
+            .map_err(|error| kj::failed!("{error}"))?;
+        ffi::factory_set_worker_admission(&self.inner, Box::new(admission)).map_err(Into::into)
+    }
+
+    /// Selects a dynamic root for a new owner. Loading a child into an already-admitted
+    /// factory is rejected before fetching its source.
+    pub fn restrict_to_dynamic_worker(&self, name: &str) -> Result<()> {
+        let admission = crate::admission::WorkerAdmission::dynamic(name.to_owned())
+            .map_err(|error| kj::failed!("{error}"))?;
+        ffi::factory_set_worker_admission(&self.inner, Box::new(admission)).map_err(Into::into)
+    }
+
     #[must_use]
     pub fn new(inner: KjOwn<ffi::WorkerFactory>) -> Self {
         Self {
             inner,
             loopback: Loopback::default(),
+            actor_storage: None,
+            owned_endpoints: RefCell::new(Vec::new()),
+            endpoint_retirements: RefCell::new(Vec::new()),
         }
+    }
+
+    #[must_use]
+    pub fn with_actor_storage_provider(mut self, provider: Rc<dyn ActorStorageProvider>) -> Self {
+        self.actor_storage = Some(provider);
+        self
+    }
+
+    pub(crate) fn actor_storage_provider(&self) -> Option<&Rc<dyn ActorStorageProvider>> {
+        self.actor_storage.as_ref()
     }
 
     /// The `loopback:` namespace of this server's sockets and external services.
@@ -201,6 +260,11 @@ pub struct Overrides {
 /// One named service of the config.
 pub enum Service {
     Worker(Rc<WorkerService>),
+    /// A configured Worker hosted by the embedder outside this factory.
+    Endpoint {
+        default: Rc<dyn Channel>,
+        endpoint: Rc<dyn WorkerEndpoint>,
+    },
     /// An external server or a network: a channel and nothing more. A service whose config was
     /// rejected (the error was reported) is an [`InvalidConfigChannel`], which stands in so that
     /// the rest of the config can be checked.
@@ -214,6 +278,7 @@ impl Service {
     pub fn channel(&self) -> Rc<dyn Channel> {
         match self {
             Self::Worker(worker) => worker.default_entrypoint(),
+            Self::Endpoint { default, .. } => Rc::clone(default),
             Self::Leaf(channel) => Rc::clone(channel),
             Self::Disk(disk) => Rc::clone(disk) as Rc<dyn Channel>,
         }
@@ -225,6 +290,135 @@ impl Service {
             Self::Worker(worker) => Some(worker),
             _ => None,
         }
+    }
+}
+
+/// Resolves the complete configured service designator without constructing a local isolate.
+/// The returned channel owns its connection and preserves its transfer and lifetime policies.
+pub trait WorkerEndpoint {
+    fn resolve(&self, designator: &Designator) -> Result<Rc<dyn Channel>>;
+
+    fn bind_factory(&self, _factory: &Rc<Factory>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Fence starts now; finish owned local cleanup outside JavaScript, independently of the
+    /// cancellable factory task set. This is not a remote/native join receipt.
+    fn unlink(&self) -> futures::future::LocalBoxFuture<'static, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn actor_class(&self, _designator: &Designator) -> Result<Rc<dyn ActorClass>> {
+        Err(kj::failed!(
+            "hosted Worker actor-class route was not supplied"
+        ))
+    }
+
+    fn actor_namespace(&self, _class_name: &str) -> Result<Rc<dyn ActorNamespaceChannel>> {
+        Err(kj::failed!(
+            "hosted Worker actor-namespace route was not supplied"
+        ))
+    }
+}
+
+struct EndpointChannel {
+    endpoint: Rc<dyn WorkerEndpoint>,
+    designator: Designator,
+}
+
+impl Channel for EndpointChannel {
+    fn start_request(&self, metadata: KjOwn<RequestMetadata>) -> Result<KjOwn<WorkerInterface>> {
+        self.endpoint
+            .resolve(&self.designator)?
+            .start_request(metadata)
+    }
+
+    fn require_allows_transfer(&self) -> Result<()> {
+        self.endpoint
+            .resolve(&self.designator)?
+            .require_allows_transfer()
+    }
+
+    fn token(&self, usage: TokenUsage) -> Result<KjOwn<PendingToken>> {
+        self.endpoint.resolve(&self.designator)?.token(usage)
+    }
+}
+
+/// Trusted placement of configured Workers, separate from ordinary supplied leaf services.
+/// Every other configured Worker needs an explicit endpoint; there is no local fallback.
+pub struct WorkerPartition {
+    local_index: u32,
+    endpoints: HashMap<String, Rc<dyn WorkerEndpoint>>,
+    dynamic_loader: Option<Rc<dyn DynamicWorkerLoader>>,
+}
+
+impl WorkerPartition {
+    #[must_use]
+    pub fn with_dynamic_loader(mut self, loader: Rc<dyn DynamicWorkerLoader>) -> Self {
+        self.dynamic_loader = Some(loader);
+        self
+    }
+
+    #[must_use]
+    pub fn local_index(&self) -> u32 {
+        self.local_index
+    }
+
+    pub fn new(
+        config: config::Reader<'_>,
+        local_index: u32,
+        endpoints: HashMap<String, Rc<dyn WorkerEndpoint>>,
+    ) -> Result<Self> {
+        let services = config.get_services().map_err(capnp_error)?;
+        if local_index >= services.len()
+            || !matches!(
+                services.get(local_index).which(),
+                Ok(service::Which::Worker(_))
+            )
+        {
+            return Err(kj::failed!(
+                "partition local service must be a configured Worker"
+            ));
+        }
+        let mut names = HashSet::new();
+        let mut required = HashSet::new();
+        for (index, service) in services.iter().enumerate() {
+            let name = text(service.get_name())?;
+            if name.is_empty() || !names.insert(name.clone()) {
+                return Err(kj::failed!(
+                    "partition service names must be nonempty and unique"
+                ));
+            }
+            if index != local_index as usize
+                && matches!(service.which(), Ok(service::Which::Worker(_)))
+            {
+                required.insert(name);
+            }
+        }
+        let mut missing: Vec<_> = required
+            .iter()
+            .filter(|name| !endpoints.contains_key(*name))
+            .cloned()
+            .collect();
+        let mut unexpected: Vec<_> = endpoints
+            .keys()
+            .filter(|name| !required.contains(*name))
+            .cloned()
+            .collect();
+        missing.sort();
+        unexpected.sort();
+        if !missing.is_empty() || !unexpected.is_empty() {
+            return Err(kj::failed!(
+                "partition Worker endpoints differ: missing [{}], unexpected [{}]",
+                missing.join(", "),
+                unexpected.join(", ")
+            ));
+        }
+        Ok(Self {
+            local_index,
+            endpoints,
+            dynamic_loader: None,
+        })
     }
 }
 
@@ -297,6 +491,33 @@ struct WorkerLoaders {
 #[derive(Default)]
 pub struct Services(LinkedHashMap<String, Service>);
 
+impl Services {
+    fn with_channels(
+        actor_configs: &mut ActorConfigs,
+        channels: HashMap<String, Rc<dyn Channel>>,
+    ) -> Result<Self> {
+        let mut channels: Vec<_> = channels.into_iter().collect();
+        channels.sort_by(|a, b| a.0.cmp(&b.0));
+        let conflicts: Vec<_> = channels
+            .iter()
+            .filter(|(name, _)| actor_configs.contains_key(name))
+            .map(|(name, _)| name.as_str())
+            .collect();
+        if !conflicts.is_empty() {
+            return Err(kj::failed!(
+                "Services supplied by the embedder conflict with configured services: {}",
+                conflicts.join(", ")
+            ));
+        }
+        let mut services = Self::default();
+        for (name, channel) in channels {
+            actor_configs.insert(name.clone(), ActorConfigMap::new());
+            services.0.insert(name, Service::Leaf(channel));
+        }
+        Ok(services)
+    }
+}
+
 impl Drop for Services {
     fn drop(&mut self) {
         for worker in self.0.values().filter_map(Service::as_worker) {
@@ -312,11 +533,16 @@ pub struct Server {
     /// Durable namespaces by `uniqueKey`, for actor tokens.
     namespaces_by_unique_key: HashMap<String, Rc<ActorNamespace>>,
     worker_loaders: RefCell<WorkerLoaders>,
+    dynamic_loader: Option<Rc<dyn DynamicWorkerLoader>>,
     /// Declared last, so that it is dropped last: the services (and their isolates) refer to it.
     factory: Rc<Factory>,
 }
 
 impl Server {
+    pub(crate) fn dynamic_worker_loader(&self) -> Option<Rc<dyn DynamicWorkerLoader>> {
+        self.dynamic_loader.as_ref().map(Rc::clone)
+    }
+
     #[must_use]
     pub fn factory(&self) -> &Rc<Factory> {
         &self.factory
@@ -332,7 +558,32 @@ impl Server {
         lookup_service(&self.services.0, &self.report, designator)
     }
 
-    /// Every service, in config order.
+    /// Resolves an admitted runtime target without turning a refused connection into a
+    /// permanent configuration error.
+    pub fn resolve(&self, designator: &Designator) -> Result<Rc<dyn Channel>> {
+        if let Some(json) = &designator.props_json {
+            serde_json::from_str::<serde::de::IgnoredAny>(json).map_err(|error| {
+                kj::failed!(
+                    "{} has invalid props JSON: {error}",
+                    designator.error_context
+                )
+            })?;
+        }
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        let sink = Rc::clone(&errors);
+        let report = Reporter::new(
+            Box::new(move |error| sink.borrow_mut().push(error)),
+            Box::new(|warning| eprintln!("{warning}")),
+            false,
+        );
+        let channel = lookup_service(&self.services.0, &report, designator);
+        if report.refuses() {
+            return Err(kj::failed!("{}", errors.borrow().join("\n")));
+        }
+        Ok(channel)
+    }
+
+    /// Supplied services in name order, then configured services in config order.
     pub fn services(&self) -> impl Iterator<Item = (&str, &Service)> {
         self.services
             .0
@@ -361,6 +612,14 @@ impl Server {
 
     /// Aborts every evictable actor and deletes its storage.
     pub fn delete_all_actors(&self, reason: Option<&crate::Error>) -> Result<()> {
+        // A refusal must leave every namespace untouched, regardless of iteration order.
+        for (_, worker) in self.workers() {
+            for (_, namespace) in worker.namespaces() {
+                if namespace.is_evictable() {
+                    namespace.check_delete_all()?;
+                }
+            }
+        }
         for (_, worker) in self.workers() {
             for (_, namespace) in worker.namespaces() {
                 if namespace.is_evictable() {
@@ -378,6 +637,7 @@ impl Drop for Server {
         // tasks (tasks.rs) go too: one may hold an actor, and so its class's worker.
         self.abort_all_actors(Some(&kj::disconnected!("Server shutting down.")));
         ffi::factory_clear_tasks(self.factory.raw());
+        self.factory.retire_endpoints();
         // The dynamic workers go before `services` unlinks the config's.
         let loaders = std::mem::take(&mut *self.worker_loaders.borrow_mut());
         for loader in loaders.by_id.values().chain(&loaders.anonymous) {
@@ -642,6 +902,9 @@ fn init_workflows(
             continue;
         }
         let name = text(service_conf.get_name())?;
+        if matches!(services.get(&name), Some(Service::Endpoint { .. })) {
+            continue;
+        }
         let Some(Service::Worker(app)) = services.get(&name) else {
             report.service_error(
                 &name,
@@ -901,6 +1164,18 @@ pub fn lookup_service(
         ));
         return Rc::new(InvalidConfigChannel);
     };
+    if let Service::Endpoint { endpoint, .. } = service {
+        return match endpoint.resolve(designator) {
+            Ok(channel) => channel,
+            Err(error) => {
+                report.error(format!(
+                    "{context} cannot resolve hosted Worker \"{target}\": {}",
+                    error.description()
+                ));
+                Rc::new(InvalidConfigChannel)
+            }
+        };
+    }
     let props = configured_props(props_json.as_deref());
 
     let Service::Worker(worker) = service else {
@@ -960,6 +1235,18 @@ pub fn lookup_actor_class(
         ));
         return Rc::new(InvalidConfigActorClass);
     };
+    if let Service::Endpoint { endpoint, .. } = service {
+        return match endpoint.actor_class(designator) {
+            Ok(class) => class,
+            Err(error) => {
+                report.error(format!(
+                    "{context} cannot resolve hosted Worker class \"{target}\": {}",
+                    error.description()
+                ));
+                Rc::new(InvalidConfigActorClass)
+            }
+        };
+    }
     let props = configured_props(props_json.as_deref());
 
     let Service::Worker(worker) = service else {
@@ -1006,22 +1293,133 @@ impl Server {
         factory: Rc<Factory>,
         overrides: &Overrides,
         report: Reporter,
-        mut inbound_listeners: HashMap<String, Vec<ffi::InboundListener>>,
+        inbound_listeners: HashMap<String, Vec<ffi::InboundListener>>,
+    ) -> Result<Rc<Self>> {
+        Self::start_with_services(
+            factory,
+            overrides,
+            report,
+            inbound_listeners,
+            HashMap::new(),
+        )
+        .await
+    }
+
+    /// Builds the ordinary service graph with additional leaf capabilities supplied by an
+    /// embedder. Config bindings and outbound designators can name these services without a
+    /// socket or a replacement worker implementation.
+    ///
+    /// A configured service may not shadow a supplied service: conflicts fail before configured
+    /// services are constructed. The graph owns the channels until teardown; each request's
+    /// returned `WorkerInterface` must retain any channel state it needs after that.
+    /// This does not sandbox other configured services or the default `internet` service;
+    /// admitting config and capabilities remains the embedder's responsibility.
+    pub async fn start_with_services(
+        factory: Rc<Factory>,
+        overrides: &Overrides,
+        report: Reporter,
+        inbound_listeners: HashMap<String, Vec<ffi::InboundListener>>,
+        channels: HashMap<String, Rc<dyn Channel>>,
+    ) -> Result<Rc<Self>> {
+        Self::start_partitioned(
+            factory,
+            overrides,
+            report,
+            inbound_listeners,
+            channels,
+            None,
+        )
+        .await
+    }
+
+    /// Constructs only the selected configured Worker in this factory. Other Workers resolve
+    /// through trusted endpoints rather than being constructed and rejected after startup.
+    pub async fn start_with_worker_partition(
+        factory: Rc<Factory>,
+        overrides: &Overrides,
+        report: Reporter,
+        inbound_listeners: HashMap<String, Vec<ffi::InboundListener>>,
+        channels: HashMap<String, Rc<dyn Channel>>,
+        partition: WorkerPartition,
     ) -> Result<Rc<Self>> {
         let message = factory.config()?;
         let config = message.get_root::<config::Reader>().map_err(capnp_error)?;
+        let loader = partition.dynamic_loader;
+        let mut partition =
+            WorkerPartition::new(config, partition.local_index, partition.endpoints)?;
+        partition.dynamic_loader = loader;
+        if partition
+            .endpoints
+            .keys()
+            .any(|name| inbound_listeners.contains_key(name))
+        {
+            return Err(kj::failed!(
+                "hosted Workers cannot own local inbound listeners"
+            ));
+        }
+        factory.restrict_to_worker(partition.local_index)?;
+        Self::start_partitioned(
+            factory,
+            overrides,
+            report,
+            inbound_listeners,
+            channels,
+            Some(partition),
+        )
+        .await
+    }
+
+    async fn start_partitioned(
+        factory: Rc<Factory>,
+        overrides: &Overrides,
+        report: Reporter,
+        mut inbound_listeners: HashMap<String, Vec<ffi::InboundListener>>,
+        channels: HashMap<String, Rc<dyn Channel>>,
+        mut partition: Option<WorkerPartition>,
+    ) -> Result<Rc<Self>> {
+        let message = factory.config()?;
+        let config = message.get_root::<config::Reader>().map_err(capnp_error)?;
+        let dynamic_loader = partition
+            .as_mut()
+            .and_then(|partition| partition.dynamic_loader.take());
+        if let Some(partition) = &partition {
+            for endpoint in partition.endpoints.values() {
+                endpoint.bind_factory(&factory)?;
+                factory
+                    .owned_endpoints
+                    .borrow_mut()
+                    .push(Rc::clone(endpoint));
+            }
+        }
 
         // First pass: the actor configs, which bindings to other workers' classes are checked
         // against.
-        let actor_configs =
+        let mut actor_configs =
             collect_actor_configs(config, factory.experimental(), &report).map_err(capnp_error)?;
 
         // Second pass: the services.
-        let mut services = Services::default();
+        let mut services = Services::with_channels(&mut actor_configs, channels)?;
         let mut namespaces_by_unique_key = HashMap::new();
         let service_confs = config.get_services().map_err(capnp_error)?;
         for (index, service_conf) in (0..).zip(service_confs) {
             let name = text(service_conf.get_name())?;
+            if let Some(partition) = &mut partition
+                && let Some(endpoint) = partition.endpoints.remove(&name)
+            {
+                let default = Rc::new(EndpointChannel {
+                    endpoint: Rc::clone(&endpoint),
+                    designator: Designator {
+                        service: name.clone(),
+                        entrypoint: None,
+                        props_json: None,
+                        error_context: format!("Hosted Worker \"{name}\""),
+                    },
+                });
+                services
+                    .0
+                    .insert(name, Service::Endpoint { default, endpoint });
+                continue;
+            }
             let service = make_service(
                 &factory,
                 &name,
@@ -1067,6 +1465,7 @@ impl Server {
             services,
             namespaces_by_unique_key,
             worker_loaders: RefCell::new(WorkerLoaders::default()),
+            dynamic_loader,
             factory,
         });
         let handle = Box::new(ServerHandle(Rc::downgrade(&server)));
@@ -1103,25 +1502,8 @@ impl Server {
             subrequest.push(worker.loopback_entrypoint(entrypoint.as_deref())?);
         }
         // The access binding's entrypoint is a template: its props are each request's identity.
-        let mut access_binding_channel = None;
-        if let Some(designator) = &pending.access_binding {
-            let target = &designator.service;
-            match services.get(target) {
-                Some(Service::Worker(target_worker)) => {
-                    access_binding_channel = Some(len_u32(&subrequest));
-                    subrequest
-                        .push(target_worker.loopback_entrypoint(designator.entrypoint.as_deref())?);
-                }
-                Some(_) => report.error(format!(
-                    "Worker accessBindingService refers to service \"{target}\", but it is not a \
-                     Worker."
-                )),
-                None => report.error(format!(
-                    "Worker accessBindingService refers to a service \"{target}\", but no such \
-                     service is defined."
-                )),
-            }
-        }
+        let access_binding_channel =
+            self.link_access_binding(pending.access_binding.as_ref(), &mut subrequest)?;
 
         let mut actor_class: Vec<Rc<dyn ActorClass>> = Vec::new();
         actor_class.extend(pending.bindings.actor_classes.iter().map(lookup_class));
@@ -1131,16 +1513,43 @@ impl Server {
 
         // A namespace binding whose service or class does not exist was reported by the
         // bindings compiler; its channel stays empty.
-        let mut actor: Vec<Option<Rc<ActorNamespace>>> = Vec::new();
+        let mut actor: Vec<Option<Rc<dyn ActorNamespaceChannel>>> = Vec::new();
         for designator in &pending.bindings.actors {
-            let target = match &designator.service {
-                Some(service) => services.get(service).and_then(Service::as_worker),
-                None => Some(worker),
+            let namespace = match &designator.service {
+                Some(name) => match services.get(name) {
+                    Some(Service::Worker(target)) => target
+                        .namespace(&designator.class_name)
+                        .map(|namespace| namespace as Rc<dyn ActorNamespaceChannel>),
+                    Some(Service::Endpoint { endpoint, .. }) => {
+                        match endpoint.actor_namespace(&designator.class_name) {
+                            Ok(namespace) => Some(namespace),
+                            Err(error) => {
+                                report.service_error(
+                                    name,
+                                    format!(
+                                        "hosted actor namespace \"{}\": {}",
+                                        designator.class_name,
+                                        error.description()
+                                    ),
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                },
+                None => worker
+                    .namespace(&designator.class_name)
+                    .map(|namespace| namespace as Rc<dyn ActorNamespaceChannel>),
             };
-            actor.push(target.and_then(|target| target.namespace(&designator.class_name)));
+            actor.push(namespace);
         }
         for class_name in &pending.loopback.actor_namespaces {
-            actor.push(worker.namespace(class_name));
+            actor.push(
+                worker
+                    .namespace(class_name)
+                    .map(|namespace| namespace as Rc<dyn ActorNamespaceChannel>),
+            );
         }
 
         let cache = pending.cache_api_outbound.as_ref().map(lookup);
@@ -1180,6 +1589,33 @@ impl Server {
             },
             storage_path.as_deref(),
         )
+    }
+
+    fn link_access_binding(
+        &self,
+        designator: Option<&Designator>,
+        subrequest: &mut Vec<Rc<dyn Channel>>,
+    ) -> Result<Option<u32>> {
+        let Some(designator) = designator else {
+            return Ok(None);
+        };
+        let target = &designator.service;
+        match self.services.0.get(target) {
+            Some(Service::Worker(worker)) => {
+                let channel = len_u32(subrequest);
+                subrequest.push(worker.loopback_entrypoint(designator.entrypoint.as_deref())?);
+                return Ok(Some(channel));
+            }
+            Some(_) => self.report.error(format!(
+                "Worker accessBindingService refers to service \"{target}\", but it is not a \
+                 Worker."
+            )),
+            None => self.report.error(format!(
+                "Worker accessBindingService refers to a service \"{target}\", but no such \
+                 service is defined."
+            )),
+        }
+        Ok(None)
     }
 
     /// The directory a worker's Durable Objects persist to: the writable path of its
@@ -1453,6 +1889,16 @@ impl ServerHandle {
 }
 
 impl Server {
+    /// Resolves an explicitly admitted durable actor, never the default HTTP entrypoint.
+    /// Namespace/root selection belongs to the trusted embedder; this grants no routing authority.
+    pub fn actor_channel(&self, unique_key: &str, actor_id: &str) -> Result<Rc<dyn Channel>> {
+        let namespace = self
+            .namespaces_by_unique_key
+            .get(unique_key)
+            .ok_or_else(|| kj::failed!("admitted actor namespace was not found"))?;
+        Ok(namespace.channel(ffi::actor_id_from_hex(actor_id)?, false))
+    }
+
     /// The service a debug-port request names.
     fn debug_service(&self, service_name: &str) -> Result<&Service> {
         self.services

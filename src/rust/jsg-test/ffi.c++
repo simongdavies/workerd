@@ -2,10 +2,9 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-#include "ffi.h"
-
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/jsg/setup.h>
+#include <workerd/rust/jsg-test/ffi.h>
 #include <workerd/rust/jsg-test/lib.rs.h>
 #include <workerd/rust/jsg/ffi-inl.h>
 #include <workerd/rust/jsg/ffi.h>

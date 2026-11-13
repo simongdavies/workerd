@@ -56,6 +56,7 @@ kj::Own<kj::HttpClient> R2Bucket::getHttpClient(IoContext& context, TraceContext
           .cfBlobJson = kj::none,
           .parentSpan = tracing.getInternalSpanParent(),
           .userSpanParent = tracing.getUserSpanParent(),
+          .requestContext = context.getCurrentRequestContext(),
         });
       },
           {

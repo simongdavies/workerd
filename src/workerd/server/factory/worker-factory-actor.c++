@@ -124,7 +124,19 @@ kj::Own<ActorStorage> factory_new_actor_storage(const WorkerFactory& factory,
       factory, kj::mv(directory), kj::str(uniqueKey), kj::mv(actors)));
 }
 
+kj::Own<ActorStorage> factory_new_actor_storage_with_backend(const WorkerFactory& factory,
+    ::rust::Str uniqueKey,
+    ::rust::Box<ActorNamespaceHandle> actors,
+    kj::Own<ActorStorageBackend> backend) {
+  auto impl =
+      kj::refcounted<ActorStorage::Impl>(factory, kj::none, kj::str(uniqueKey), kj::mv(actors));
+  impl->externalBackend = kj::mv(backend);
+  return kj::heap<ActorStorage>(kj::mv(impl));
+}
+
 void actor_storage_delete_all(const ActorStorage& storage) {
+  KJ_REQUIRE(storage.getImpl().externalBackend == kj::none,
+      "namespace-wide deletion requires an external actor storage implementation");
   storage.getImpl().alarmScheduler->deleteAll();
 }
 
@@ -133,6 +145,8 @@ void actor_storage_delete_facet(const ActorStorage& storage,
     kj::Maybe<uint32_t> parentFacetId,
     ::rust::Str name) {
   auto& impl = storage.getImpl();
+  KJ_REQUIRE(impl.externalBackend == kj::none,
+      "facet deletion requires an external actor storage implementation");
   auto& dir = *KJ_UNWRAP_OR(impl.directory, return);
   auto key = kj::str(rootKey);
   // Without an index there can be no facet storage.
@@ -147,6 +161,8 @@ void actor_storage_clone_facet(const ActorStorage& storage,
     ::rust::Str src,
     ::rust::Str dst) {
   auto& impl = storage.getImpl();
+  KJ_REQUIRE(impl.externalBackend == kj::none,
+      "facet cloning requires an external actor storage implementation");
   auto& dir = *KJ_UNWRAP_OR(impl.directory, return);
   auto key = kj::str(rootKey);
   // Without an index there is no storage to delete or copy.
@@ -164,6 +180,8 @@ kj::Maybe<uint32_t> actor_storage_facet_id(const ActorStorage& storage,
     ::rust::Str rootKey,
     kj::Maybe<uint32_t> parentFacetId,
     ::rust::Str name) {
+  KJ_REQUIRE(storage.getImpl().externalBackend == kj::none,
+      "facets require an external actor storage implementation");
   auto& dir = *KJ_UNWRAP_OR(storage.getImpl().directory, return kj::none);
   // The index is read from disk for this one lookup; the server keeps the number it yields.
   auto file = dir.openFile(
@@ -268,6 +286,17 @@ Worker::Actor::MakeActorCacheFunc makeActorCacheFunc(kj::Own<ActorStorage::Impl>
              OutputGate& outputGate, ActorCache::Hooks& hooks,
              SqliteObserver& sqliteObserver) mutable -> kj::Maybe<kj::Own<ActorCacheInterface>> {
     if (!durable) return kj::none;
+    KJ_IF_SOME(backend, storage->externalBackend) {
+      KJ_REQUIRE(facetId == kj::none, "external actor storage facets are not supported");
+      if (storage->externalLru == kj::none) {
+        auto options = sharedLru.getOptions();
+        options.neverFlush = false;
+        storage->externalLru = kj::heap<ActorCache::SharedLru>(options);
+      }
+      return kj::heap<ActorCache>(backend->getStage(rootKey, 0),
+          *KJ_ASSERT_NONNULL(storage->externalLru), outputGate, hooks)
+          .attach(kj::addRef(*storage));
+    }
     if (storage->directory == kj::none) {
       // The cache never flushes (see NullIsolateLimitEnforcer), so this is in-memory storage.
       return kj::heap<ActorCache>(newEmptyReadOnlyActorStorage(), sharedLru, outputGate, hooks);

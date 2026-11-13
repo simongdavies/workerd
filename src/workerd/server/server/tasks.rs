@@ -38,6 +38,15 @@ pub async fn task_run(task: Box<SpawnedTask>) -> Result<()> {
 }
 
 impl Factory {
+    pub(crate) fn retire_endpoints(&self) {
+        let endpoints = std::mem::take(&mut *self.owned_endpoints.borrow_mut());
+        for endpoint in endpoints {
+            self.endpoint_retirements
+                .borrow_mut()
+                .push(endpoint.unlink());
+        }
+    }
+
     /// Spawns `future` as a background task of the run; it starts on the next turn of the event
     /// loop. The returned handle resolves to its output, and cancels it when dropped.
     pub fn spawn<F: Future + 'static>(&self, future: F) -> RemoteHandle<F::Output> {
@@ -54,6 +63,29 @@ impl Factory {
     /// Ends the background tasks the server's drop spawned (a dropped stub unlinks its worker
     /// on the next turn): they run, and whatever remains is dropped.
     pub async fn settle_tasks(&self) -> Result<()> {
-        Ok(ffi::factory_settle_tasks(self.raw()).await?)
+        self.retire_endpoints();
+        let retirements = std::mem::take(&mut *self.endpoint_retirements.borrow_mut());
+        let mut failure = None;
+        for retirement in retirements {
+            if let Err(error) = retirement.await {
+                if failure.is_none() {
+                    failure = Some(error);
+                } else {
+                    eprintln!("additional endpoint retirement failed: {error:?}");
+                }
+            }
+        }
+        let settled: Result<()> = ffi::factory_settle_tasks(self.raw())
+            .await
+            .map_err(Into::into);
+        match failure {
+            Some(error) => {
+                if let Err(settled) = settled {
+                    eprintln!("factory task settlement also failed: {settled:?}");
+                }
+                Err(error)
+            }
+            None => settled,
+        }
     }
 }

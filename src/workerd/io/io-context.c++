@@ -390,7 +390,7 @@ void IoContext::IncomingRequest::delivered(kj::StringPtr eventType, kj::SourceLo
     context->limitEnforcer->topUpActor();
 
     // Run the Actor's constructor if it hasn't been run already.
-    a.ensureConstructed(*context);
+    a.ensureConstructed(*context, getRequestContext());
 
     // Record a new incoming request to actor metrics.
     a.getMetrics().startRequest();
@@ -1382,6 +1382,7 @@ kj::Own<WorkerInterface> IoContext::getSubrequestChannelImpl(uint channel,
     .parentSpan = tracing.getInternalSpanParent(),
     .userSpanParent = kj::mv(propagatedUserSpanParent),
     .featureFlagsForFl = worker->getIsolate().getFeatureFlagsForFl().clone(),
+    .requestContext = getCurrentRequestContext(),
   };
 
   auto client = channelFactory.startSubrequest(channel, kj::mv(metadata));
@@ -1419,6 +1420,38 @@ kj::Own<CacheClient> IoContext::getCacheClient() {
   }
 
   return kj::mv(ret);
+}
+
+kj::Maybe<kj::Rc<RequestContext>> IoContext::getCurrentRequestContext() {
+  KJ_IF_SOME(lock, currentLock) {
+    KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(lock)) {
+      KJ_IF_SOME(value, frame.get(*lock.getRequestContextAsyncKey())) {
+        jsg::Lock& js = lock;
+        auto& own = jsg::unwrapOpaqueRef<IoOwn<kj::Maybe<kj::Rc<RequestContext>>>>(
+            js.v8Isolate, value.getHandle(js));
+        KJ_IF_SOME(context, own.tryGet()) {
+          return context.clone();
+        }
+      }
+    }
+  }
+  return kj::none;
+}
+
+kj::Maybe<kj::Own<jsg::AsyncContextFrame::StorageScope>> IoContext::makeRequestContextScope(
+    Worker::Lock& lock, kj::Maybe<kj::Rc<RequestContext>> requestContext) {
+  if (requestContext == kj::none) {
+    bool hasCapturedContext = false;
+    KJ_IF_SOME(frame, jsg::AsyncContextFrame::current(lock)) {
+      hasCapturedContext = frame.get(*lock.getRequestContextAsyncKey()) != kj::none;
+    }
+    if (!hasCapturedContext) return kj::none;
+  }
+  jsg::Lock& js = lock;
+  auto owned = addObject(kj::heap(kj::mv(requestContext)));
+  auto handle = jsg::wrapOpaque(js.v8Context(), kj::mv(owned));
+  return kj::heap<jsg::AsyncContextFrame::StorageScope>(
+      js, lock.getRequestContextAsyncKey(), js.v8Ref(handle));
 }
 
 jsg::AsyncContextFrame::StorageScope IoContext::makeAsyncTraceScope(

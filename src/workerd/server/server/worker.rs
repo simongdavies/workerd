@@ -39,6 +39,7 @@ use crate::bridge::ffi;
 use crate::channels::ActorClass;
 use crate::channels::ActorClassChannel;
 use crate::channels::ActorIdHandle;
+use crate::channels::ActorNamespaceChannel;
 use crate::channels::Channel;
 use crate::channels::ChannelFactory;
 use crate::channels::DynamicSource;
@@ -90,7 +91,7 @@ pub struct LinkedChannels {
     /// if any).
     pub subrequest: Vec<Rc<dyn Channel>>,
     /// Indexed by actor channel; `None` when the binding's config was invalid.
-    pub actor: Vec<Option<Rc<ActorNamespace>>>,
+    pub actor: Vec<Option<Rc<dyn ActorNamespaceChannel>>>,
     pub first_actor_class: u32,
     /// Indexed by actor class channel less `first_actor_class`.
     pub actor_class: Vec<Rc<dyn ActorClass>>,
@@ -956,7 +957,7 @@ impl LinkedChannels {
             .ok_or_else(|| kj::failed!("invalid subrequest channel number"))
     }
 
-    fn namespace(&self, channel: u32) -> Result<&Rc<ActorNamespace>> {
+    fn namespace(&self, channel: u32) -> Result<&Rc<dyn ActorNamespaceChannel>> {
         self.actor
             .get(channel as usize)
             .ok_or_else(|| kj::failed!("invalid actor channel number"))?
@@ -993,7 +994,7 @@ impl ChannelFactory {
                 "expected a durable namespace on this actor channel"
             ));
         }
-        Ok(SubrequestChannel::new(namespace.channel(id, persistent)))
+        Ok(SubrequestChannel::new(namespace.channel(id, persistent)?))
     }
 
     pub(crate) fn colo_local_actor(
@@ -1007,7 +1008,9 @@ impl ChannelFactory {
                 "expected an ephemeral namespace on this actor channel"
             ));
         }
-        Ok(SubrequestChannel::new(namespace.channel_by_name(id, false)))
+        Ok(SubrequestChannel::new(
+            namespace.channel_by_name(id, false)?,
+        ))
     }
 
     pub(crate) fn actor_class(

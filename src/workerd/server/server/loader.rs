@@ -41,6 +41,98 @@ use crate::config::Factory;
 use crate::config::Server;
 use crate::worker::WorkerService;
 
+/// Placement of a dynamic source by a trusted embedder, before any local compilation.
+/// The returned future owns its source and startup; failure must not fall back locally.
+pub trait DynamicWorkerLoader {
+    fn load(
+        &self,
+        name: String,
+        source: KjOwn<DynamicSource>,
+        on_abort: Box<dyn Fn()>,
+    ) -> LocalBoxFuture<'static, Result<Rc<dyn HostedWorker>>>;
+}
+
+/// A dynamic Worker outside this factory. Props remain opaque capability-bearing values.
+pub trait HostedWorker {
+    fn entrypoint(&self, name: Option<&str>, props: KjOwn<Frankenvalue>)
+    -> Result<Rc<dyn Channel>>;
+
+    fn actor_class(
+        &self,
+        name: Option<&str>,
+        props: KjOwn<Frankenvalue>,
+    ) -> Result<Rc<dyn ActorClass>>;
+
+    /// Drop this loader's links outside JavaScript; this is not a native owner join receipt.
+    fn unlink(&self);
+}
+
+#[derive(Clone)]
+pub enum LoadedWorker {
+    Local(Rc<WorkerService>),
+    Hosted(Rc<dyn HostedWorker>),
+}
+
+impl LoadedWorker {
+    fn entrypoint(
+        &self,
+        name: Option<&str>,
+        props: KjOwn<Frankenvalue>,
+    ) -> Result<Rc<dyn Channel>> {
+        match self {
+            Self::Local(service) => {
+                service
+                    .entrypoint(name, Some(props), false)
+                    .ok_or_else(|| match name {
+                        Some(name) => {
+                            kj::failed!("jsg.Error: Worker has no such entrypoint: {name}")
+                        }
+                        None => kj::failed!("jsg.Error: Worker has no default entrypoint."),
+                    })
+            }
+            Self::Hosted(service) => service.entrypoint(name, props),
+        }
+    }
+
+    fn complete_startup(result: Result<Self>, unlinked: bool) -> Result<Self> {
+        let service = result?;
+        if unlinked {
+            service.unlink();
+            return Err(kj::disconnected!(
+                "dynamic Worker was unlinked during startup"
+            ));
+        }
+        Ok(service)
+    }
+
+    fn actor_class(
+        &self,
+        name: Option<&str>,
+        props: KjOwn<Frankenvalue>,
+    ) -> Result<Rc<dyn ActorClass>> {
+        match self {
+            Self::Local(service) => {
+                service
+                    .actor_class(name, Some(props), false)
+                    .ok_or_else(|| match name {
+                        Some(name) => {
+                            kj::failed!("jsg.Error: Worker has no such actor class: {name}")
+                        }
+                        None => kj::failed!("jsg.Error: Worker has no default actor class."),
+                    })
+            }
+            Self::Hosted(service) => service.actor_class(name, props),
+        }
+    }
+
+    fn unlink(&self) {
+        match self {
+            Self::Local(service) => service.unlink(),
+            Self::Hosted(service) => service.unlink(),
+        }
+    }
+}
+
 /// One `workerLoader` namespace. Bindings with the same `id` share a namespace, so a worker
 /// loaded under a name by one binding is the one another finds under that name.
 pub struct WorkerLoaderNamespace {
@@ -92,6 +184,7 @@ impl WorkerLoaderNamespace {
                     format!("{}:{name}", self.name),
                     source,
                     Some(on_abort),
+                    server.dynamic_worker_loader(),
                 );
                 self.isolates
                     .borrow_mut()
@@ -104,6 +197,7 @@ impl WorkerLoaderNamespace {
                 format!("{}:dynamic:{:032x}", self.name, rand::random::<u128>()),
                 source,
                 None,
+                server.dynamic_worker_loader(),
             ),
         };
 
@@ -122,7 +216,9 @@ impl WorkerLoaderNamespace {
 
     /// Drops every loaded worker's links, as the server does its own at teardown.
     pub fn unlink(&self) {
-        for stub in self.isolates.borrow().values() {
+        // An external unlink can synchronously abort and remove its named stub.
+        let stubs: Vec<_> = self.isolates.borrow().values().cloned().collect();
+        for stub in stubs {
             stub.unlink();
         }
     }
@@ -132,8 +228,9 @@ impl WorkerLoaderNamespace {
 pub struct WorkerStub {
     /// Resolves with the started worker, or the startup error. Only clones are polled, so the
     /// result stays readable here (`Shared::peek`).
-    startup: Shared<LocalBoxFuture<'static, Result<Rc<WorkerService>>>>,
-    unlinked: Cell<bool>,
+    startup: Shared<LocalBoxFuture<'static, Result<LoadedWorker>>>,
+    unlinked: Rc<Cell<bool>>,
+    factory: Rc<Factory>,
 }
 
 impl WorkerStub {
@@ -146,6 +243,7 @@ impl WorkerStub {
         isolate_name: String,
         source: KjOwn<DynamicSource>,
         on_abort: Option<Box<dyn Fn()>>,
+        loader: Option<Rc<dyn DynamicWorkerLoader>>,
     ) -> Rc<Self> {
         let fired = Cell::new(false);
         let abort_isolate: Box<dyn Fn()> = Box::new(move || {
@@ -156,23 +254,43 @@ impl WorkerStub {
                 on_abort();
             }
         });
-        let startup =
-            WorkerService::new_dynamic(factory, isolate_name, source, server, abort_isolate)
-                .boxed_local()
-                .shared();
+        let unlinked = Rc::new(Cell::new(false));
+        let closed = Rc::clone(&unlinked);
+        let startup_factory = Rc::clone(&factory);
+        let startup = async move {
+            match loader {
+                Some(loader) => loader
+                    .load(isolate_name, source, abort_isolate)
+                    .await
+                    .map(LoadedWorker::Hosted),
+                None => WorkerService::new_dynamic(
+                    startup_factory,
+                    isolate_name,
+                    source,
+                    server,
+                    abort_isolate,
+                )
+                .await
+                .map(LoadedWorker::Local),
+            }
+        }
+        .map(move |result| LoadedWorker::complete_startup(result, closed.get()))
+        .boxed_local()
+        .shared();
         Rc::new(Self {
             startup,
-            unlinked: Cell::new(false),
+            unlinked,
+            factory,
         })
     }
 
     /// Resolves once the worker has started; fails with the startup error.
-    pub fn startup(&self) -> Shared<LocalBoxFuture<'static, Result<Rc<WorkerService>>>> {
+    pub fn startup(&self) -> Shared<LocalBoxFuture<'static, Result<LoadedWorker>>> {
         self.startup.clone()
     }
 
     /// The started worker, once startup has resolved.
-    fn service(&self) -> Result<Rc<WorkerService>> {
+    fn service(&self) -> Result<LoadedWorker> {
         match self.startup.peek() {
             Some(started) => started.clone(),
             None => Err(kj::failed!("the dynamic worker has not started")),
@@ -181,10 +299,12 @@ impl WorkerStub {
 
     /// Drops the worker's links now. After this, dropping the stub does nothing more.
     pub fn unlink(&self) {
+        if self.unlinked.replace(true) {
+            return;
+        }
         if let Ok(service) = self.service() {
             service.unlink();
         }
-        self.unlinked.set(true);
     }
 }
 
@@ -200,7 +320,7 @@ impl Drop for WorkerStub {
         let Ok(service) = self.service() else {
             return;
         };
-        let factory = Rc::clone(service.factory());
+        let factory = Rc::clone(&self.factory);
         factory.spawn_detached(async move { service.unlink() });
     }
 }
@@ -256,13 +376,7 @@ impl Channel for DynamicEntrypoint {
         // Starts the request on the started worker. The request keeps the stub alive until it
         // is done: the stub's drop unlinks the worker, which a request in flight must not see.
         let start = move || -> Result<KjOwn<WorkerInterface>> {
-            let channel = stub
-                .service()?
-                .entrypoint(name.as_deref(), Some(props), false)
-                .ok_or_else(|| match &name {
-                    Some(name) => kj::failed!("jsg.Error: Worker has no such entrypoint: {name}"),
-                    None => kj::failed!("jsg.Error: Worker has no default entrypoint."),
-                })?;
+            let channel = stub.service()?.entrypoint(name.as_deref(), props)?;
             Ok(attach(channel.start_request(metadata)?, stub))
         };
         if self.stub.service().is_ok() {
@@ -299,12 +413,7 @@ impl DynamicActorClass {
             kj::failed!("ActorClassChannel is not ready yet; should have awaited whenReady()")
         })?;
         let props = ffi::frankenvalue_clone(&self.props);
-        service
-            .actor_class(self.name.as_deref(), Some(props), false)
-            .ok_or_else(|| match &self.name {
-                Some(name) => kj::failed!("jsg.Error: Worker has no such actor class: {name}"),
-                None => kj::failed!("jsg.Error: Worker has no default actor class."),
-            })
+        service.actor_class(self.name.as_deref(), props)
     }
 }
 
@@ -336,3 +445,7 @@ impl ActorClass for DynamicActorClass {
         Err(dynamic_transfer_error())
     }
 }
+
+#[cfg(test)]
+#[path = "loader-test.rs"]
+mod tests;

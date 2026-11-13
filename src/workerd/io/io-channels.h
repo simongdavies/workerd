@@ -8,6 +8,7 @@
 #include <workerd/io/compatibility-date.capnp.h>
 #include <workerd/io/frankenvalue.h>
 #include <workerd/io/io-util.h>
+#include <workerd/io/request-context.h>
 #include <workerd/io/trace.h>
 #include <workerd/io/worker-interface.capnp.h>
 #include <workerd/io/worker-source.h>
@@ -56,6 +57,9 @@ class CacheClient {
 
     // User span parent for trace propagation, as in IoChannelFactory::SubrequestMetadata.
     SpanParent userSpanParent = SpanParent(nullptr);
+
+    // Initiating async-frame provenance; absent outside a scoped request.
+    kj::Maybe<kj::Rc<RequestContext>> requestContext;
   };
 
   // Get the default namespace, i.e. the one that fetch() will use for caching.
@@ -203,6 +207,7 @@ class IoChannelFactory: public virtual kj::Refcounted {
 
     // Address of the client as IP:port on whose behalf this request is being made.
     kj::Maybe<kj::String> clientAddress;
+    kj::Maybe<kj::Rc<RequestContext>> requestContext;
   };
 
   // Parameters that can influence the version of a worker that is used to serve a subrequest.
@@ -218,6 +223,12 @@ class IoChannelFactory: public virtual kj::Refcounted {
   };
 
   virtual kj::Own<WorkerInterface> startSubrequest(uint channel, SubrequestMetadata metadata) = 0;
+
+  // The context of this factory's explicit incoming request, not the actor's current tracing
+  // request. Legacy embedders supply none.
+  virtual kj::Maybe<kj::Rc<RequestContext>> getRequestContext() {
+    return kj::none;
+  }
 
   // Get a Cap'n Proto RPC capability. Various binding types are backed by capabilities.
   //

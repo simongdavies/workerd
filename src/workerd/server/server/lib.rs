@@ -11,6 +11,7 @@
 //! workers, drain and the test and bench runners.
 
 pub mod actor;
+mod admission;
 pub mod bench;
 pub mod bindings;
 pub mod bridge;
@@ -21,6 +22,8 @@ pub mod in_process;
 pub mod listen;
 pub mod loader;
 pub mod log;
+pub mod request_context;
+pub mod rpc_endpoint;
 pub mod run;
 pub mod services;
 pub mod tasks;

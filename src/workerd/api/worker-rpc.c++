@@ -2057,7 +2057,8 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server {
   // makeReentryCallback() to guard against the possibility that the IoContext is canceled before
   // or during a call.
   JsRpcTargetBase(IoContext& ctx, MayOutliveIncomingRequest)
-      : durableObjectId(getCurrentDurableObjectId()),
+      : originRequestContext(ctx.getCurrentRequestContext()),
+        durableObjectId(getCurrentDurableObjectId()),
         enterIsolateAndCall(ctx.makeReentryCallback<IoContext::TOP_UP>(
             [this](Worker::Lock& lock, IoContext& ctx, CallContext callContext) {
               return callImpl(lock, ctx, callContext);
@@ -2066,12 +2067,17 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server {
 
   // Constructor use by EntrypointJsRpcTarget, which is revoked and destroyed before the IoContext
   // can possibly be canceled. It can just use ctx.run().
-  JsRpcTargetBase(IoContext& ctx, CantOutliveIncomingRequest)
-      : durableObjectId(getCurrentDurableObjectId()),
-        enterIsolateAndCall([this, &ctx](CallContext callContext) {
+  JsRpcTargetBase(
+      IoContext& ctx, CantOutliveIncomingRequest, kj::Maybe<kj::Rc<RequestContext>> requestContext)
+      : originRequestContext(requestContext.clone()),
+        durableObjectId(getCurrentDurableObjectId()),
+        enterIsolateAndCall([this, &ctx, requestContext = kj::mv(requestContext)](
+                                CallContext callContext) mutable {
           // Note: No need to topUpActor() since this is the start of a top-level request, so the
           // actor will already have been topped up by IncomingRequest::delivered().
-          return ctx.run([this, callContext](Worker::Lock& lock, IoContext& ctx) mutable {
+          return ctx.run([this, callContext, requestContext = requestContext.clone()](
+                             Worker::Lock& lock, IoContext& ctx) mutable {
+            auto requestContextScope = ctx.makeRequestContextScope(lock, kj::mv(requestContext));
             return callImpl(lock, ctx, callContext);
           });
         }),
@@ -2143,6 +2149,8 @@ class JsRpcTargetBase: public rpc::JsRpcTarget::Server {
   virtual void maybeClaimRetryToken(
       jsg::Lock& js, const TargetInfo& targetInfo, rpc::JsRpcTarget::CallParams::Reader params) = 0;
 
+  // Retain the origin value until this RPC target dies; it is not later-caller authority.
+  kj::Maybe<kj::Rc<RequestContext>> originRequestContext;
   kj::Maybe<kj::String> durableObjectId;
 
   // Function which enters the isolate lock and IoContext and then invokes callImpl(). Created
@@ -3282,7 +3290,7 @@ class EntrypointJsRpcTarget final: public JsRpcTargetBase {
       kj::Maybe<kj::Rc<BaseTracer>> tracer,
       IoContext::IncomingRequest& incomingRequest,
       bool isDynamicDispatch)
-      : JsRpcTargetBase(ioCtx, CantOutliveIncomingRequest()),
+      : JsRpcTargetBase(ioCtx, CantOutliveIncomingRequest(), incomingRequest.getRequestContext()),
         ioCtx(ioCtx),
         metrics(kj::mv(metrics)),
         // Most of the time we don't really have to clone this but it's hard to fully prove, so

@@ -93,6 +93,24 @@ pub struct ActorNamespace {
     cleanup_task: RefCell<Option<TaskHandle>>,
 }
 
+impl crate::channels::ActorNamespaceChannel for ActorNamespace {
+    fn unique_key(&self) -> Option<&str> {
+        Self::unique_key(self)
+    }
+
+    fn channel(&self, id: KjOwn<ActorIdHandle>, persistent: Persistent) -> Result<Rc<dyn Channel>> {
+        Ok(Self::channel(self, id, persistent))
+    }
+
+    fn channel_by_name(&self, name: &str, persistent: Persistent) -> Result<Rc<dyn Channel>> {
+        Ok(Self::channel_by_name(self, name, persistent))
+    }
+
+    fn evict_all_for_test(&self, hibernate: bool) -> LocalBoxFuture<'_, Result<()>> {
+        Box::pin(Self::evict_all_for_test(self, hibernate))
+    }
+}
+
 impl ActorNamespace {
     /// Builds the namespace of `class_name`, a class of a worker `factory` compiled.
     ///
@@ -227,8 +245,20 @@ impl ActorNamespace {
         }
     }
 
+    /// Checks configured support even before the namespace has opened its storage.
+    pub(crate) fn check_delete_all(&self) -> Result<()> {
+        if self.is_durable() && self.factory.actor_storage_provider().is_some() {
+            return Err(kj::failed!(
+                "jsg.Error: namespace-wide deletion is not supported for externally backed Durable Object class \"{}\"",
+                self.class_name
+            ));
+        }
+        Ok(())
+    }
+
     /// Aborts every actor and deletes the namespace's storage and alarms.
     pub fn delete_all(&self, reason: Option<&crate::Error>) -> Result<()> {
+        self.check_delete_all()?;
         // The databases are reset while their connections are open, before the abort closes
         // them: Windows releases file locks late.
         for container in self.actors.borrow().values() {
@@ -277,12 +307,24 @@ impl ActorNamespace {
             }
             ActorConfig::Ephemeral { .. } => ("", ""),
         };
-        let storage = ffi::factory_new_actor_storage(
-            self.factory.raw(),
-            path,
-            unique_key,
-            Box::new(ActorNamespaceHandle(Weak::clone(&self.this))),
-        )?;
+        let actors = Box::new(ActorNamespaceHandle(Weak::clone(&self.this)));
+        let storage = match (&self.config, self.factory.actor_storage_provider()) {
+            (ActorConfig::Durable { .. }, Some(provider)) => {
+                if storage_path.is_some() {
+                    return Err(kj::failed!(
+                        "external actor storage and local disk selection are mutually exclusive"
+                    ));
+                }
+                let backend = provider.open_namespace(&self.class_name, unique_key)?;
+                ffi::factory_new_actor_storage_with_backend(
+                    self.factory.raw(),
+                    unique_key,
+                    actors,
+                    backend,
+                )?
+            }
+            _ => ffi::factory_new_actor_storage(self.factory.raw(), path, unique_key, actors)?,
+        };
         // Checked above; nothing else sets it.
         let _ = self.storage.set(storage);
         Ok(())

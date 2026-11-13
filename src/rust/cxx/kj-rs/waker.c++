@@ -1,6 +1,5 @@
-#include "waker.h"
-
-#include "awaiter.h"  // FuturePollEvent (an Event), the same-thread wake target
+#include <kj-rs/awaiter.h>  // FuturePollEvent (an Event), the same-thread wake target
+#include <kj-rs/waker.h>
 
 #include <kj/debug.h>
 

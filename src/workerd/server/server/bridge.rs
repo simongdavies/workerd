@@ -15,6 +15,7 @@
     reason = "holds the cxx bridge, which expands to unsafe FFI glue, and `rewriting_response`, the safe wrapper over the bridge's `unsafe fn new_rewriting_response`"
 )]
 
+pub use crate::admission::WorkerAdmission;
 pub use crate::channels::AbortReason;
 pub use crate::channels::ActorClassChannel;
 pub use crate::channels::ActorHooks;
@@ -31,6 +32,7 @@ pub use crate::in_process::InProcessServer;
 pub use crate::in_process::close_in_process_server;
 pub use crate::in_process::new_in_process_server;
 pub use crate::listen::udp::UdpFlow;
+pub use crate::request_context::RequestContextHandle;
 pub use crate::tasks::SpawnedTask;
 pub use crate::tasks::task_run;
 
@@ -304,6 +306,19 @@ pub mod ffi {
         /// C++ bootstrap (bootstrap.c++) for the lifetime of a run.
         type WorkerFactory;
 
+        #[namespace = "workerd"]
+        type RequestContext;
+        fn new_request_context(value: Box<RequestContextHandle>) -> KjRc<RequestContext>;
+        fn request_context_value(context: &RequestContext) -> Result<Box<RequestContextHandle>>;
+        fn request_metadata_context(
+            metadata: Pin<&mut RequestMetadata>,
+        ) -> KjMaybe<KjRc<RequestContext>>;
+        fn request_metadata_set_context(
+            metadata: Pin<&mut RequestMetadata>,
+            context: KjRc<RequestContext>,
+        );
+        fn current_request_context() -> Result<KjMaybe<KjRc<RequestContext>>>;
+
         /// The config, as the bytes of an encoded `Config` message the factory and the server
         /// both read. Owned by the factory for the run; every reader into it stays valid.
         fn factory_config<'a>(factory: &'a WorkerFactory) -> &'a [u8];
@@ -311,6 +326,11 @@ pub mod ffi {
         /// Whether requests get tail workers (`WorkerFactory::Options::tailWorkers`): not under
         /// `workerd bench`, unless given `--trace`.
         fn factory_tail_workers(factory: &WorkerFactory) -> bool;
+        /// Selects one source before any worker startup. Admission is immutable and one-shot.
+        fn factory_set_worker_admission(
+            factory: &WorkerFactory,
+            admission: Box<WorkerAdmission>,
+        ) -> Result<()>;
         /// Registers the server as the resolver of channel tokens and debug-port requests.
         /// Tokens cannot be decoded before this.
         fn factory_set_server(factory: &WorkerFactory, server: Box<ServerHandle>);
@@ -445,6 +465,14 @@ pub mod ffi {
         /// The storage of one actor namespace: its directory on disk (or none for in-memory
         /// storage), the SQLite VFS over it, and its alarm scheduler.
         type ActorStorage;
+        /// Explicit namespace backend supplying the existing typed ActorStorage::Stage.
+        type ActorStorageBackend;
+        fn factory_new_actor_storage_with_backend(
+            factory: &WorkerFactory,
+            unique_key: &str,
+            actors: Box<ActorNamespaceHandle>,
+            backend: KjOwn<ActorStorageBackend>,
+        ) -> Result<KjOwn<ActorStorage>>;
         /// `path` is the namespace's directory; empty for in-memory storage. `actors` answers
         /// the scheduler's requests for an actor to run an alarm on.
         fn factory_new_actor_storage(
@@ -559,6 +587,10 @@ pub mod ffi {
             factory: &WorkerFactory,
             stream: KjOwn<AsyncIoStream>,
         ) -> KjOwn<RpcClient>;
+        fn rpc_client_into_worker(
+            client: KjOwn<RpcClient>,
+            metadata: &RequestMetadata,
+        ) -> Result<KjOwn<WorkerInterface>>;
         /// Sends a custom event (a trace, a JS RPC session, a tail stream, a UDP flow) to the
         /// peer's `WorkerdBootstrap`.
         async fn rpc_client_custom_event(
@@ -643,6 +675,23 @@ pub mod ffi {
     // `'static`. C++ keeps the arguments alive until the promise settles or is destroyed.
 
     extern "Rust" {
+        type RequestContextHandle;
+        fn context_handle_clone(self: &RequestContextHandle) -> Box<RequestContextHandle>;
+
+        type WorkerAdmission;
+        fn begin_worker(
+            self: &WorkerAdmission,
+            configured: bool,
+            index: u32,
+            name: &str,
+        ) -> Result<()>;
+        fn admit_isolate(
+            self: &WorkerAdmission,
+            configured: bool,
+            index: u32,
+            name: &str,
+        ) -> Result<()>;
+
         /// The Rust half of a command, run by `with_process_context` (entry.rs).
         type PendingCommand;
         fn run_pending_command(

@@ -126,6 +126,10 @@ class IoContext_IncomingRequest final {
     return *context;
   }
 
+  kj::Maybe<kj::Rc<RequestContext>> getRequestContext() {
+    return ioChannelFactory->getRequestContext();
+  }
+
   // Invoked when the request is actually delivered.
   //
   // If, for some reason, this is not invoked before the object is destroyed, this indicate that
@@ -1244,6 +1248,12 @@ class IoContext final: public kj::Refcounted, private kj::TaskSet::ErrorHandler 
   IoChannelFactory& getIoChannelFactory() {
     return *getCurrentIncomingRequest().ioChannelFactory;
   }
+
+  // Only the captured async frame is authoritative for provenance. There is deliberately no
+  // fallback to the most recently delivered actor request.
+  kj::Maybe<kj::Rc<RequestContext>> getCurrentRequestContext();
+  kj::Maybe<kj::Own<jsg::AsyncContextFrame::StorageScope>> makeRequestContextScope(
+      Worker::Lock& lock, kj::Maybe<kj::Rc<RequestContext>> requestContext);
 
   void pumpMessageLoop();
 

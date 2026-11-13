@@ -116,6 +116,7 @@ kj::Own<kj::HttpClient> KvNamespace::getHttpClient(IoContext& context,
             .cfBlobJson = kj::none,
             .parentSpan = tracing.getInternalSpanParent(),
             .userSpanParent = tracing.getUserSpanParent(),
+            .requestContext = context.getCurrentRequestContext(),
           });
         },
             {

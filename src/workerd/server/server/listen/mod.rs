@@ -459,11 +459,7 @@ pub async fn listen_http(
                 .flatten();
             let hangup = hangup(&accepted);
             let io = transport(accepted, socket.tls.as_ref(), &context).await?;
-            let handler: Rc<dyn Handler> = Rc::new(HttpConnection {
-                context: Rc::clone(&context),
-                socket,
-                cf_blob,
-            });
+            let handler = http_connection_handler(Rc::clone(&context), socket, cf_blob);
             let table = header_table(&context.factory);
             kj_hyper::server::serve_connection(io, hangup, table, settings, handler, &shutdown)
                 .await
@@ -476,6 +472,21 @@ pub async fn listen_http(
         || shutdown.shutdown(),
     )
     .await
+}
+
+/// The ordinary HTTP/CONNECT handler on an already-admitted connection. Embedders may bind
+/// that connection's channel to an opaque context without interpreting or replacing HTTP.
+#[must_use]
+pub fn http_connection_handler(
+    context: Rc<ListenContext>,
+    socket: Rc<HttpSocket>,
+    cf_blob: Option<String>,
+) -> Rc<dyn Handler> {
+    Rc::new(HttpConnection {
+        context,
+        socket,
+        cf_blob,
+    })
 }
 
 /// One HTTP connection's handler: the socket's service, with the socket's rewriting and the

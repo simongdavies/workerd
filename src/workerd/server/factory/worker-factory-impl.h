@@ -94,6 +94,8 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
   kj::EntropySource& entropySource;
   kj::Filesystem& fs;
   kj::Own<Options> options;
+  kj::Maybe<::rust::Box<WorkerAdmission>> workerAdmission;
+  bool workerCreationStarted = false;
 
   // The reader borrows the message, so the message is declared first.
   ::rust::Vec<uint64_t> configMessage;
@@ -220,6 +222,8 @@ class ActorStorage::Impl final: public kj::Refcounted {
   SqliteDatabase::Vfs vfs;
   kj::String uniqueKey;
   kj::Own<AlarmScheduler> alarmScheduler;
+  kj::Maybe<kj::Own<ActorStorageBackend>> externalBackend;
+  kj::Maybe<kj::Own<ActorCache::SharedLru>> externalLru;
 
   // The facet index of the root actor `rootKey`, read from disk for one operation; none when it
   // does not exist (so no facet can have storage).

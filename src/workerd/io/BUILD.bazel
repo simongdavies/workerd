@@ -5,6 +5,13 @@ load("//:build/wd_cc_embed.bzl", "wd_cc_embed")
 load("//:build/wd_cc_library.bzl", "wd_cc_library")
 load("//:build/wd_test.bzl", "wd_test")
 
+wd_cc_library(
+    name = "request-context",
+    hdrs = ["request-context.h"],
+    visibility = ["//visibility:public"],
+    deps = ["@capnp-cpp//src/kj"],
+)
+
 # TODO(cleanup): Split up into smaller targets, although this target is already relatively small and
 # not encumbered with many dependencies.
 wd_cc_library(
@@ -108,6 +115,7 @@ wd_cc_library(
         ":maximum-compatibility-date",
         ":observer",
         ":release-version",
+        ":request-context",
         ":trace",
         ":tracked-wasm-instance",
         ":wasm-instantiate-shim",
